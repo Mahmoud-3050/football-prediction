@@ -1,0 +1,9 @@
+[
+  {"score": "2-1", "result_1x2": "Home", "btts": "Yes", "over_under_25": "Over"},
+  {"score": "0-0", "result_1x2": "Draw", "btts": "No", "over_under_25": "Under"},
+  {"score": "1-0", "result_1x2": "Home", "btts": "No", "over_under_25": "Under"},
+  {"score": "1-2", "result_1x2": "Away", "btts": "Yes", "over_under_25": "Over"},
+  {"score": "1-1", "result_1x2": "Draw", "btts": "Yes", "over_under_25": "Under"},
+  {"score": "2-2", "result_1x2": "Draw", "btts": "Yes", "over_under_25": "Over"},
+  {"score": "3-0", "result_1x2": "Home", "btts": "No", "over_under_25": "Over"}
+]
