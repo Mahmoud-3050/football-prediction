@@ -65,20 +65,31 @@ def form_payload(
     with_half_time: bool = True,
     first_opponent: dict[str, Any] | None = None,
     null_full_time: int = 0,
+    venue: str = "home",
 ) -> dict[str, Any]:
     matches = []
     for index in range(count):
         other = first_opponent if index == 0 and first_opponent is not None else opponent
+        scored = None if index < null_full_time else 3
+        conceded = None if index < null_full_time else 1
+        if venue == "away":
+            match_home, match_away = other, team
+            home_goals, away_goals = conceded, scored
+            half_home, half_away = (0, 1) if with_half_time else (None, None)
+        else:
+            match_home, match_away = team, other
+            home_goals, away_goals = scored, conceded
+            half_home, half_away = (1, 0) if with_half_time else (None, None)
         matches.append(
             make_match(
                 start_id + index,
-                team,
-                other,
+                match_home,
+                match_away,
                 status="FINISHED",
-                home_goals=None if index < null_full_time else 3,
-                away_goals=None if index < null_full_time else 1,
-                half_home=1 if with_half_time else None,
-                half_away=0 if with_half_time else None,
+                home_goals=home_goals,
+                away_goals=away_goals,
+                half_home=half_home,
+                half_away=half_away,
                 competition=competition,
                 when=f"2026-02-{20 - index:02d}T15:00:00Z",
             )
@@ -93,6 +104,7 @@ def standings_for(teams: list[dict[str, Any]], *, last_updated: str | None = STA
             {
                 "position": index,
                 "team": {"id": team["id"], "name": team["name"], "shortName": team["shortName"], "tla": team["tla"]},
+                "playedGames": 10,
                 "points": 40 - index,
                 "goalsFor": 30 - index,
                 "goalsAgainst": 10 + index,
@@ -109,13 +121,7 @@ def standings_for(teams: list[dict[str, Any]], *, last_updated: str | None = STA
 
 
 def valid_model_json(**overrides: Any) -> str:
-    body = {
-        "half_time_prediction": "Team A",
-        "half_time_score": "1-0",
-        "full_time_score": "2-1",
-        "confidence_percentage": 64,
-        "tactical_reasoning": "The home club's recent wins are in the snapshot.",
-    }
+    body = {"tactical_reasoning": "The home club's recent wins are in the snapshot."}
     body.update(overrides)
     return json.dumps(body)
 
@@ -132,7 +138,7 @@ class Api:
         self.standings = standings_for([ARSENAL, CHELSEA, MAN_CITY, MAN_UNITED, SPURS])
         self.forms = {
             1: form_payload(ARSENAL, SPURS, start_id=100, first_opponent=CHELSEA),
-            2: form_payload(CHELSEA, SPURS, start_id=200),
+            2: form_payload(CHELSEA, SPURS, start_id=200, venue="away"),
         }
         self.h2h = {"matches": [], "lastUpdated": STAMP}
         self.status_overrides: dict[str, tuple[int, dict[str, Any], int]] = {}

@@ -3,6 +3,7 @@ import json
 
 from conftest import CHELSEA, SPURS, Harness, form_payload, standings_for, valid_model_json
 from bot import render_report
+from score_model import estimate_score
 from storage import loads
 
 
@@ -13,20 +14,22 @@ def test_completed_prediction_derives_markets_and_stores_the_trace(tmp_path) -> 
         return result, holder
 
     result, holder = asyncio.run(run())
+    estimate = _estimate_for(holder, include_half_time=True)
     assert result.status == "completed"
-    assert result.full_time_score == "2-1"
-    assert result.markets.result_1x2 == "Home"
-    assert result.markets.btts == "Yes"
-    assert result.markets.over_under_25 == "Over"
+    assert result.full_time_score == estimate.full_time_score
+    assert result.half_time_score == estimate.half_time_score
+    assert result.markets.result_1x2 == estimate.markets.result_1x2
+    assert result.markets.btts == estimate.markets.btts
+    assert result.markets.over_under_25 == estimate.markets.over_under_25
     assert result.include_half_time is True
     report = render_report(result)
-    assert "1X2: Home" in report
-    assert "BTTS: Yes" in report
-    assert "Over/Under 2.5: Over" in report
-    assert "Markets derived from the predicted scoreline" in report
+    assert f"1X2: {estimate.markets.result_1x2} ({estimate.markets.result_probability}%)" in report
+    assert f"BTTS: {estimate.markets.btts}" in report
+    assert "Markets from the score distribution" in report
     assert "Statistical estimate, not a betting tip." in report
     assert f"Run id: {result.run_id}" in report
     assert "Half-time:" in report
+    assert f"Full-time: {estimate.full_time_score}" in report
     assert holder.api.calls[0]["token"] == "fd-test-key"
     assert not any(call["path"].endswith("/head2head") for call in holder.api.calls)
 
@@ -42,14 +45,21 @@ def test_completed_prediction_derives_markets_and_stores_the_trace(tmp_path) -> 
     assert versions[0]["version_number"] == 1
     assert versions[0]["model_id"] == "gemini-2.5-flash"
     output = loads(versions[0]["output_json"])
-    assert output["markets"]["result_1x2"] == "Home"
-    assert output["markets_derived_from_score"] is True
+    assert output["markets"]["result_1x2"] == estimate.markets.result_1x2
+    assert output["markets_derived_from_distribution"] is True
+    assert output["lambda_home"] == round(estimate.lambda_home, 4)
+    assert output["lambda_away"] == round(estimate.lambda_away, 4)
     payload = loads(snapshots[0]["payload"])
     assert payload["resolved"]["match_id"] == 50
     assert "SNAPSHOT:" in holder.prompts[0]
     echoed = json.loads(holder.prompts[0].split("SNAPSHOT:\n", 1)[1])
     assert echoed["resolved"]["home_team_id"] == 1
     assert echoed["resolved"]["away_team_id"] == 2
+    assert holder.schemas[0]["required"] == ["tactical_reasoning"]
+    assert "lambda_home" in holder.prompts[0]
+    assert "Do not invent a different score" in holder.prompts[0]
+    stored = loads(snapshots[0]["payload"])
+    assert stored["derived"]["score_model"]["full_time_score"] == estimate.full_time_score
 
 
 def test_missing_standings_does_not_call_the_model(tmp_path, missing_standings) -> None:
@@ -84,19 +94,23 @@ def test_missing_half_time_limits_the_prompt_and_the_report(tmp_path, missing_ha
     async def run():
         holder = Harness(tmp_path)
         holder.api.forms[1] = missing_half_time
-        holder.api.forms[2] = form_payload(CHELSEA, SPURS, start_id=200, with_half_time=False)
+        holder.api.forms[2] = form_payload(
+            CHELSEA, SPURS, start_id=200, with_half_time=False, venue="away"
+        )
         result = await holder.execute()
         return result, holder
 
     result, holder = asyncio.run(run())
+    estimate = _estimate_for(holder, include_half_time=False)
     assert result.status == "partial"
     assert result.include_half_time is False
-    assert result.full_time_score == "2-1"
+    assert result.full_time_score == estimate.full_time_score
+    assert result.half_time_score is None
     assert "half_time_prediction" not in holder.schemas[0]["required"]
     assert "Do not return a half-time" in holder.prompts[0]
     report = render_report(result)
     assert "Half-time:" not in report
-    assert "Full-time: 2-1" in report
+    assert f"Full-time: {estimate.full_time_score}" in report
     assert any("Half-time" in item for item in result.limitations)
 
 
@@ -113,8 +127,8 @@ def test_accepted_retry_is_the_next_version(tmp_path) -> None:
     assert versions[0]["version_number"] == 2
 
 
-def test_model_disagreement_twice_stores_no_version(tmp_path) -> None:
-    bad = valid_model_json(half_time_prediction="Draw", half_time_score="1-0")
+def test_invalid_reasoning_twice_falls_back_to_score_model(tmp_path) -> None:
+    bad = "{}"
 
     async def run():
         holder = Harness(tmp_path, scripts=[bad, bad])
@@ -122,11 +136,12 @@ def test_model_disagreement_twice_stores_no_version(tmp_path) -> None:
         return result, holder
 
     result, holder = asyncio.run(run())
-    assert result.status == "failed"
-    assert result.stage == "model"
-    assert "disagrees" in result.reason
-    assert "twice" in result.reason
-    assert holder.store.versions_for(result.run_id) == []
+    assert result.status == "partial"
+    assert result.full_time_score
+    versions = holder.store.versions_for(result.run_id)
+    assert len(versions) == 1
+    assert versions[0]["model_id"] == "score-model"
+    assert any("statistical model only" in note for note in result.limitations)
     assert len(holder.prompts) == 2
 
 
@@ -188,6 +203,20 @@ def test_no_head_to_head_calls_the_endpoint_once(tmp_path) -> None:
     assert result.status == "partial"
     assert any("No head-to-head" in item for item in result.limitations)
     assert sum(1 for call in holder.api.calls if call["path"].endswith("/head2head")) == 1
+
+
+def _estimate_for(holder: Harness, *, include_half_time: bool):
+    return estimate_score(
+        standings_payload=holder.api.standings,
+        home_finished_payload=holder.api.forms[1],
+        away_finished_payload=holder.api.forms[2],
+        competition_code=holder.api.competition,
+        home_team_id=1,
+        away_team_id=2,
+        home_team_name="Arsenal FC",
+        away_team_name="Chelsea FC",
+        include_half_time=include_half_time,
+    )
 
 
 def test_standings_without_a_timestamp_is_partial(tmp_path) -> None:

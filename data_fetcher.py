@@ -17,6 +17,7 @@ import time
 import unicodedata
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -30,6 +31,13 @@ from models import (
     Team,
     TeamResolution,
 )
+from timeutil import (
+    api_date_window_for_cairo_day,
+    cairo_today,
+    falls_on_cairo_day,
+    format_kickoff_cairo,
+    format_kickoff_short_cairo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +46,8 @@ UPCOMING_STATUSES = frozenset({"SCHEDULED", "TIMED"})
 TEAMS_CACHE_TTL_SECONDS = 6 * 60 * 60
 STANDINGS_CACHE_TTL_SECONDS = 15 * 60
 MAX_CALLS_PER_MINUTE = 8
+# Competitions shown by /today. Match ids from that list feed /predict <id>.
+TODAY_MATCH_COMPETITIONS: tuple[str, ...] = ("PL", "CL", "PD", "SA", "BL1", "FL1")
 
 FREE_COMPETITIONS: dict[str, dict[str, Any]] = {
     "WC": {
@@ -297,6 +307,118 @@ def parse_fixture(raw: dict[str, Any]) -> Fixture:
     )
 
 
+def fixtures_from_payload(
+    payload: dict[str, Any],
+    *,
+    cairo_day: date | None = None,
+) -> list[Fixture]:
+    fixtures: list[Fixture] = []
+    for raw in payload.get("matches") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            fixture = parse_fixture(raw)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fixture.competition_code not in TODAY_MATCH_COMPETITIONS:
+            continue
+        if cairo_day is not None and not falls_on_cairo_day(fixture.utc_date, cairo_day):
+            continue
+        fixtures.append(fixture)
+    return sort_todays_fixtures(fixtures)
+
+
+def sort_todays_fixtures(fixtures: list[Fixture]) -> list[Fixture]:
+    order = {code: index for index, code in enumerate(TODAY_MATCH_COMPETITIONS)}
+    return sorted(
+        fixtures,
+        key=lambda fixture: (
+            order.get(fixture.competition_code, len(order)),
+            fixture.utc_date or "",
+            fixture.id,
+        ),
+    )
+
+
+def format_todays_matches(fixtures: list[Fixture], *, max_chars: int = 3500) -> list[str]:
+    return format_match_list(fixtures, day_label="today", max_chars=max_chars)
+
+
+def format_match_list(
+    fixtures: list[Fixture],
+    *,
+    day_label: str,
+    max_chars: int = 3500,
+) -> list[str]:
+    """Build Telegram-ready pages. Match ids are Football-Data.org ids."""
+
+    if not fixtures:
+        competitions = ", ".join(
+            FREE_COMPETITIONS[code]["name"] for code in TODAY_MATCH_COMPETITIONS
+        )
+        return [
+            f"No matches listed for {day_label} in:\n"
+            f"{competitions}\n\n"
+            "This list is display-only. No prediction is made here."
+        ]
+
+    heading = (
+        "Today's matches (no predictions):"
+        if day_label == "today"
+        else f"Matches for {day_label} (no predictions):"
+    )
+    lines: list[str] = [
+        heading,
+        "Tap a match button below, or use /predict <id>.",
+        "",
+    ]
+    current_competition = ""
+    for fixture in fixtures:
+        competition_name = fixture.competition_name or FREE_COMPETITIONS.get(
+            fixture.competition_code, {}
+        ).get("name", fixture.competition_code)
+        if competition_name != current_competition:
+            if current_competition:
+                lines.append("")
+            lines.append(f"{competition_name}")
+            current_competition = competition_name
+        kickoff = format_kickoff_short_cairo(fixture.utc_date)
+        lines.append(
+            f"#{fixture.id}  {kickoff}  "
+            f"{fixture.home_team_name} vs {fixture.away_team_name}  [{fixture.status}]"
+        )
+    lines.extend(
+        [
+            "",
+            "Example: /predict #" + str(fixtures[0].id),
+            "This list does not run predictions.",
+        ]
+    )
+    return _chunk_lines(lines, max_chars=max_chars)
+
+
+def team_from_fixture_side(team_id: int, team_name: str) -> Team:
+    return Team(id=team_id, name=team_name, short_name=None, tla=None)
+
+
+def _chunk_lines(lines: list[str], *, max_chars: int) -> list[str]:
+    pages: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in lines:
+        addition = len(line) + (1 if current else 0)
+        if current and size + addition > max_chars:
+            pages.append("\n".join(current))
+            current = [line]
+            size = len(line)
+        else:
+            current.append(line)
+            size += addition
+    if current:
+        pages.append("\n".join(current))
+    return pages
+
+
 def classify_fixtures(
     matches: list[dict[str, Any]],
     *,
@@ -365,7 +487,8 @@ def explain_fixture(
             f"Checked {competition_name} for {requested_home} vs {requested_away}. "
             "No fixture with that home team, away team, and competition was found."
         )
-    kickoff = f" Kickoff: {fixture.utc_date}." if fixture.utc_date else ""
+    kickoff_text = format_kickoff_cairo(fixture.utc_date)
+    kickoff = f" Kickoff: {kickoff_text}." if kickoff_text else ""
     if resolution.kind == "opposite":
         return (
             f"Checked {competition_name} for {requested_home} vs {requested_away}. "
@@ -530,6 +653,33 @@ class DataFetcher:
             f"/v4/matches/{match_id}/head2head",
             params={"limit": 5},
         )
+
+    async def get_todays_matches(self) -> dict[str, Any]:
+        """Cairo-today fixtures for the /today competitions. Display only."""
+
+        return await self.get_matches_for_cairo_day(cairo_today())
+
+    async def get_matches_for_cairo_day(self, day: date) -> dict[str, Any]:
+        """Fixtures that may fall on one Africa/Cairo calendar day."""
+
+        date_from, date_to = api_date_window_for_cairo_day(day)
+        params: dict[str, Any] = {
+            "competitions": ",".join(TODAY_MATCH_COMPETITIONS),
+            "dateFrom": date_from,
+            "dateTo": date_to,
+        }
+        return await self._get("/v4/matches", params=params)
+
+    async def get_matches_for_date(self, api_date: str | None) -> dict[str, Any]:
+        """Back-compat wrapper. Prefer get_matches_for_cairo_day."""
+
+        if api_date:
+            year, month, day = (int(part) for part in api_date.split("-", 2))
+            return await self.get_matches_for_cairo_day(date(year, month, day))
+        return await self.get_todays_matches()
+
+    async def get_match(self, match_id: int) -> dict[str, Any]:
+        return await self._get(f"/v4/matches/{match_id}")
 
     async def _cached(
         self,

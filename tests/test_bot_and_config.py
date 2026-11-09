@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from bot import build_application, predict, render_report
-from config import Config, ConfigError, load_config
+from config import Config, ConfigError, load_config, normalize_gemini_model
 from conftest import Harness
 from data_fetcher import DataFetcher, RateLimiter
 from models import Markets, PipelineResult
@@ -17,7 +17,7 @@ def test_missing_keys_fail_without_a_provider_call() -> None:
         load_config({"BOT_TOKEN": "123", "FOOTBALL_API_KEY": "abc", "GEMINI_API_KEY": "  "})
 
 
-def test_model_defaults_to_gemini_2_5_flash() -> None:
+def test_model_defaults_to_gemini_3_5_flash() -> None:
     config = load_config(
         {
             "BOT_TOKEN": "123456:token",
@@ -25,9 +25,23 @@ def test_model_defaults_to_gemini_2_5_flash() -> None:
             "GEMINI_API_KEY": "gem",
         }
     )
-    assert config.gemini_model == "gemini-2.5-flash"
+    assert config.gemini_model == "gemini-3.5-flash"
+    assert config.gemini_fallback_models == ("gemini-3.8-flash", "gemini-3.5-flash-lite")
     assert config.database_path == Path("data/predictions.db")
     assert config.cache_dir == Path("data/cache")
+
+
+def test_display_model_names_become_api_ids() -> None:
+    base = {
+        "BOT_TOKEN": "123456:token",
+        "FOOTBALL_API_KEY": "fd",
+        "GEMINI_API_KEY": "gem",
+    }
+    display = load_config({**base, "GEMINI_MODEL": "gemini-Gemini 3.8 Flash"})
+    prefixed = load_config({**base, "GEMINI_MODEL": "models/gemini-3.8-flash"})
+    assert display.gemini_model == "gemini-3.8-flash"
+    assert prefixed.gemini_model == "gemini-3.8-flash"
+    assert normalize_gemini_model("Gemini 2.5 Flash-Lite") == "gemini-2.5-flash-lite"
 
 
 def test_only_start_and_predict_are_registered() -> None:
@@ -44,7 +58,7 @@ def test_only_start_and_predict_are_registered() -> None:
     for handlers in application.handlers.values():
         for handler in handlers:
             commands.extend(getattr(handler, "commands", set()))
-    assert set(commands) == {"start", "predict"}
+    assert set(commands) == {"start", "today", "matches", "predict"}
     assert application.job_queue is None
 
 
@@ -124,7 +138,8 @@ def test_predict_acknowledges_one_match_and_does_not_swap_it(tmp_path) -> None:
     assert "Only this match is analyzed." in message.reply_text.await_args_list[0].args[0]
     assert "Arsenal vs Chelsea" in message.reply_text.await_args_list[0].args[0]
     report = message.reply_text.await_args_list[1].args[0]
-    assert "1X2: Home" in report
+    assert "Markets from the score distribution" in report
+    assert "Full-time:" in report
     # The explicit swapped command is a different request and must not reuse the first fixture.
     assert swapped.stage == "fixture"
     assert "not swapped" in swapped.reason
@@ -137,11 +152,17 @@ def test_requirements_and_sources_stay_on_demand() -> None:
     assert "google-generativeai" not in requirements
     assert "python-telegram-bot" in requirements
     assert "httpx" in requirements
-    banned = ("today_matches", "JobQueue", "run_daily", "run_repeating", "InlineKeyboard", "google.generativeai")
+    banned = ("JobQueue", "run_daily", "run_repeating", "google.generativeai")
     for path in root.glob("*.py"):
         text = path.read_text(encoding="utf-8")
         for word in banned:
             assert word not in text, f"{path.name} contains {word}"
+    assert "get_todays_matches" in (root / "data_fetcher.py").read_text(encoding="utf-8")
+    bot_text = (root / "bot.py").read_text(encoding="utf-8")
+    assert 'CommandHandler("today"' in bot_text
+    assert 'CommandHandler("matches"' in bot_text
+    assert "CallbackQueryHandler" in bot_text
+    assert "InlineKeyboardButton" in bot_text
     main_text = (root / "main.py").read_text(encoding="utf-8")
     assert "run_polling" in main_text
     assert "get_teams" not in main_text

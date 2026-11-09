@@ -204,11 +204,18 @@ class AnalysisSnapshot:
 
 @dataclass(frozen=True)
 class Markets:
-    """Outcomes computed from a validated full-time scoreline."""
+    """1X2, both teams to score, and over/under 2.5.
+
+    Live predictions fill the percentages from the score distribution.
+    A scoreline-only derivation leaves them empty.
+    """
 
     result_1x2: str
     btts: str
     over_under_25: str
+    result_probability: int | None = None
+    btts_probability: int | None = None
+    over_under_probability: int | None = None
 
 
 @dataclass(frozen=True)
@@ -229,17 +236,28 @@ class ProducedPrediction:
     prompt_version: str
     schema_version: str
     limitations: list[str]
+    lambda_home: float | None = None
+    lambda_away: float | None = None
+    probabilities: dict[str, float] | None = None
 
     def output(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "half_time_prediction": self.prediction.half_time_prediction,
             "half_time_score": self.prediction.half_time_score,
             "full_time_score": self.prediction.full_time_score,
             "confidence_percentage": self.prediction.confidence_percentage,
             "tactical_reasoning": self.prediction.tactical_reasoning,
             "markets": asdict(self.markets),
-            "markets_derived_from_score": True,
+            "markets_derived_from_distribution": True,
         }
+        if self.lambda_home is not None and self.lambda_away is not None:
+            payload["lambda_home"] = round(self.lambda_home, 4)
+            payload["lambda_away"] = round(self.lambda_away, 4)
+        if self.probabilities is not None:
+            payload["probabilities"] = {
+                key: round(value, 4) for key, value in self.probabilities.items()
+            }
+        return payload
 
 
 @dataclass
