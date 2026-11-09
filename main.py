@@ -1,7 +1,7 @@
 """Long polling for Telegram commands.
 
-Polling only waits for a message. It does not schedule predictions, prefetch
-fixtures, or scan a competition.
+Polling only waits for a message. It does not schedule predictions.
+/today loads fixtures only when that command arrives.
 """
 
 from __future__ import annotations
@@ -22,7 +22,11 @@ def build_pipeline(config: object) -> Pipeline:
     if not isinstance(config, Config):
         raise TypeError("config must be a Config instance.")
     fetcher = DataFetcher(api_key=config.football_api_key, cache_dir=config.cache_dir)
-    predictor = Predictor(api_key=config.gemini_api_key, model=config.gemini_model)
+    predictor = Predictor(
+        api_key=config.gemini_api_key,
+        model=config.gemini_model,
+        fallback_models=config.gemini_fallback_models,
+    )
     store = Storage(config.database_path)
     return Pipeline(fetcher, predictor, store)
 
@@ -35,6 +39,11 @@ def main() -> None:
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger(__name__).info(
+        "Using Gemini model %s (fallbacks: %s)",
+        config.gemini_model,
+        ", ".join(config.gemini_fallback_models) or "none",
     )
     application = build_application(config, build_pipeline(config))
     application.run_polling()

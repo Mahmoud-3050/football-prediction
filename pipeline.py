@@ -10,14 +10,18 @@ import logging
 from typing import Any
 
 from data_fetcher import (
+    TODAY_MATCH_COMPETITIONS,
+    UPCOMING_STATUSES,
     DataFetcher,
     classify_fixtures,
     explain_fixture,
     extract_last_updated,
     meetings_in_history,
     normalize_label,
+    parse_fixture,
     resolve_competition,
     resolve_team,
+    team_from_fixture_side,
     teams_from_payload,
     unknown_competition_reason,
 )
@@ -25,13 +29,16 @@ from eligibility import FREE_TIER_DELAY_WARNING, evaluate
 from models import (
     AnalysisSnapshot,
     CheckResult,
+    Competition,
     Fixture,
+    FixtureResolution,
     ModelError,
     PipelineResult,
     ProviderError,
     Team,
 )
 from predictor import Predictor
+from score_model import estimate_score
 from storage import Storage, utc_now
 
 logger = logging.getLogger(__name__)
@@ -98,6 +105,78 @@ class Pipeline:
         except ProviderError as exc:
             logger.info("provider stop for run %s: %s", run_id, exc.reason)
             return self._finish(run_id, status="failed", stage="provider", reason=exc.reason)
+
+    async def execute_by_match_id(
+        self,
+        *,
+        chat_id: int | None,
+        user_id: int | None,
+        match_id: int,
+    ) -> PipelineResult:
+        """Analyze one listed fixture by its Football-Data.org match id."""
+
+        run_id = self.store.create_run(
+            chat_id=chat_id,
+            user_id=user_id,
+            raw_home=f"#{match_id}",
+            raw_away="",
+            raw_competition="match_id",
+        )
+        if match_id <= 0:
+            return self._finish(
+                run_id,
+                status="failed",
+                stage="input",
+                reason="Match id must be a positive Football-Data.org id.",
+            )
+        try:
+            async with self.fetcher.request_scope():
+                return await self._analyze_match_id(run_id, match_id=match_id)
+        except ProviderError as exc:
+            logger.info("provider stop for run %s: %s", run_id, exc.reason)
+            return self._finish(run_id, status="failed", stage="provider", reason=exc.reason)
+
+    async def _analyze_match_id(self, run_id: int, *, match_id: int) -> PipelineResult:
+        payload = await self.fetcher.get_match(match_id)
+        try:
+            fixture = parse_fixture(payload)
+        except (KeyError, TypeError, ValueError):
+            return self._finish(
+                run_id,
+                status="abstained",
+                stage="fixture",
+                reason=f"Match #{match_id} could not be read from the provider.",
+            )
+
+        if fixture.competition_code not in TODAY_MATCH_COMPETITIONS:
+            supported = ", ".join(TODAY_MATCH_COMPETITIONS)
+            return self._finish(
+                run_id,
+                status="abstained",
+                stage="competition",
+                reason=(
+                    f"Match #{match_id} is in {fixture.competition_name or fixture.competition_code}. "
+                    f"/predict <id> only covers today's list competitions ({supported})."
+                ),
+            )
+
+        competition = Competition(
+            code=fixture.competition_code,
+            name=fixture.competition_name or fixture.competition_code,
+        )
+        home = team_from_fixture_side(fixture.home_team_id, fixture.home_team_name)
+        away = team_from_fixture_side(fixture.away_team_id, fixture.away_team_name)
+        return await self._after_known_fixture(
+            run_id,
+            raw_home=home.name,
+            raw_away=away.name,
+            raw_competition=competition.name,
+            competition=competition,
+            home=home,
+            away=away,
+            fixture=fixture,
+            fixture_payload_stamp=extract_last_updated(payload),
+        )
 
     async def _analyze(
         self,
@@ -236,7 +315,72 @@ class Pipeline:
                 warnings=snapshot.warnings,
             )
 
-        fixture = resolution.fixture
+        return await self._after_known_fixture(
+            run_id,
+            raw_home=raw_home,
+            raw_away=raw_away,
+            raw_competition=raw_competition,
+            competition=competition,
+            home=home,
+            away=away,
+            fixture=resolution.fixture,
+            fixture_payload_stamp=extract_last_updated(fixture_payload),
+        )
+
+    async def _after_known_fixture(
+        self,
+        run_id: int,
+        *,
+        raw_home: str,
+        raw_away: str,
+        raw_competition: str,
+        competition: Competition,
+        home: Team,
+        away: Team,
+        fixture: Fixture,
+        fixture_payload_stamp: str | None,
+    ) -> PipelineResult:
+        if fixture.status not in UPCOMING_STATUSES:
+            kind = "finished" if fixture.status == "FINISHED" else "unavailable"
+            reason = explain_fixture(
+                FixtureResolution(kind, fixture),
+                competition_name=competition.name,
+                requested_home=home.name,
+                requested_away=away.name,
+            )
+            snapshot = _snapshot(
+                raw_home=raw_home,
+                raw_away=raw_away,
+                raw_competition=raw_competition,
+                competition_code=competition.code,
+                competition_name=competition.name,
+                home=home,
+                away=away,
+                fixture=fixture,
+                standings_rows={},
+                last_five={"home": [], "away": []},
+                h2h=[],
+                derived={},
+                checks=_fixture_checks(kind),
+                freshness={"fixtures": fixture_payload_stamp or fixture.last_updated},
+                limitations=[],
+                warnings=[FREE_TIER_DELAY_WARNING],
+                include_half_time=False,
+            )
+            self.store.save_snapshot(run_id, snapshot)
+            return self._finish(
+                run_id,
+                status="abstained",
+                stage="fixture",
+                reason=reason,
+                snapshot_saved=True,
+                competition_name=competition.name,
+                home_name=home.name,
+                away_name=away.name,
+                kickoff=fixture.utc_date,
+                warnings=snapshot.warnings,
+            )
+
         standings_payload = await self.fetcher.get_standings(competition.code)
         home_form = await self.fetcher.get_finished_matches(home.id)
         away_form = await self.fetcher.get_finished_matches(away.id)
@@ -269,6 +413,24 @@ class Pipeline:
             standings_rows["home"] = decision.home_row.public()
         if decision.away_row is not None:
             standings_rows["away"] = decision.away_row.public()
+        limitations = list(decision.limitations)
+        estimate = None
+        if decision.eligible:
+            estimate = estimate_score(
+                standings_payload=standings_payload,
+                home_finished_payload=home_form,
+                away_finished_payload=away_form,
+                competition_code=competition.code,
+                home_team_id=home.id,
+                away_team_id=away.id,
+                home_team_name=home.name,
+                away_team_name=away.name,
+                include_half_time=include_half_time,
+            )
+            derived["score_model"] = estimate.public()
+            for note in estimate.limitations:
+                if note not in limitations:
+                    limitations.append(note)
         snapshot = _snapshot(
             raw_home=raw_home,
             raw_away=raw_away,
@@ -284,12 +446,12 @@ class Pipeline:
             derived=derived,
             checks=decision.checks,
             freshness=decision.freshness,
-            limitations=decision.limitations,
+            limitations=limitations,
             warnings=decision.warnings,
             include_half_time=include_half_time,
         )
         snapshot_id = self.store.save_snapshot(run_id, snapshot)
-        if not decision.eligible:
+        if not decision.eligible or estimate is None:
             return self._finish(
                 run_id,
                 status="abstained",
@@ -304,7 +466,11 @@ class Pipeline:
             )
 
         try:
-            produced = await self.predictor.predict(snapshot, limitations=decision.limitations)
+            produced = await self.predictor.predict(
+                snapshot,
+                estimate,
+                limitations=limitations,
+            )
         except ModelError as exc:
             return self._finish(
                 run_id,
@@ -316,12 +482,12 @@ class Pipeline:
                 home_name=home.name,
                 away_name=away.name,
                 kickoff=fixture.utc_date,
-                limitations=decision.limitations,
+                limitations=limitations,
                 warnings=decision.warnings,
             )
 
         self.store.save_version(run_id, snapshot_id, produced)
-        status = "partial" if decision.limitations else "completed"
+        status = "partial" if produced.limitations else "completed"
         return self._finish(
             run_id,
             status=status,
@@ -338,7 +504,7 @@ class Pipeline:
             markets=produced.markets,
             confidence=produced.prediction.confidence_percentage,
             reasoning=produced.prediction.tactical_reasoning,
-            limitations=decision.limitations,
+            limitations=produced.limitations,
             warnings=decision.warnings,
             include_half_time=include_half_time,
         )

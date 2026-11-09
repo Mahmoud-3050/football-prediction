@@ -1,4 +1,4 @@
-from bot import ParseFailure, ParsedCommand, parse_predict_command
+from bot import ParseFailure, ParsedCommand, ParsedMatchId, parse_predict_command
 
 
 def test_command_with_spaces_and_competition() -> None:
@@ -7,6 +7,15 @@ def test_command_with_spaces_and_competition() -> None:
     assert parsed.home == "Manchester City"
     assert parsed.away == "West Ham"
     assert parsed.competition == "Premier League"
+
+
+def test_command_accepts_a_today_match_id() -> None:
+    hashed = parse_predict_command("/predict #560638")
+    plain = parse_predict_command("/predict 560638")
+    assert isinstance(hashed, ParsedMatchId)
+    assert isinstance(plain, ParsedMatchId)
+    assert hashed.match_id == 560638
+    assert plain.match_id == 560638
 
 
 def test_command_addressed_to_a_bot_is_accepted() -> None:
@@ -47,3 +56,4 @@ def test_bare_command_explains_the_shape() -> None:
     parsed = parse_predict_command("/predict")
     assert isinstance(parsed, ParseFailure)
     assert "/predict Home vs Away | Competition" in parsed.reason
+    assert "/predict <id>" in parsed.reason
