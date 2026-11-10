@@ -69,8 +69,8 @@ def test_exact_name_alias_and_typo_rules() -> None:
 
 def test_earliest_scheduled_fixture_beats_a_later_one_and_a_finished_one() -> None:
     matches = [
-        make_match(2, ARSENAL, CHELSEA, status="SCHEDULED", home_goals=None, away_goals=None, half_home=None, half_away=None, when="2026-05-01T15:00:00Z"),
-        make_match(1, ARSENAL, CHELSEA, status="TIMED", home_goals=None, away_goals=None, half_home=None, half_away=None, when="2026-04-01T15:00:00Z"),
+        make_match(2, ARSENAL, CHELSEA, status="SCHEDULED", home_goals=None, away_goals=None, half_home=None, half_away=None, when="2026-12-20T15:00:00Z"),
+        make_match(1, ARSENAL, CHELSEA, status="TIMED", home_goals=None, away_goals=None, half_home=None, half_away=None, when="2026-12-10T15:00:00Z"),
         make_match(3, ARSENAL, CHELSEA, status="FINISHED", home_goals=1, away_goals=0, when="2026-01-01T15:00:00Z"),
     ]
     found = classify_fixtures(matches, competition_code="PL", home_id=1, away_id=2)

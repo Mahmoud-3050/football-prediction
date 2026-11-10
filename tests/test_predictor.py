@@ -29,12 +29,14 @@ def test_prompt_omits_half_time_when_that_market_is_ineligible() -> None:
     schema = build_schema()
     assert "Do not return a half-time" in prompt
     assert "Half-time is not part of this estimate" in prompt
-    assert schema["required"] == ["tactical_reasoning"]
+    assert schema["required"] == ["tactical_reasoning", "tactical_reasoning_ar"]
     assert "Arsenal" in prompt
     assert "Chelsea" in prompt
-    assert "lambda_home" in prompt
+    assert "Never mention Poisson" in prompt
+    assert "tactical_reasoning_ar" in prompt
     assert "Do not invent a different score" in prompt
     assert "SNAPSHOT:" in prompt
+    assert "lambda_home" not in prompt
 
 
 def test_prompt_cites_the_computed_half_time_when_eligible() -> None:
@@ -54,7 +56,12 @@ def test_retry_is_version_two_and_a_second_failure_stops() -> None:
         once_then_valid.calls += 1
         if once_then_valid.calls == 1:
             return "not-json"
-        return json.dumps({"tactical_reasoning": "from the snapshot"})
+        return json.dumps(
+            {
+                "tactical_reasoning": "from the snapshot",
+                "tactical_reasoning_ar": "من اللقطة",
+            }
+        )
 
     once_then_valid.calls = 0
     predictor = Predictor("key", "gemini-2.5-flash", generate=once_then_valid)
@@ -65,6 +72,7 @@ def test_retry_is_version_two_and_a_second_failure_stops() -> None:
     assert produced.prediction.full_time_score == estimate.full_time_score
     assert produced.markets.result_1x2 == estimate.markets.result_1x2
     assert produced.prediction.tactical_reasoning == "from the snapshot"
+    assert produced.prediction.tactical_reasoning_ar == "من اللقطة"
     assert produced.model_id == "gemini-2.5-flash"
     assert produced.lambda_home == estimate.lambda_home
 
@@ -107,7 +115,11 @@ def test_provider_failure_returns_statistical_score(monkeypatch) -> None:
     produced = asyncio.run(predictor.predict(_snapshot(False), estimate, limitations=[]))
     assert produced.model_id == "score-model"
     assert produced.prediction.full_time_score == estimate.full_time_score
-    assert "Dixon-Coles" in produced.prediction.tactical_reasoning
+    assert produced.prediction.tactical_reasoning_ar
+    assert "Poisson" not in produced.prediction.tactical_reasoning
+    assert "λ" not in produced.prediction.tactical_reasoning
+    assert "lambda" not in produced.prediction.tactical_reasoning.lower()
+    assert estimate.full_time_score.replace("-", "–") in produced.prediction.tactical_reasoning
     assert any("statistical model only" in note for note in produced.limitations)
 
 
@@ -124,7 +136,12 @@ def test_transient_503_falls_back_to_the_next_model(monkeypatch) -> None:
             raise ModelError(
                 "The model request failed (503 UNAVAILABLE. This model is currently experiencing high demand.)"
             )
-        return json.dumps({"tactical_reasoning": "fallback model answered"})
+        return json.dumps(
+            {
+                "tactical_reasoning": "fallback model answered",
+                "tactical_reasoning_ar": "أجاب النموذج الاحتياطي",
+            }
+        )
 
     monkeypatch.setattr(Predictor, "_generate_sync", fake_generate)
     predictor = Predictor(
@@ -164,7 +181,7 @@ def _snapshot(include_half_time: bool) -> AnalysisSnapshot:
         home_team_name="Arsenal",
         away_team_name="Chelsea",
         match_id=50,
-        kickoff="2026-04-12T15:00:00Z",
+        kickoff="2026-12-12T15:00:00Z",
         fixture_status="SCHEDULED",
         standings_rows={"home": {"points": 40}, "away": {"points": 30}},
         last_five={"home": [], "away": []},

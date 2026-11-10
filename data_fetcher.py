@@ -17,7 +17,7 @@ import time
 import unicodedata
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -43,11 +43,64 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.football-data.org"
 UPCOMING_STATUSES = frozenset({"SCHEDULED", "TIMED"})
+IN_PROGRESS_STATUSES = frozenset(
+    {"IN_PLAY", "PAUSED", "LIVE", "HALFTIME", "EXTRA_TIME", "PENALTY_SHOOTOUT"}
+)
+FINISHED_STATUSES = frozenset({"FINISHED", "AWARDED"})
 TEAMS_CACHE_TTL_SECONDS = 6 * 60 * 60
 STANDINGS_CACHE_TTL_SECONDS = 15 * 60
+COMPETITION_MATCHES_CACHE_TTL_SECONDS = 15 * 60
+FINISHED_MATCH_LIMIT = 100
 MAX_CALLS_PER_MINUTE = 8
 # Competitions shown by /today. Match ids from that list feed /predict <id>.
 TODAY_MATCH_COMPETITIONS: tuple[str, ...] = ("PL", "CL", "PD", "SA", "BL1", "FL1")
+# Automatic pre-round job prices fixtures whose kickoff is within this many days.
+# On-demand /predict ignores this window and only requires a not-yet-started fixture.
+PROSPECTIVE_LEAD_DAYS = 1
+
+
+def fixture_is_predictable(
+    fixture: Fixture,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """True only for not-yet-started scheduled/timed fixtures.
+
+    In-progress and finished matches are never predicted or stored as predictions
+    from the live bot path. Kickoff already passed is treated as started even if
+    the provider status lags.
+    """
+
+    if fixture.status in IN_PROGRESS_STATUSES:
+        return False
+    if fixture.status not in UPCOMING_STATUSES:
+        return False
+    if not fixture.utc_date:
+        return False
+    try:
+        kickoff = datetime.fromisoformat(fixture.utc_date.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return kickoff > (now or datetime.now(timezone.utc))
+
+
+def fixture_in_prospective_window(
+    fixture: Fixture,
+    *,
+    now: datetime | None = None,
+    lead_days: float = PROSPECTIVE_LEAD_DAYS,
+) -> bool:
+    """True when a predictable fixture kicks off within the pre-round lead window."""
+
+    moment = now or datetime.now(timezone.utc)
+    if lead_days <= 0:
+        return False
+    if not fixture_is_predictable(fixture, now=moment):
+        return False
+    assert fixture.utc_date is not None
+    kickoff = datetime.fromisoformat(fixture.utc_date.replace("Z", "+00:00"))
+    return kickoff <= moment + timedelta(days=lead_days)
+
 
 FREE_COMPETITIONS: dict[str, dict[str, Any]] = {
     "WC": {
@@ -503,9 +556,19 @@ def explain_fixture(
             f"({score}). No prediction is made for a match that has already been played."
         )
     if resolution.kind == "unavailable":
+        if fixture.status in IN_PROGRESS_STATUSES:
+            return (
+                f"{requested_home} vs {requested_away} in {competition_name} is in progress "
+                f"({fixture.status}).{kickoff} No prediction is made once a match has started."
+            )
         return (
             f"{requested_home} vs {requested_away} in {competition_name} is {fixture.status}. "
-            "Only scheduled or timed fixtures are predicted."
+            "Only scheduled or timed fixtures that have not started are predicted."
+        )
+    if resolution.kind == "started":
+        return (
+            f"{requested_home} vs {requested_away} in {competition_name} has already started "
+            f"({fixture.status}).{kickoff} No prediction is made once a match has started."
         )
     return ""
 
@@ -642,10 +705,29 @@ class DataFetcher:
             params={"competitions": competition_code, "limit": 100},
         )
 
-    async def get_finished_matches(self, team_id: int) -> dict[str, Any]:
+    async def get_finished_matches(
+        self,
+        team_id: int,
+        competition_code: str,
+    ) -> dict[str, Any]:
         return await self._get(
             f"/v4/teams/{team_id}/matches",
-            params={"status": "FINISHED", "limit": 30},
+            params={
+                "status": "FINISHED",
+                "competitions": competition_code,
+                "limit": FINISHED_MATCH_LIMIT,
+            },
+        )
+
+    async def get_competition_finished_matches(self, competition_code: str) -> dict[str, Any]:
+        """Season finished matches for one competition. Cached per request budget."""
+
+        return await self._cached(
+            "competition_finished",
+            competition_code,
+            COMPETITION_MATCHES_CACHE_TTL_SECONDS,
+            f"/v4/competitions/{competition_code}/matches",
+            params={"status": "FINISHED"},
         )
 
     async def get_head_to_head(self, match_id: int) -> dict[str, Any]:
@@ -659,12 +741,18 @@ class DataFetcher:
 
         return await self.get_matches_for_cairo_day(cairo_today())
 
-    async def get_matches_for_cairo_day(self, day: date) -> dict[str, Any]:
+    async def get_matches_for_cairo_day(
+        self,
+        day: date,
+        *,
+        competitions: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         """Fixtures that may fall on one Africa/Cairo calendar day."""
 
         date_from, date_to = api_date_window_for_cairo_day(day)
+        codes = competitions or TODAY_MATCH_COMPETITIONS
         params: dict[str, Any] = {
-            "competitions": ",".join(TODAY_MATCH_COMPETITIONS),
+            "competitions": ",".join(codes),
             "dateFrom": date_from,
             "dateTo": date_to,
         }
@@ -687,12 +775,13 @@ class DataFetcher:
         key: str,
         ttl_seconds: float,
         path: str,
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         cache_path = self._cache_file(kind, key)
         cached = self._read_cache(cache_path, ttl_seconds)
         if cached is not None:
             return cached
-        payload = await self._get(path)
+        payload = await self._get(path, params=params)
         self._write_cache(cache_path, payload)
         return payload
 

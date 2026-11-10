@@ -1,0 +1,17 @@
+[Unit]
+Description=Football Predictor Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/football-predictor
+EnvironmentFile=/opt/football-predictor/.env
+ExecStart=/opt/football-predictor/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+User=football
+Group=football
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 # Architecture
 
-The bot answers Telegram commands on demand. Analysis starts only when the user asks for a prediction. `/today` lists fixtures without predicting them. There is no periodic scan and no background prediction job.
+The bot answers Telegram commands on demand. `/today` lists fixtures without predicting them. Production predictions are created only by this bot path: `/predict` on demand, or a background asyncio pre-round task that prices fixtures whose kickoff is within one day (same pipeline, stored without a Telegram message). The laboratory database may hold historical fixtures; it does not write bot predictions.
 
 ## Commands
 
@@ -25,12 +25,12 @@ Inside the named competition, a club resolves by its name, short name, three-let
 flowchart TD
   user[User message] --> parse[Validate home away competition]
   parse --> identify[Resolve competition and exact fixture]
-  identify --> fetch[Fetch standings form H2H]
+  identify --> fetch[Fetch standings league form H2H]
   fetch --> check[Validate quality consistency freshness]
   check --> snap[Save point-in-time snapshot]
   snap --> eligible{Eligible}
   eligible -->|no| abstain[Abstain and explain the stage]
-  eligible -->|yes| rates[Dixon-Coles score distribution]
+  eligible -->|yes| rates[Multiplicative Poisson score distribution]
   rates --> gemini[Gemini writes the reasoning]
   gemini --> version[Save prediction version]
   abstain --> reply[Telegram report]
@@ -54,12 +54,13 @@ For a named command, teams are loaded for the one competition. The fixture searc
 Only after that fixture is identified:
 
 - `GET /v4/competitions/{code}/standings` for position, points, goals for, goals against, and goal difference.
-- `GET /v4/teams/{id}/matches?status=FINISHED&limit=30` for each club. The analysis window is the latest five with a full-time score.
-- Head-to-head meetings are taken from that history. If none are there, one `GET /v4/matches/{id}/head2head?limit=5` is used.
+- `GET /v4/competitions/{code}/matches?status=FINISHED` for season-to-date league priors (cached).
+- `GET /v4/teams/{id}/matches?status=FINISHED&competitions={code}&limit=100` for each club.
+- Head-to-head meetings are taken from that club history. If none are there, one `GET /v4/matches/{id}/head2head?limit=5` is used.
 
-Code, not the model, computes last-five W-D-L, half-time goals scored and conceded, and second-half goals (`full time` minus `half time`) when both scores exist and the half-time score does not exceed the full-time score. The same finished matches feed the Dixon-Coles score in `score_model.py`.
+Code, not the model, computes last-five W-D-L for the Telegram form display, and half-time eligibility from same-league season-to-date samples when both half-time and full-time scores exist and half-time does not exceed full-time. League finished matches feed the multiplicative Poisson rates in `score_model.py`.
 
-Football-Data is called with `X-Auth-Token`. The client keeps about 8 calls per minute in process. HTTP 429 waits once for this request and then stops. HTTP 401 or 403 names the rejected key or competition. Team and standings bodies are cached on disk only while a request reads or writes them. There is no refresh loop.
+Football-Data is called with `X-Auth-Token`. The client keeps about 8 calls per minute in process. HTTP 429 waits once for this request and then stops. HTTP 401 or 403 names the rejected key or competition. Team, standings, and competition finished-match bodies are cached on disk only while a request reads or writes them. There is no refresh loop.
 
 ### Validate
 
@@ -74,7 +75,7 @@ Every check is kept as pass, fail, or limitation.
 
 ### Snapshot
 
-The snapshot is the only Gemini input, together with the score estimate stored on it: request labels, resolved ids, kickoff, raw standings rows, last five, head-to-head, derived facts, check results, limitations, and fetch time. The stored snapshot keeps half-time samples so the trace shows why that market was skipped. The prompt copy drops those fields when the market is ineligible. `derived.score_model` holds λ, the chosen scores, and the market probabilities.
+The snapshot is the only Gemini input, together with the score estimate stored on it: request labels, resolved ids, kickoff, raw standings rows, last five, head-to-head, derived facts, check results, limitations, and fetch time. The stored snapshot keeps half-time samples so the trace shows why that market was skipped. The prompt copy drops those fields when the market is ineligible. `derived.score_model` holds λ, ratios, league averages, `k`, tail tolerance, chosen scores, markets, and assumptions.
 
 ### Predict or abstain
 
@@ -88,24 +89,22 @@ No score is requested when any of these are true:
 
 These limitations still allow a full-time estimate, and they are printed:
 
-- Fewer than 3 of the last 5 scored matches are in the named competition. Matches from other competitions are used and named.
-- Half-time scores exist on fewer than 3 of either club's last 5. Half-time result and half-time score are left out of the prompt and the report.
+- Fewer than 3 of the last 5 scored matches are in the named competition. Matches from other competitions were used for the form display.
+- Half-time scores exist on fewer than 3 same-league finished matches for either club. Half-time result and half-time score are left out of the prompt and the report.
 - No head-to-head meetings were found.
 - A required `lastUpdated` value is missing, so freshness is unknown.
-- A venue has fewer than 3 scored matches in the named competition, so rates use other competitions, the season table, or the finished-match list.
-- Season `playedGames` is missing. It is not treated as zero.
-- The season table supplied the rates, so home λ is multiplied by 1.25 and away λ by 0.85.
+- The competition finished-match list was empty, so rates fell back to the two clubs' finished matches.
 
 The free-tier delay warning is printed on every report that used provider data. By itself it does not change a completed run into a partial one.
 
-`score_model.py` prices the match before Gemini is called. Home and away rates prefer the club's matches at that venue in the named competition. Fewer than 3 falls back to other competitions, then to the season `TOTAL` row. A missing `playedGames` is not stored as zero; the rate uses the finished-match list.
+`score_model.py` prices the match before Gemini is called. Priors are finished matches in the named competition with kickoff strictly before the fixture, restricted to the current August–July season. League home and away averages come from that sample. Attack and defence ratios are shrunk with prior strength `k = 6` toward last season's shrunk club venue ratios when that season is present in the finished-match payload (otherwise toward 1):
 
-- `λ_home = home_scored_per_game × away_conceded_per_game / league_goals_per_team_game`
-- `λ_away = away_scored_per_game × home_conceded_per_game / league_goals_per_team_game`
+- `λ_home = league_home_avg × attack_home_shrunk × defence_away_shrunk`
+- `λ_away = league_away_avg × attack_away_shrunk × defence_home_shrunk`
 
-`league_goals_per_team_game` is `sum(goalsFor) / sum(playedGames)` on the `TOTAL` table that contains the clubs. The season-row fallback multiplies `λ_home` by 1.25 and `λ_away` by 0.85.
+An independent Poisson grid grows until the raw tail outside the grid is under 0.1%, then the kept cells are renormalized. There is no Dixon-Coles factor and no fixed 1.25 / 0.85 home multiplier. The published full-time score is the most likely cell. Ties break toward the lower total, then the lower home-goal count. When half-time is eligible, the league first-half share is estimated from priors with usable half-time scores; each club's share is shrunk toward that league share; the same grid is priced at `λ × share`. The half-time label is the winner of that score.
 
-An independent Poisson grid for goals 0 through 6 is adjusted with the Dixon-Coles low-score correction at `ρ = -0.13`, then renormalized. The published full-time score is the most likely cell. Ties break toward the lower total, then the lower home-goal count. When half-time is eligible, the same grid is priced at `λ × first-half share`. The share is that club's half-time goals divided by its full-time goals on the last five consistent samples. A club with no full-time goals in that sample uses 0.45. The half-time label is the winner of that score.
+Standing model assumptions (schedule bias, independence, `k`, tail tolerance) are stored on `derived.score_model.assumptions`. Situational gaps stay in `limitations` and can mark a run `partial`.
 
 1X2, both teams to score, and over/under 2.5 are sums over the full-time grid, so they can disagree with the modal score. Confidence is that cell's probability, as an integer percent.
 
@@ -121,7 +120,7 @@ The prompt includes λ, both scores, and the market probabilities, and tells the
 
 ### Trace
 
-SQLite at `DATABASE_PATH` (default `data/predictions.db`) stores three rows:
+SQLite at `DATABASE_PATH` (default `data/football.db`) is shared with the laboratory. Bot traces use three tables:
 
 - **Prediction Run:** chat, user, raw home, away, and competition text, time, status `completed | partial | abstained | failed`, stage, and the user-facing reason. A run is inserted when the command is accepted and updated when the path stops. A crash before that update stays `failed`, not `completed`.
 - **Prediction Snapshot:** one row once a fetch has produced data, including abstentions after a fetch. It holds the capture time, competition code, match id, team ids, kickoff, payload, freshness, and validation checks.
@@ -142,7 +141,7 @@ Shared dataclasses live in `models.py`. The other modules are the request path:
 | `config.py` | Required keys and optional model, log level, and database path. Import and startup do not call external APIs. |
 | `data_fetcher.py` | Async Football-Data client, competition and club resolution, fixture orientation. |
 | `eligibility.py` | Checks, derived facts, and the abstain or partial decision. |
-| `score_model.py` | Venue rates, Dixon-Coles grid, modal scores, and market probabilities. |
+| `score_model.py` | Multiplicative rates, shrinkage, independent Poisson grid, modal scores, and market probabilities. |
 | `predictor.py` | Prompt, Gemini reasoning, validation, and retry. |
 | `storage.py` | Run, snapshot, and version tables. |
 | `pipeline.py` | The single orchestration path. |

@@ -16,6 +16,7 @@ from data_fetcher import (
     classify_fixtures,
     explain_fixture,
     extract_last_updated,
+    fixture_is_predictable,
     meetings_in_history,
     normalize_label,
     parse_fixture,
@@ -112,6 +113,7 @@ class Pipeline:
         chat_id: int | None,
         user_id: int | None,
         match_id: int,
+        source: str = "match_id",
     ) -> PipelineResult:
         """Analyze one listed fixture by its Football-Data.org match id."""
 
@@ -120,7 +122,7 @@ class Pipeline:
             user_id=user_id,
             raw_home=f"#{match_id}",
             raw_away="",
-            raw_competition="match_id",
+            raw_competition=source,
         )
         if match_id <= 0:
             return self._finish(
@@ -340,8 +342,13 @@ class Pipeline:
         fixture: Fixture,
         fixture_payload_stamp: str | None,
     ) -> PipelineResult:
-        if fixture.status not in UPCOMING_STATUSES:
-            kind = "finished" if fixture.status == "FINISHED" else "unavailable"
+        if not fixture_is_predictable(fixture):
+            if fixture.status == "FINISHED":
+                kind = "finished"
+            elif fixture.status in UPCOMING_STATUSES:
+                kind = "started"
+            else:
+                kind = "unavailable"
             reason = explain_fixture(
                 FixtureResolution(kind, fixture),
                 competition_name=competition.name,
@@ -382,8 +389,11 @@ class Pipeline:
             )
 
         standings_payload = await self.fetcher.get_standings(competition.code)
-        home_form = await self.fetcher.get_finished_matches(home.id)
-        away_form = await self.fetcher.get_finished_matches(away.id)
+        competition_finished = await self.fetcher.get_competition_finished_matches(
+            competition.code
+        )
+        home_form = await self.fetcher.get_finished_matches(home.id, competition.code)
+        away_form = await self.fetcher.get_finished_matches(away.id, competition.code)
         h2h = meetings_in_history([home_form, away_form], home.id, away.id)
         h2h_payload: dict[str, Any] | None = {"matches": h2h} if h2h else None
         if not h2h:
@@ -417,15 +427,15 @@ class Pipeline:
         estimate = None
         if decision.eligible:
             estimate = estimate_score(
-                standings_payload=standings_payload,
+                competition_finished_payload=competition_finished,
                 home_finished_payload=home_form,
                 away_finished_payload=away_form,
-                competition_code=competition.code,
                 home_team_id=home.id,
                 away_team_id=away.id,
-                home_team_name=home.name,
-                away_team_name=away.name,
                 include_half_time=include_half_time,
+                kickoff=fixture.utc_date,
+                prior_mean_mode="last_season",
+                half_time_share_mode="fixed_0_45",
             )
             derived["score_model"] = estimate.public()
             for note in estimate.limitations:
@@ -500,13 +510,17 @@ class Pipeline:
             kickoff=fixture.utc_date,
             half_time_prediction=produced.prediction.half_time_prediction,
             half_time_score=produced.prediction.half_time_score,
+            half_time_probabilities=produced.half_time_probabilities,
             full_time_score=produced.prediction.full_time_score,
             markets=produced.markets,
             confidence=produced.prediction.confidence_percentage,
             reasoning=produced.prediction.tactical_reasoning,
+            reasoning_ar=produced.prediction.tactical_reasoning_ar,
             limitations=produced.limitations,
             warnings=decision.warnings,
             include_half_time=include_half_time,
+            probabilities=produced.probabilities,
+            top_scores=produced.top_scores,
         )
 
     def _finish(self, run_id: int, **fields: Any) -> PipelineResult:

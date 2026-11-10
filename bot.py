@@ -38,6 +38,7 @@ BUTTONS_PER_MESSAGE = 6
 BUTTON_LABEL_MAX = 60
 
 START_TEXT = (
+    "Bot enabled for this chat.\n\n"
     "Football match estimates on request.\n\n"
     "/today — today's fixtures (no predictions)\n"
     "/matches 24-05-2026 — fixtures for that day (DD-MM-YYYY)\n"
@@ -54,6 +55,7 @@ START_TEXT = (
     "If a match is finished or the data is missing, the bot abstains.\n\n"
     "A result is a statistical estimate, not a betting tip."
 )
+NEED_START_TEXT = "Send /start to enable the bot in this chat."
 
 
 @dataclass(frozen=True)
@@ -164,8 +166,15 @@ def _button_label(fixture: Fixture) -> str:
 
 
 def build_application(config: Config, pipeline: Pipeline) -> Application:
-    application = Application.builder().token(config.bot_token).job_queue(None).build()
+    builder = Application.builder().token(config.bot_token).job_queue(None)
+    # Optional legacy pre-round inside the bot process. Prefer `python -m jobs`.
+    if config.pre_round_enabled:
+        builder = builder.post_init(_start_pre_round_job)
+    application = builder.build()
     application.bot_data["pipeline"] = pipeline
+    application.bot_data["pre_round_enabled"] = config.pre_round_enabled
+    application.bot_data["pre_round_interval_seconds"] = config.pre_round_interval_seconds
+    application.bot_data["active_chats"] = set()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("today", today))
     application.add_handler(CommandHandler("matches", matches))
@@ -177,13 +186,60 @@ def build_application(config: Config, pipeline: Pipeline) -> Application:
     return application
 
 
+async def _start_pre_round_job(application: Application) -> None:
+    """Legacy background loop. Prefer the standalone `python -m jobs` worker."""
+
+    from pre_round import pre_round_loop
+
+    pipeline: Pipeline = application.bot_data["pipeline"]
+    interval = float(application.bot_data.get("pre_round_interval_seconds") or 3600)
+    application.create_task(
+        pre_round_loop(pipeline, interval_seconds=interval),
+        name="pre-round",
+    )
+    logger.info("pre-round background task scheduled (interval=%ss)", interval)
+
+
+def _activate_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    chats = context.bot_data.setdefault("active_chats", set())
+    chats.add(chat_id)
+
+
+def _chat_is_active(context: ContextTypes.DEFAULT_TYPE, chat_id: int | None) -> bool:
+    if chat_id is None:
+        return False
+    return chat_id in context.bot_data.get("active_chats", set())
+
+
+async def _require_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Commands other than /start need an explicit /start in this chat first."""
+
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        message = getattr(update, "message", None) or getattr(update, "effective_message", None)
+        chat_id = getattr(message, "chat_id", None)
+    if _chat_is_active(context, chat_id):
+        return True
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    if message is not None:
+        await message.reply_text(NEED_START_TEXT)
+    return False
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
+    if update.message is None or update.effective_chat is None:
         return
+    _activate_chat(context, update.effective_chat.id)
     await update.message.reply_text(START_TEXT)
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_start(update, context):
+        return
     message = update.message
     if message is None:
         return
@@ -200,6 +256,8 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_start(update, context):
+        return
     message = update.message
     if message is None:
         return
@@ -260,6 +318,9 @@ async def predict_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     if query is None or query.data is None:
         return
+    if not await _require_start(update, context):
+        await query.answer()
+        return
     match = PREDICT_CALLBACK_RE.fullmatch(query.data)
     if match is None:
         await query.answer()
@@ -287,6 +348,8 @@ async def predict_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_start(update, context):
+        return
     message = update.message
     if message is None or not message.text:
         return
@@ -381,34 +444,51 @@ def _success(result: PipelineResult, *, markdown: bool) -> str:
     home = result.home_name or "Home"
     away = result.away_name or "Away"
     kickoff = _kickoff(result.kickoff) or "unknown"
+    probs = result.probabilities or {}
     lines = [
         _em(result.competition_name or "Competition", markdown),
         _em(f"{home} vs {away}", markdown),
         f"Kickoff: {_plain(kickoff, markdown)}",
         "",
     ]
-    if result.include_half_time and result.half_time_score and result.half_time_prediction:
-        lines.append(
-            "Half-time: "
-            f"{_plain(_half_time_name(result), markdown)} {_plain(result.half_time_score, markdown)}"
-        )
-    lines.extend(
-        [
-            f"Full-time: {_plain(result.full_time_score or '', markdown)}",
-            "",
-            "Markets from the score distribution:",
-            _market_line("1X2", result.markets.result_1x2, result.markets.result_probability),
-            _market_line("BTTS", result.markets.btts, result.markets.btts_probability),
-            _market_line(
-                "Over/Under 2.5",
-                result.markets.over_under_25,
-                result.markets.over_under_probability,
-            ),
-            "",
-            f"Confidence: {result.confidence}% for this scoreline",
-            _plain(result.reasoning or "", markdown),
-        ]
-    )
+    lines.extend(_prob_block(probs, markdown=markdown))
+    score_label = _score_display(result.full_time_score or "")
+    lines.append("")
+    lines.append(f"Most likely score {_em(score_label, markdown)}")
+    if result.top_scores:
+        lines.append("")
+        lines.append(_plain("Score  Probability", markdown))
+        for home_goals, away_goals, probability in result.top_scores:
+            score = f"{home_goals}–{away_goals}"
+            lines.append(
+                f"{_plain(score, markdown)}  {_plain(_pct1(probability), markdown)}"
+            )
+    if result.include_half_time and result.half_time_probabilities:
+        lines.append("")
+        lines.append(_em("Half time", markdown))
+        if result.half_time_score:
+            lines.append(
+                f"Most likely {_plain(_score_display(result.half_time_score), markdown)}"
+            )
+        lines.extend(_prob_block(result.half_time_probabilities, markdown=markdown))
+    over_25 = probs.get("over_25")
+    over_35 = probs.get("over_35")
+    if over_25 is not None or over_35 is not None:
+        lines.append("")
+        parts = []
+        if over_25 is not None:
+            parts.append(f"Over 2.5 {_plain(_pct1(over_25), markdown)}")
+        if over_35 is not None:
+            parts.append(f"Over 3.5 {_plain(_pct1(over_35), markdown)}")
+        lines.append(" · ".join(parts))
+    if result.reasoning:
+        lines.append("")
+        lines.append(_em("Interpretation", markdown))
+        lines.append(_plain(result.reasoning, markdown))
+        if result.reasoning_ar:
+            lines.append("")
+            lines.append(_em("التفسير", markdown))
+            lines.append(_plain(result.reasoning_ar, markdown))
     if result.limitations:
         lines.append("")
         lines.append("Limitations:")
@@ -435,18 +515,30 @@ def _failure(result: PipelineResult, *, markdown: bool) -> str:
     return "\n".join(lines)
 
 
-def _market_line(label: str, choice: str, percent: int | None) -> str:
-    if percent is None:
-        return f"{label}: {choice}"
-    return f"{label}: {choice} ({percent}%)"
+def _prob_block(probabilities: dict[str, float], *, markdown: bool) -> list[str]:
+    lines = []
+    for label, key in (("Home", "home"), ("Draw", "draw"), ("Away", "away")):
+        value = probabilities.get(key)
+        if value is None:
+            continue
+        lines.append(_prob_row(label, value, markdown=markdown))
+    return lines
 
 
-def _half_time_name(result: PipelineResult) -> str:
-    if result.half_time_prediction == "Team A":
-        return result.home_name or "Team A"
-    if result.half_time_prediction == "Team B":
-        return result.away_name or "Team B"
-    return "Draw"
+def _prob_row(label: str, probability: float, *, markdown: bool) -> str:
+    filled = max(0, min(10, int(round(float(probability) * 10))))
+    bar = "█" * filled + "░" * (10 - filled)
+    return (
+        f"{_plain(label, markdown)}  {bar}  {_plain(_pct1(probability), markdown)}"
+    )
+
+
+def _score_display(score: str) -> str:
+    return score.replace("-", "–")
+
+
+def _pct1(probability: float) -> str:
+    return f"{100.0 * float(probability):.1f}%"
 
 
 def _kickoff(value: str | None) -> str | None:

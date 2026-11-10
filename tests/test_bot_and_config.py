@@ -27,8 +27,10 @@ def test_model_defaults_to_gemini_3_5_flash() -> None:
     )
     assert config.gemini_model == "gemini-3.5-flash"
     assert config.gemini_fallback_models == ("gemini-3.8-flash", "gemini-3.5-flash-lite")
-    assert config.database_path == Path("data/predictions.db")
+    assert config.database_path == Path("data/football.db")
     assert config.cache_dir == Path("data/cache")
+    assert config.pre_round_enabled is False
+    assert config.pre_round_interval_seconds == 3600
 
 
 def test_display_model_names_become_api_ids() -> None:
@@ -44,22 +46,57 @@ def test_display_model_names_become_api_ids() -> None:
     assert normalize_gemini_model("Gemini 2.5 Flash-Lite") == "gemini-2.5-flash-lite"
 
 
+def _with_event_loop(callback):
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return callback()
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
 def test_only_start_and_predict_are_registered() -> None:
-    config = load_config(
-        {
-            "BOT_TOKEN": "123456789:AAH1234567890abcdefghijklmnopqrstuv",
-            "FOOTBALL_API_KEY": "fd",
-            "GEMINI_API_KEY": "gem",
-            "DATABASE_PATH": "data/predictions.db",
-        }
-    )
-    application = build_application(config, pipeline=SimpleNamespace())
-    commands = []
-    for handlers in application.handlers.values():
-        for handler in handlers:
-            commands.extend(getattr(handler, "commands", set()))
-    assert set(commands) == {"start", "today", "matches", "predict"}
-    assert application.job_queue is None
+    def run() -> None:
+        config = load_config(
+            {
+                "BOT_TOKEN": "123456789:AAH1234567890abcdefghijklmnopqrstuv",
+                "FOOTBALL_API_KEY": "fd",
+                "GEMINI_API_KEY": "gem",
+                "DATABASE_PATH": "data/football.db",
+                "PRE_ROUND_ENABLED": "0",
+            }
+        )
+        application = build_application(config, pipeline=SimpleNamespace())
+        commands = []
+        for handlers in application.handlers.values():
+            for handler in handlers:
+                commands.extend(getattr(handler, "commands", set()))
+        assert set(commands) == {"start", "today", "matches", "predict"}
+        assert application.job_queue is None
+        assert application.bot_data["pre_round_enabled"] is False
+
+    _with_event_loop(run)
+
+
+def test_pre_round_can_be_enabled_on_the_application() -> None:
+    def run() -> None:
+        config = load_config(
+            {
+                "BOT_TOKEN": "123456789:AAH1234567890abcdefghijklmnopqrstuv",
+                "FOOTBALL_API_KEY": "fd",
+                "GEMINI_API_KEY": "gem",
+                "DATABASE_PATH": "data/football.db",
+                "PRE_ROUND_ENABLED": "1",
+                "PRE_ROUND_INTERVAL_SECONDS": "120",
+            }
+        )
+        application = build_application(config, pipeline=SimpleNamespace())
+        assert application.bot_data["pre_round_enabled"] is True
+        assert application.bot_data["pre_round_interval_seconds"] == 120.0
+        assert application.job_queue is None
+
+    _with_event_loop(run)
 
 
 def test_report_escapes_markdown_and_hides_ineligible_half_time() -> None:
@@ -88,6 +125,59 @@ def test_report_escapes_markdown_and_hides_ineligible_half_time() -> None:
     assert "No score was estimated." in failure
 
 
+def test_report_shows_distribution_layout_with_gemini_interpretation() -> None:
+    shown = PipelineResult(
+        run_id=5,
+        status="completed",
+        stage=None,
+        reason=None,
+        full_time_score="2-1",
+        markets=Markets("Home", "Yes", "Over", result_probability=48),
+        confidence=14,
+        reasoning="Home attack edge in the snapshot.",
+        reasoning_ar="تفوق هجومي للمضيف في اللقطة.",
+        include_half_time=True,
+        half_time_prediction="Team A",
+        half_time_score="1-0",
+        half_time_probabilities={"home": 0.369, "draw": 0.339, "away": 0.292},
+        home_name="Arsenal",
+        away_name="Chelsea",
+        competition_name="Premier League",
+        probabilities={
+            "home": 0.456,
+            "draw": 0.211,
+            "away": 0.333,
+            "over_25": 0.729,
+            "over_35": 0.524,
+        },
+        top_scores=[
+            (2, 1, 0.083),
+            (1, 1, 0.081),
+            (2, 2, 0.072),
+            (1, 2, 0.070),
+            (3, 1, 0.056),
+            (3, 2, 0.049),
+            (2, 0, 0.048),
+            (1, 0, 0.046),
+        ],
+    )
+    text = render_report(shown, markdown=False)
+    assert "Home  █████░░░░░  45.6%" in text
+    assert "Most likely score 2–1" in text
+    assert "2–1  8.3%" in text
+    assert "1–0  4.6%" in text
+    assert "Half time" in text
+    assert "Most likely 1–0" in text
+    assert "Over 2.5 72.9%" in text
+    assert "Over 3.5 52.4%" in text
+    assert "Interpretation" in text
+    assert "Home attack edge in the snapshot." in text
+    assert "التفسير" in text
+    assert "تفوق هجومي للمضيف في اللقطة." in text
+    assert "BTTS:" not in text
+    assert "Markets from the score distribution" not in text
+
+
 def test_predict_rejects_a_bad_command_before_the_provider(tmp_path) -> None:
     async def run():
         holder = Harness(tmp_path)
@@ -103,7 +193,9 @@ def test_predict_rejects_a_bad_command_before_the_provider(tmp_path) -> None:
         # The handler needs a pipeline. Construct one with the harness client by running
         # a local execute wrapper's pipeline after a dummy open.
         opened = await _open(holder)
-        context = SimpleNamespace(bot_data={"pipeline": opened})
+        context = SimpleNamespace(
+            bot_data={"pipeline": opened, "active_chats": {5}},
+        )
         await predict_command(SimpleNamespace(message=message), context)
         return message, holder
 
@@ -123,7 +215,10 @@ def test_predict_acknowledges_one_match_and_does_not_swap_it(tmp_path) -> None:
             from_user=SimpleNamespace(id=9),
             reply_text=AsyncMock(),
         )
-        await predict(SimpleNamespace(message=message), SimpleNamespace(bot_data={"pipeline": pipeline}))
+        await predict(
+            SimpleNamespace(message=message),
+            SimpleNamespace(bot_data={"pipeline": pipeline, "active_chats": {5}}),
+        )
         result = await pipeline.execute(
             chat_id=5,
             user_id=9,
@@ -138,8 +233,8 @@ def test_predict_acknowledges_one_match_and_does_not_swap_it(tmp_path) -> None:
     assert "Only this match is analyzed." in message.reply_text.await_args_list[0].args[0]
     assert "Arsenal vs Chelsea" in message.reply_text.await_args_list[0].args[0]
     report = message.reply_text.await_args_list[1].args[0]
-    assert "Markets from the score distribution" in report
-    assert "Full-time:" in report
+    assert "Most likely score" in report
+    assert "Interpretation" in report
     # The explicit swapped command is a different request and must not reuse the first fixture.
     assert swapped.stage == "fixture"
     assert "not swapped" in swapped.reason

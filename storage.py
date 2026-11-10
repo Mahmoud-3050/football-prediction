@@ -10,7 +10,7 @@ from typing import Any
 
 from models import AnalysisSnapshot, ProducedPrediction
 
-SCHEMA = """
+BOT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS prediction_run (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER,
@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS prediction_version (
 );
 """
 
+# Back-compat alias for older imports/tests.
+SCHEMA = BOT_SCHEMA
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -61,11 +64,15 @@ class Storage:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        self._conn.execute("PRAGMA busy_timeout = 30000")
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        # Bot + laboratory tables live in the same file.
+        from database import ensure_shared_schemas
+
+        ensure_shared_schemas(self._conn)
 
     def close(self) -> None:
         self._conn.close()
@@ -177,6 +184,23 @@ class Storage:
                 (run_id,),
             )
         )
+
+    def has_prediction_for_match(self, match_id: int) -> bool:
+        """True when a completed or partial version already exists for this fixture."""
+
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM prediction_version v
+            JOIN prediction_snapshot s ON s.id = v.snapshot_id
+            JOIN prediction_run r ON r.id = v.run_id
+            WHERE s.match_id = ?
+              AND r.status IN ('completed', 'partial')
+            LIMIT 1
+            """,
+            (match_id,),
+        ).fetchone()
+        return row is not None
 
 
 def loads(value: str) -> Any:

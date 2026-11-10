@@ -225,6 +225,7 @@ class ScorePrediction:
     full_time_score: str
     confidence_percentage: int
     tactical_reasoning: str
+    tactical_reasoning_ar: str | None = None
 
 
 @dataclass
@@ -239,6 +240,8 @@ class ProducedPrediction:
     lambda_home: float | None = None
     lambda_away: float | None = None
     probabilities: dict[str, float] | None = None
+    half_time_probabilities: dict[str, float] | None = None
+    top_scores: list[tuple[int, int, float]] | None = None
 
     def output(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -250,6 +253,8 @@ class ProducedPrediction:
             "markets": asdict(self.markets),
             "markets_derived_from_distribution": True,
         }
+        if self.prediction.tactical_reasoning_ar:
+            payload["tactical_reasoning_ar"] = self.prediction.tactical_reasoning_ar
         if self.lambda_home is not None and self.lambda_away is not None:
             payload["lambda_home"] = round(self.lambda_home, 4)
             payload["lambda_away"] = round(self.lambda_away, 4)
@@ -257,6 +262,20 @@ class ProducedPrediction:
             payload["probabilities"] = {
                 key: round(value, 4) for key, value in self.probabilities.items()
             }
+        if self.half_time_probabilities is not None:
+            payload["half_time_probabilities"] = {
+                key: round(value, 4)
+                for key, value in self.half_time_probabilities.items()
+            }
+        if self.top_scores is not None:
+            payload["top_scores"] = [
+                {
+                    "home_goals": home_goals,
+                    "away_goals": away_goals,
+                    "probability": round(probability, 4),
+                }
+                for home_goals, away_goals, probability in self.top_scores
+            ]
         return payload
 
 
@@ -273,10 +292,14 @@ class PipelineResult:
     kickoff: str | None = None
     half_time_prediction: str | None = None
     half_time_score: str | None = None
+    half_time_probabilities: dict[str, float] | None = None
     full_time_score: str | None = None
     markets: Markets | None = None
     confidence: int | None = None
     reasoning: str | None = None
+    reasoning_ar: str | None = None
     limitations: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     include_half_time: bool = False
+    probabilities: dict[str, float] | None = None
+    top_scores: list[tuple[int, int, float]] | None = None

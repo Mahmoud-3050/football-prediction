@@ -37,7 +37,7 @@ def make_match(
     half_home: int | None = 1,
     half_away: int | None = 0,
     competition: str = "PL",
-    when: str = "2026-04-12T15:00:00Z",
+    when: str = "2026-12-12T15:00:00Z",
     last_updated: str | None = STAMP,
 ) -> dict[str, Any]:
     return {
@@ -91,7 +91,7 @@ def form_payload(
                 half_home=half_home,
                 half_away=half_away,
                 competition=competition,
-                when=f"2026-02-{20 - index:02d}T15:00:00Z",
+                when=f"2026-09-{20 - index:02d}T15:00:00Z",
             )
         )
     return {"matches": matches, "lastUpdated": STAMP}
@@ -121,7 +121,10 @@ def standings_for(teams: list[dict[str, Any]], *, last_updated: str | None = STA
 
 
 def valid_model_json(**overrides: Any) -> str:
-    body = {"tactical_reasoning": "The home club's recent wins are in the snapshot."}
+    body = {
+        "tactical_reasoning": "The home club's recent wins are in the snapshot.",
+        "tactical_reasoning_ar": "انتصارات النادي المضيف الأخيرة موجودة في اللقطة.",
+    }
     body.update(overrides)
     return json.dumps(body)
 
@@ -140,9 +143,25 @@ class Api:
             1: form_payload(ARSENAL, SPURS, start_id=100, first_opponent=CHELSEA),
             2: form_payload(CHELSEA, SPURS, start_id=200, venue="away"),
         }
+        self.competition_matches: dict[str, Any] | None = None
         self.h2h = {"matches": [], "lastUpdated": STAMP}
         self.status_overrides: dict[str, tuple[int, dict[str, Any], int]] = {}
         self._override_seen: dict[str, int] = {}
+
+    def _competition_finished_payload(self) -> dict[str, Any]:
+        if self.competition_matches is not None:
+            return self.competition_matches
+        matches: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for payload in self.forms.values():
+            for match in payload.get("matches") or []:
+                match_id = match.get("id")
+                if isinstance(match_id, int) and match_id in seen:
+                    continue
+                if isinstance(match_id, int):
+                    seen.add(match_id)
+                matches.append(match)
+        return {"matches": matches, "lastUpdated": STAMP}
 
     async def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
@@ -168,6 +187,8 @@ class Api:
             return httpx.Response(200, json={"teams": self.teams, "competition": {"code": self.competition}})
         if path == f"/v4/competitions/{self.competition}/standings":
             return httpx.Response(200, json=self.standings)
+        if path == f"/v4/competitions/{self.competition}/matches":
+            return httpx.Response(200, json=self._competition_finished_payload())
         if path.startswith("/v4/teams/") and path.endswith("/matches"):
             team_id = int(path.split("/")[3])
             if request.url.params.get("status") == "FINISHED":

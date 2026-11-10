@@ -4,6 +4,15 @@ __pycache__/
 *.py[cod]
 .env
 data/
+backups/
 .pytest_cache/
 .mypy_cache/
 *.db
+.DS_Store
+.cursor/
+*.log
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/

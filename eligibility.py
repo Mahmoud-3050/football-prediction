@@ -58,10 +58,14 @@ def evaluate(
     away_row, away_row_problem = _standing_row(standings_payload, away)
     home_scored = _scored_matches(home_finished_payload)
     away_scored = _scored_matches(away_finished_payload)
+    home_same_league = _same_competition_matches(home_scored, competition.code)
+    away_same_league = _same_competition_matches(away_scored, competition.code)
     home_window = home_scored[:FORM_WINDOW]
     away_window = away_scored[:FORM_WINDOW]
     home_facts = _facts(home, home_window, competition.code)
     away_facts = _facts(away, away_window, competition.code)
+    home_ht_samples = _half_time_sample_count(home_same_league, home.id)
+    away_ht_samples = _half_time_sample_count(away_same_league, away.id)
 
     fixture_matches = (
         fixture.home_team_id == home.id
@@ -191,13 +195,13 @@ def evaluate(
         limitations.extend(_competition_limitations(home, home_facts, competition.name))
         limitations.extend(_competition_limitations(away, away_facts, competition.name))
         short_half_time = []
-        if home_facts.half_time_samples < MINIMUM_SCORED_MATCHES:
-            short_half_time.append(f"{home.name} ({home_facts.half_time_samples})")
-        if away_facts.half_time_samples < MINIMUM_SCORED_MATCHES:
-            short_half_time.append(f"{away.name} ({away_facts.half_time_samples})")
+        if home_ht_samples < MINIMUM_SCORED_MATCHES:
+            short_half_time.append(f"{home.name} ({home_ht_samples})")
+        if away_ht_samples < MINIMUM_SCORED_MATCHES:
+            short_half_time.append(f"{away.name} ({away_ht_samples})")
         if short_half_time:
             limitations.append(
-                "Half-time scores on fewer than 3 of the last 5 scored matches for "
+                "Half-time scores on fewer than 3 same-league finished matches for "
                 + " and ".join(short_half_time)
                 + ". Half-time result and half-time score are skipped."
             )
@@ -209,8 +213,8 @@ def evaluate(
 
     include_half_time = (
         blocking_stage is None
-        and home_facts.half_time_samples >= MINIMUM_SCORED_MATCHES
-        and away_facts.half_time_samples >= MINIMUM_SCORED_MATCHES
+        and home_ht_samples >= MINIMUM_SCORED_MATCHES
+        and away_ht_samples >= MINIMUM_SCORED_MATCHES
     )
     return Evaluation(
         checks=checks,
@@ -343,6 +347,21 @@ def _scored_matches(payload: dict[str, Any]) -> list[dict[str, Any]]:
     ]
     matches.sort(key=lambda match: match.get("utcDate") or "", reverse=True)
     return matches
+
+
+def _same_competition_matches(
+    matches: list[dict[str, Any]],
+    competition_code: str,
+) -> list[dict[str, Any]]:
+    return [
+        match
+        for match in matches
+        if (match.get("competition") or {}).get("code") == competition_code
+    ]
+
+
+def _half_time_sample_count(matches: list[dict[str, Any]], team_id: int) -> int:
+    return sum(1 for match in matches if _consistent_half_time(match, team_id) is not None)
 
 
 def _omitted_full_time_count(payload: dict[str, Any]) -> int:

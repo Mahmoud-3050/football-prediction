@@ -80,7 +80,25 @@ def test_missing_half_time_skips_that_market_and_keeps_full_time(missing_half_ti
     assert decision.include_half_time is False
     assert decision.home_facts.half_time_goals_scored is None
     assert decision.home_facts.second_half_goals_scored is None
-    assert any("Half-time" in item for item in decision.limitations)
+    assert any("same-league finished matches" in item for item in decision.limitations)
+
+
+def test_half_time_uses_season_to_date_same_league_samples_not_only_last_five() -> None:
+    # Last five lack half-time, but earlier same-league games supply enough samples.
+    recent = form_payload(ARSENAL, SPURS, count=5, start_id=100, with_half_time=False)
+    older = form_payload(ARSENAL, SPURS, count=3, start_id=300, with_half_time=True)
+    for index, match in enumerate(older["matches"]):
+        match["utcDate"] = f"2026-01-{20 - index:02d}T15:00:00Z"
+    home = {
+        "matches": recent["matches"] + older["matches"],
+        "lastUpdated": recent["lastUpdated"],
+    }
+    away = form_payload(CHELSEA, SPURS, start_id=200, with_half_time=True)
+    decision = _evaluate(home_finished_payload=home, away_finished_payload=away)
+    assert decision.eligible is True
+    assert decision.include_half_time is True
+    assert decision.home_facts.window_size == 5
+    assert decision.home_facts.half_time_samples == 0
 
 
 def test_other_competitions_are_allowed_with_a_limitation() -> None:

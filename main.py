@@ -1,7 +1,7 @@
 """Long polling for Telegram commands.
 
-Polling only waits for a message. It does not schedule predictions.
-/today loads fixtures only when that command arrives.
+Send /start in a chat to enable the bot there. Background tomorrow predictions
+and standings refresh run separately via `python -m jobs`.
 """
 
 from __future__ import annotations
@@ -45,6 +45,13 @@ def main() -> None:
         config.gemini_model,
         ", ".join(config.gemini_fallback_models) or "none",
     )
+    logging.getLogger(__name__).info(
+        "Telegram bot waits for /start in each chat before other commands"
+    )
+    if config.pre_round_enabled:
+        logging.getLogger(__name__).info(
+            "Legacy in-process pre-round enabled (prefer: python -m jobs)"
+        )
     application = build_application(config, build_pipeline(config))
     application.run_polling()
 

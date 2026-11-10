@@ -10,12 +10,16 @@ from typing import Mapping
 
 from dotenv import load_dotenv
 
+from db_paths import DEFAULT_DATABASE_PATH, resolve_database_path
+
 REQUIRED_KEYS = ("BOT_TOKEN", "FOOTBALL_API_KEY", "GEMINI_API_KEY")
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_GEMINI_FALLBACKS = ("gemini-3.8-flash", "gemini-3.5-flash-lite")
 _MODEL_ID = re.compile(r"^gemini-[a-z0-9]+(?:[.\-][a-z0-9]+)*$")
-DEFAULT_DATABASE_PATH = "data/predictions.db"
 DEFAULT_LOG_LEVEL = "INFO"
+# Pre-round inside the Telegram process is off by default; use `python -m jobs`.
+DEFAULT_PRE_ROUND_ENABLED = False
+DEFAULT_PRE_ROUND_INTERVAL_SECONDS = 3600
 
 
 class ConfigError(Exception):
@@ -32,6 +36,8 @@ class Config:
     log_level: str
     database_path: Path
     cache_dir: Path
+    pre_round_enabled: bool
+    pre_round_interval_seconds: float
 
 
 def load_config(environ: Mapping[str, str] | None = None) -> Config:
@@ -53,7 +59,7 @@ def load_config(environ: Mapping[str, str] | None = None) -> Config:
             "Missing required environment variables: " + ", ".join(missing)
         )
 
-    database_path = Path(source.get("DATABASE_PATH") or DEFAULT_DATABASE_PATH)
+    database_path = resolve_database_path(dict(source))
     gemini_model = normalize_gemini_model(source.get("GEMINI_MODEL") or "")
     return Config(
         bot_token=source["BOT_TOKEN"].strip(),
@@ -67,6 +73,14 @@ def load_config(environ: Mapping[str, str] | None = None) -> Config:
         log_level=(source.get("LOG_LEVEL") or DEFAULT_LOG_LEVEL).strip() or DEFAULT_LOG_LEVEL,
         database_path=database_path,
         cache_dir=database_path.parent / "cache",
+        pre_round_enabled=_bool(
+            source.get("PRE_ROUND_ENABLED"),
+            default=DEFAULT_PRE_ROUND_ENABLED,
+        ),
+        pre_round_interval_seconds=_positive_float(
+            source.get("PRE_ROUND_INTERVAL_SECONDS"),
+            default=float(DEFAULT_PRE_ROUND_INTERVAL_SECONDS),
+        ),
     )
 
 
@@ -111,3 +125,19 @@ def _fallback_models(raw: str | None, *, preferred: str) -> tuple[str, ...]:
 def _present(source: Mapping[str, str], key: str) -> bool:
     value = source.get(key)
     return bool(value and str(value).strip())
+
+
+def _bool(raw: str | None, *, default: bool) -> bool:
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _positive_float(raw: str | None, *, default: float) -> float:
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default

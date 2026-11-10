@@ -22,14 +22,23 @@ def test_completed_prediction_derives_markets_and_stores_the_trace(tmp_path) -> 
     assert result.markets.btts == estimate.markets.btts
     assert result.markets.over_under_25 == estimate.markets.over_under_25
     assert result.include_half_time is True
-    report = render_report(result)
-    assert f"1X2: {estimate.markets.result_1x2} ({estimate.markets.result_probability}%)" in report
-    assert f"BTTS: {estimate.markets.btts}" in report
-    assert "Markets from the score distribution" in report
+    report = render_report(result, markdown=False)
+    assert "Most likely score" in report
+    assert "Interpretation" in report
+    assert "Over 2.5" in report
+    assert "Over 3.5" in report
     assert "Statistical estimate, not a betting tip." in report
     assert f"Run id: {result.run_id}" in report
-    assert "Half-time:" in report
-    assert f"Full-time: {estimate.full_time_score}" in report
+    assert "Half time" in report
+    assert result.probabilities is not None
+    assert "home" in result.probabilities
+    assert "over_35" in result.probabilities
+    assert result.top_scores
+    assert result.top_scores[0][2] >= result.top_scores[-1][2]
+    score_label = estimate.full_time_score.replace("-", "–")
+    assert f"Most likely score {score_label}" in report
+    assert result.half_time_probabilities is not None
+    assert abs(sum(result.half_time_probabilities.values()) - 1.0) < 1e-9
     assert holder.api.calls[0]["token"] == "fd-test-key"
     assert not any(call["path"].endswith("/head2head") for call in holder.api.calls)
 
@@ -55,7 +64,7 @@ def test_completed_prediction_derives_markets_and_stores_the_trace(tmp_path) -> 
     echoed = json.loads(holder.prompts[0].split("SNAPSHOT:\n", 1)[1])
     assert echoed["resolved"]["home_team_id"] == 1
     assert echoed["resolved"]["away_team_id"] == 2
-    assert holder.schemas[0]["required"] == ["tactical_reasoning"]
+    assert holder.schemas[0]["required"] == ["tactical_reasoning", "tactical_reasoning_ar"]
     assert "lambda_home" in holder.prompts[0]
     assert "Do not invent a different score" in holder.prompts[0]
     stored = loads(snapshots[0]["payload"])
@@ -108,9 +117,9 @@ def test_missing_half_time_limits_the_prompt_and_the_report(tmp_path, missing_ha
     assert result.half_time_score is None
     assert "half_time_prediction" not in holder.schemas[0]["required"]
     assert "Do not return a half-time" in holder.prompts[0]
-    report = render_report(result)
-    assert "Half-time:" not in report
-    assert f"Full-time: {estimate.full_time_score}" in report
+    report = render_report(result, markdown=False)
+    assert "Half time" not in report
+    assert f"Most likely score {estimate.full_time_score.replace('-', '–')}" in report
     assert any("Half-time" in item for item in result.limitations)
 
 
@@ -207,15 +216,13 @@ def test_no_head_to_head_calls_the_endpoint_once(tmp_path) -> None:
 
 def _estimate_for(holder: Harness, *, include_half_time: bool):
     return estimate_score(
-        standings_payload=holder.api.standings,
+        competition_finished_payload=holder.api._competition_finished_payload(),
         home_finished_payload=holder.api.forms[1],
         away_finished_payload=holder.api.forms[2],
-        competition_code=holder.api.competition,
         home_team_id=1,
         away_team_id=2,
-        home_team_name="Arsenal FC",
-        away_team_name="Chelsea FC",
         include_half_time=include_half_time,
+        kickoff="2026-12-12T15:00:00Z",
     )
 
 

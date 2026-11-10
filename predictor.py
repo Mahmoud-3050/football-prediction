@@ -1,4 +1,4 @@
-"""Gemini reasoning for a score the Dixon-Coles model already chose.
+"""Gemini reasoning for a score the statistical model already chose.
 
 The model is asked for tactical_reasoning only. Scores, confidence, and
 markets come from the score distribution. Invalid JSON is retried once.
@@ -20,12 +20,12 @@ from models import (
     ProducedPrediction,
     ScorePrediction,
 )
-from score_model import ScoreEstimate
+from score_model import ScoreEstimate, ranked_exact_scores
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "v2"
-SCHEMA_VERSION = "v2"
+PROMPT_VERSION = "v3"
+SCHEMA_VERSION = "v3"
 SCORE_RE = re.compile(r"^(\d+)-(\d+)$")
 TRANSIENT_MARKERS = (
     "503",
@@ -46,26 +46,54 @@ HTTP_TIMEOUT_MS = 20_000
 Generate = Callable[[str, dict[str, Any]], Awaitable[str]]
 
 
-def statistical_reasoning(estimate: ScoreEstimate) -> str:
+def statistical_reasoning(
+    estimate: ScoreEstimate,
+    *,
+    home: str,
+    away: str,
+) -> tuple[str, str]:
+    """Fan-facing EN + AR blurb when Gemini is unavailable."""
+
     markets = estimate.markets
-    parts = [
-        (
-            f"Full-time score {estimate.full_time_score} comes from the Dixon-Coles "
-            f"statistical model (λ_home={estimate.lambda_home:.2f}, "
-            f"λ_away={estimate.lambda_away:.2f})."
-        ),
-        (
-            f"1X2 {markets.result_1x2} ({markets.result_probability}%), "
-            f"BTTS {markets.btts} ({markets.btts_probability}%), "
-            f"O/U 2.5 {markets.over_under_25} ({markets.over_under_probability}%)."
-        ),
-    ]
-    if estimate.half_time_score and estimate.half_time_prediction:
-        parts.append(
-            f"Half-time {estimate.half_time_score} ({estimate.half_time_prediction})."
-        )
-    parts.append("Gemini reasoning was unavailable for this request.")
-    return " ".join(parts)
+    score = estimate.full_time_score.replace("-", "–")
+    result = markets.result_1x2
+    if result == "Home":
+        lean_en = f"{home} are favored to take the three points at home"
+        lean_ar = f"يُرجَّح أن يحسم {home} المباراة لصالحه على أرضه"
+    elif result == "Away":
+        lean_en = f"{away} are favored to win away from home"
+        lean_ar = f"يُرجَّح أن يفوز {away} خارج أرضه"
+    else:
+        lean_en = f"A draw between {home} and {away} looks the most likely result"
+        lean_ar = f"يبدو التعادل بين {home} و{away} النتيجة الأرجح"
+
+    if markets.over_under_25 == "Over":
+        goals_en = "the match looks open enough for three or more goals"
+        goals_ar = "تبدو المباراة مفتوحة بما يكفي لثلاثة أهداف أو أكثر"
+    else:
+        goals_en = "a tighter, lower-scoring game looks more likely"
+        goals_ar = "يبدو سيناريو مباراة أضيق وأقل أهدافاً أكثر ترجيحاً"
+
+    if markets.btts == "Yes":
+        btts_en = "both sides are tipped to get on the scoresheet"
+        btts_ar = "يُتوقَّع أن يسجل الطرفان"
+    else:
+        btts_en = "at least one side may be shut out"
+        btts_ar = "قد يخرج أحد الطرفين دون تسجيل"
+
+    en = (
+        f"{lean_en}. The most likely full-time score is {score}, "
+        f"and {goals_en}, with {btts_en}."
+    )
+    ar = (
+        f"{lean_ar}. النتيجة الأكثر ترجيحاً عند نهاية المباراة هي {score}، "
+        f"و{goals_ar}، و{btts_ar}."
+    )
+    if estimate.half_time_score:
+        ht = estimate.half_time_score.replace("-", "–")
+        en += f" At half-time, {ht} is the most likely score."
+        ar += f" وعند الاستراحة، تبدو {ht} النتيجة الأرجح."
+    return en, ar
 
 
 def derive_markets(full_time_score: str) -> Markets:
@@ -94,8 +122,11 @@ def require_score(value: Any, field_name: str) -> tuple[int, int]:
 def build_schema() -> dict[str, Any]:
     return {
         "type": "OBJECT",
-        "properties": {"tactical_reasoning": {"type": "STRING"}},
-        "required": ["tactical_reasoning"],
+        "properties": {
+            "tactical_reasoning": {"type": "STRING"},
+            "tactical_reasoning_ar": {"type": "STRING"},
+        },
+        "required": ["tactical_reasoning", "tactical_reasoning_ar"],
     }
 
 
@@ -146,33 +177,74 @@ def build_prompt(
             f"{previous_error}\nReturn a corrected JSON object.\n"
         )
     return (
-        "Explain the score_model estimate. Do not invent a different score.\n"
-        f"Team A is the home club {home}. Team B is the away club {away}.\n"
-        "Use only the snapshot and this estimate. Do not invent results, table rows, injuries, or odds.\n"
+        "Write a short football-fan interpretation of this match estimate. "
+        "Do not invent a different score.\n"
+        f"Home club: {home}. Away club: {away}.\n"
+        "Use only the snapshot and this estimate. Do not invent results, table rows, "
+        "injuries, or odds.\n"
         "record is wins-draws-losses. results are ordered most recent first.\n"
-        f"Full-time score: {estimate.full_time_score}. "
-        f"lambda_home {estimate.lambda_home:.4f}. lambda_away {estimate.lambda_away:.4f}. "
-        f"1X2 {markets.result_1x2} ({markets.result_probability}%). "
-        f"BTTS {markets.btts} ({markets.btts_probability}%). "
-        f"Over/Under 2.5 {markets.over_under_25} ({markets.over_under_probability}%).\n"
-        "Return JSON with tactical_reasoning citing only these facts.\n"
+        f"Most likely full-time score: {estimate.full_time_score}. "
+        f"Most likely result: {markets.result_1x2} "
+        f"({markets.result_probability}%). "
+        f"Both teams to score: {markets.btts} ({markets.btts_probability}%). "
+        f"Over/Under 2.5: {markets.over_under_25} "
+        f"({markets.over_under_probability}%).\n"
+        "Style rules:\n"
+        "- 2 to 4 short sentences a casual fan would understand.\n"
+        "- Talk about the match: who looks stronger, likely score, open or tight game.\n"
+        "- Cite form, table position, or head-to-head only when present in the snapshot.\n"
+        "- Never mention Poisson, lambda, λ, ratios, shrinkage, grids, models, "
+        "or any statistical jargon.\n"
+        "Return JSON with:\n"
+        "- tactical_reasoning: that English interpretation.\n"
+        "- tactical_reasoning_ar: Arabic translation of the same text "
+        "(same meaning, not a new analysis).\n"
         f"{half_time_rules}"
-        "Markets such as 1X2 are not part of your answer.\n"
+        "Do not list market labels as a raw dump; weave the idea into prose.\n"
         f"{correction}\n"
         "ESTIMATE:\n"
-        f"{json.dumps(estimate.public(), ensure_ascii=False, sort_keys=True)}\n"
+        f"{json.dumps(_public_for_prompt(estimate), ensure_ascii=False, sort_keys=True)}\n"
         "SNAPSHOT:\n"
         f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
     )
 
 
-def validate_reasoning(payload: Any) -> str:
+def _public_for_prompt(estimate: ScoreEstimate) -> dict[str, Any]:
+    """Score/market facts for Gemini without low-level rate jargon."""
+
+    payload = estimate.public()
+    for key in (
+        "lambda_home",
+        "lambda_away",
+        "k",
+        "tail_tolerance",
+        "dependence",
+        "rho",
+        "ratios",
+        "ratio_mode",
+        "prior_mean_mode",
+        "decay_half_life_days",
+        "half_time_share_mode",
+        "half_time_share_home",
+        "half_time_share_away",
+        "half_time_league_share",
+        "matrix",
+        "max_goals",
+    ):
+        payload.pop(key, None)
+    return payload
+
+
+def validate_reasoning(payload: Any) -> tuple[str, str]:
     if not isinstance(payload, dict):
         raise ValueError("The model response was not a JSON object.")
     reasoning = payload.get("tactical_reasoning")
     if not isinstance(reasoning, str) or not reasoning.strip():
         raise ValueError("tactical_reasoning must be a non-empty string.")
-    return reasoning.strip()
+    reasoning_ar = payload.get("tactical_reasoning_ar")
+    if not isinstance(reasoning_ar, str) or not reasoning_ar.strip():
+        raise ValueError("tactical_reasoning_ar must be a non-empty string.")
+    return reasoning.strip(), reasoning_ar.strip()
 
 
 class Predictor:
@@ -220,7 +292,7 @@ class Predictor:
                 try:
                     if not raw_text or not str(raw_text).strip():
                         raise ValueError("The model returned an empty response.")
-                    reasoning = validate_reasoning(coerce_json(raw_text))
+                    reasoning, reasoning_ar = validate_reasoning(coerce_json(raw_text))
                 except ValueError as exc:
                     last_error = str(exc)
                     previous_error = last_error
@@ -236,6 +308,7 @@ class Predictor:
                 return self._produced(
                     estimate,
                     reasoning=reasoning,
+                    reasoning_ar=reasoning_ar,
                     version_number=attempt,
                     model_id=self._last_model_used,
                     notes=notes,
@@ -250,9 +323,15 @@ class Predictor:
             )
             if note not in notes:
                 notes.append(note)
+            home = snapshot.home_team_name or snapshot.request_home or "Home"
+            away = snapshot.away_team_name or snapshot.request_away or "Away"
+            reasoning, reasoning_ar = statistical_reasoning(
+                estimate, home=home, away=away
+            )
             return self._produced(
                 estimate,
-                reasoning=statistical_reasoning(estimate),
+                reasoning=reasoning,
+                reasoning_ar=reasoning_ar,
                 version_number=1,
                 model_id="score-model",
                 notes=notes,
@@ -263,6 +342,7 @@ class Predictor:
         estimate: ScoreEstimate,
         *,
         reasoning: str,
+        reasoning_ar: str | None,
         version_number: int,
         model_id: str,
         notes: list[str],
@@ -274,6 +354,7 @@ class Predictor:
                 full_time_score=estimate.full_time_score,
                 confidence_percentage=estimate.confidence_percentage,
                 tactical_reasoning=reasoning,
+                tactical_reasoning_ar=reasoning_ar,
             ),
             markets=estimate.markets,
             version_number=version_number,
@@ -284,6 +365,12 @@ class Predictor:
             lambda_home=estimate.lambda_home,
             lambda_away=estimate.lambda_away,
             probabilities=dict(estimate.probabilities),
+            half_time_probabilities=(
+                None
+                if estimate.half_time_probabilities is None
+                else dict(estimate.half_time_probabilities)
+            ),
+            top_scores=ranked_exact_scores(estimate.matrix, limit=8),
         )
 
     async def _call(self, prompt: str, schema: dict[str, Any]) -> str:

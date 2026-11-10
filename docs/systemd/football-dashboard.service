@@ -1,0 +1,18 @@
+[Unit]
+Description=Football Predictor laboratory dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/football-predictor
+EnvironmentFile=/opt/football-predictor/.env
+# Keep the app on loopback; terminate TLS at Caddy/nginx.
+ExecStart=/opt/football-predictor/.venv/bin/python -m laboratory serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+User=football
+Group=football
+
+[Install]
+WantedBy=multi-user.target
