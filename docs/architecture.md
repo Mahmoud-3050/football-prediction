@@ -11,7 +11,7 @@ The bot answers Telegram commands on demand. `/today` lists fixtures without pre
 /predict #560638
 ```
 
-`/today` and `/matches DD-MM-YYYY` load fixtures for Premier League (`PL`), UEFA Champions League (`CL`), Primera Division (`PD`), Serie A (`SA`), Bundesliga (`BL1`), and Ligue 1 (`FL1`). Days and kickoff times use Africa/Cairo. `/matches` treats `DD-MM-YYYY` as a Cairo calendar day, requests the overlapping UTC date window, then keeps fixtures that kick off on that Cairo day. Each line shows the Football-Data.org match id, and each match also gets an inline button (`callback_data` `p:<id>`) that starts the same analysis as `/predict <id>`. The list text itself does not call Gemini; the button tap does.
+`/today` and `/matches DD-MM-YYYY` load fixtures for Premier League (`PL`), UEFA Champions League (`CL`), Primera Division (`PD`), Serie A (`SA`), Bundesliga (`BL1`), Ligue 1 (`FL1`), Primeira Liga (`PPL`), and Eredivisie (`DED`) — the same set as server jobs and `/predict <id>`. Days and kickoff times use Africa/Cairo. `/matches` treats `DD-MM-YYYY` as a Cairo calendar day, requests the overlapping UTC date window, then keeps fixtures that kick off on that Cairo day. Each line shows the Football-Data.org match id, and each match also gets an inline button (`callback_data` `p:<id>`) that starts the same analysis as `/predict <id>`. The list text itself does not call Gemini; the button tap does.
 
 Empty home, away, or competition text is rejected before any provider call. The same club on both sides is rejected the same way. Names may contain spaces. `vs` splits the clubs. `|` splits the competition. A bare numeric body is treated as a match id from `/today`.
 

@@ -516,6 +516,7 @@ class Pipeline:
             confidence=produced.prediction.confidence_percentage,
             reasoning=produced.prediction.tactical_reasoning,
             reasoning_ar=produced.prediction.tactical_reasoning_ar,
+            model_id=produced.model_id,
             limitations=produced.limitations,
             warnings=decision.warnings,
             include_half_time=include_half_time,

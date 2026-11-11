@@ -2,14 +2,7 @@
 
 from __future__ import annotations
 
-# Leagues priced/refreshed by server jobs (includes cups that expose fixtures).
-JOB_COMPETITIONS: tuple[str, ...] = (
-    "PL",
-    "CL",
-    "PD",
-    "SA",
-    "BL1",
-    "FL1",
-    "PPL",
-    "DED",
-)
+from data_fetcher import LIVE_MATCH_COMPETITIONS
+
+# Same leagues as /today and /predict so jobs never price a gated-out fixture.
+JOB_COMPETITIONS: tuple[str, ...] = LIVE_MATCH_COMPETITIONS

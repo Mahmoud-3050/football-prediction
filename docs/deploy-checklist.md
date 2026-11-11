@@ -24,7 +24,8 @@ Use this before exposing the laboratory dashboard and shared SQLite database.
 - [ ] Copy `data/football.db` to the host (or restore from backup) and set `DATABASE_PATH`
 - [ ] Run `pytest` on the deploy machine/image before cutover
 - [ ] Install process managers from `docs/systemd/` (bot, jobs, dashboard)
-- [ ] Schedule DB backup: `scripts/backup_db.sh` via cron/systemd timer
+- [ ] Install the backup **timer** (`football-backup.timer`) so SQLite is snapshotted daily
+- [ ] Keep the dashboard behind HTTPS proxy only (`DASHBOARD_HOST=127.0.0.1`); never publish :8765 on WAN
 - [ ] Disk headroom: keep free space ≥ 2× DB size for vacuum/backup
 - [ ] Firewall: allow only 80/443 (proxy) and SSH; deny direct 8765 from WAN
 - [ ] If the Telegram bot also runs on the same host, point it at the same `DATABASE_PATH`
@@ -70,21 +71,30 @@ server {
 Example units live in `docs/systemd/`. On the host:
 
 ```bash
-sudo cp docs/systemd/football-*.service /etc/systemd/system/
+sudo cp docs/systemd/football-*.service docs/systemd/football-*.timer /etc/systemd/system/
 # Edit WorkingDirectory / EnvironmentFile / User to match the host
 sudo systemctl daemon-reload
 sudo systemctl enable --now football-bot football-jobs football-dashboard
+sudo systemctl enable --now football-backup.timer
+systemctl list-timers football-backup.timer
 ```
+
+Default path: reverse proxy terminates TLS → `127.0.0.1:8765`. Do not bind the dashboard to a public interface without that proxy.
 
 ## Database backup
 
+Preferred: systemd timer (daily 03:15, see `docs/systemd/football-backup.timer`).
+
 ```bash
 chmod +x scripts/backup_db.sh
+# Manual run
 ./scripts/backup_db.sh
-# Optional: BACKUP_DIR=/var/backups/football BACKUP_KEEP=14 ./scripts/backup_db.sh
+# Or via unit
+sudo systemctl start football-backup.service
+# Optional: BACKUP_DIR=/var/backups/football BACKUP_KEEP=14
 ```
 
-Cron example (daily 03:15 UTC):
+Cron fallback (only if systemd timers are unavailable):
 
 ```cron
 15 3 * * * cd /opt/football-predictor && ./scripts/backup_db.sh >>/var/log/football-backup.log 2>&1

@@ -71,6 +71,58 @@ def _sample_payload() -> dict:
     }
 
 
+def test_parse_normalizes_list_form() -> None:
+    payload = _sample_payload()
+    payload["standings"][0]["table"][0]["form"] = ["W", "D", "L", "W", "W"]
+    payload["standings"][0]["table"][1]["form"] = None
+    parsed = parse_standings(payload, competition="PL")
+    assert parsed["rows"][0]["form"] == "W,D,L,W,W"
+    assert parsed["rows"][1]["form"] is None
+
+
+def test_backfill_form_from_finished_matches(tmp_path: Path) -> None:
+    from laboratory.standings import backfill_form_from_matches
+    from laboratory.store import append_result, upsert_match
+
+    connection = connect(tmp_path / "football.db")
+    payload = _sample_payload()
+    for entry in payload["standings"][0]["table"]:
+        entry["form"] = None
+    replace_standings(connection, parse_standings(payload, competition="PL"))
+    # Oldest → newest for Arsenal (57): W, D, L
+    for index, (opp, fh, fa) in enumerate(
+        (("90", 2, 0), ("91", 1, 1), ("92", 0, 1)),
+        start=1,
+    ):
+        match_id = f"m{index}"
+        upsert_match(
+            connection,
+            {
+                "match_id": match_id,
+                "dataset_version": "test",
+                "competition": "PL",
+                "season": "2025",
+                "kickoff": f"2025-09-{10 + index:02d}T15:00:00Z",
+                "home_id": "57",
+                "home_name": "Arsenal FC",
+                "away_id": opp,
+                "away_name": f"Opp {opp}",
+                "raw_payload_id": None,
+            },
+        )
+        append_result(
+            connection,
+            match_id,
+            {"ft_home": fh, "ft_away": fa, "ht_home": None, "ht_away": None},
+            "test",
+        )
+    updated = backfill_form_from_matches(connection, "PL", "2025")
+    assert updated >= 1
+    _, rows = list_standings_rows(connection, "PL")
+    arsenal = next(row for row in rows if row["team_id"] == "57")
+    assert arsenal["form"] == "W,D,L"
+
+
 def test_parse_and_store_standings(tmp_path: Path) -> None:
     parsed = parse_standings(_sample_payload(), competition="PL")
     assert parsed["season"] == "2025"
@@ -116,8 +168,10 @@ def test_dashboard_standings_reads_from_db(tmp_path: Path) -> None:
     assert 'class="league-pills"' in page
     assert "form-pill win" in page
     assert "zone-europe" in page
-    assert "10 Nov 2026" in page
+    assert "Stored" in page
     assert "T14:22:43" not in page
+    assert " UTC" not in page
+    assert "Cairo" in page
     assert "crests.football-data.org/57.png" in page
     assert 'class="crest"' in page
     assert 'class="emblem"' in page

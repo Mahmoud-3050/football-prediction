@@ -481,6 +481,8 @@ def _success(result: PipelineResult, *, markdown: bool) -> str:
         if over_35 is not None:
             parts.append(f"Over 3.5 {_plain(_pct1(over_35), markdown)}")
         lines.append(" · ".join(parts))
+    lines.append("")
+    lines.append(_plain(_interpretation_status(result), markdown))
     if result.reasoning:
         lines.append("")
         lines.append(_em("Interpretation", markdown))
@@ -513,6 +515,18 @@ def _failure(result: PipelineResult, *, markdown: bool) -> str:
         _em("Statistical estimate, not a betting tip.", markdown, italic=True),
     ]
     return "\n".join(lines)
+
+
+def _interpretation_status(result: PipelineResult) -> str:
+    """One-line status so Gemini fallback is not buried in Limitations."""
+
+    model_id = (result.model_id or "").strip()
+    if not model_id or model_id == "score-model":
+        return "Interpretation: unavailable — score from the statistical model only."
+    for item in result.limitations:
+        if "Primary model" in item and "was unavailable" in item:
+            return f"Interpretation: fallback model ({model_id})."
+    return f"Interpretation: {model_id}."
 
 
 def _prob_block(probabilities: dict[str, float], *, markdown: bool) -> list[str]:

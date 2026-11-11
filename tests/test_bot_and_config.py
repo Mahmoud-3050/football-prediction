@@ -170,12 +170,53 @@ def test_report_shows_distribution_layout_with_gemini_interpretation() -> None:
     assert "Most likely 1–0" in text
     assert "Over 2.5 72.9%" in text
     assert "Over 3.5 52.4%" in text
+    assert "Interpretation: unavailable — score from the statistical model only." in text
     assert "Interpretation" in text
     assert "Home attack edge in the snapshot." in text
     assert "التفسير" in text
     assert "تفوق هجومي للمضيف في اللقطة." in text
     assert "BTTS:" not in text
     assert "Markets from the score distribution" not in text
+
+
+def test_report_shows_gemini_and_fallback_status_lines() -> None:
+    primary = PipelineResult(
+        run_id=6,
+        status="completed",
+        stage=None,
+        reason=None,
+        full_time_score="1-0",
+        markets=Markets("Home", "No", "Under"),
+        confidence=20,
+        reasoning="Edge from attack ratios.",
+        model_id="gemini-3.5-flash",
+        home_name="Arsenal",
+        away_name="Chelsea",
+        competition_name="Premier League",
+        probabilities={"home": 0.5, "draw": 0.25, "away": 0.25},
+    )
+    assert "Interpretation: gemini-3.5-flash." in render_report(primary, markdown=False)
+
+    fallback = PipelineResult(
+        run_id=7,
+        status="partial",
+        stage=None,
+        reason=None,
+        full_time_score="1-0",
+        markets=Markets("Home", "No", "Under"),
+        confidence=20,
+        reasoning="Edge from attack ratios.",
+        model_id="gemini-3.8-flash",
+        limitations=[
+            "Primary model gemini-3.5-flash was unavailable; used gemini-3.8-flash."
+        ],
+        home_name="Arsenal",
+        away_name="Chelsea",
+        competition_name="Premier League",
+        probabilities={"home": 0.5, "draw": 0.25, "away": 0.25},
+    )
+    text = render_report(fallback, markdown=False)
+    assert "Interpretation: fallback model (gemini-3.8-flash)." in text
 
 
 def test_predict_rejects_a_bad_command_before_the_provider(tmp_path) -> None:

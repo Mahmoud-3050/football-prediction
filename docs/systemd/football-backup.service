@@ -1,0 +1,12 @@
+[Unit]
+Description=Football Predictor SQLite database backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/football-predictor
+EnvironmentFile=/opt/football-predictor/.env
+# Optional overrides: BACKUP_DIR=/var/backups/football BACKUP_KEEP=14
+ExecStart=/opt/football-predictor/scripts/backup_db.sh
+User=football
+Group=football

@@ -35,6 +35,7 @@ def overview(connection: sqlite3.Connection, query: dict[str, list[str]] | None 
     leagues, seasons, teams = _choices(loaded, filters.get("league", ""))
     body = [
         _masthead("Overview", filters, active="overview"),
+        _jobs_panel(connection),
         _filter_form("/", filters, leagues, seasons, teams, submit="Update"),
     ]
     if not loaded:
@@ -71,6 +72,7 @@ def overview(connection: sqlite3.Connection, query: dict[str, list[str]] | None 
                 "<h2>Market results</h2>",
                 "<p class=\"note\">Scored evaluations only. Log loss and Brier are means over that sample.</p>",
                 _market_table(rows),
+                _overview_charts(rows),
             ]
         )
         if all(_summarize(rows, key)["n"] == 0 for key, _, _ in MARKETS):
@@ -82,6 +84,66 @@ def overview(connection: sqlite3.Connection, query: dict[str, list[str]] | None 
                 )
             )
     return _page("Overview", "\n".join(body), filters)
+
+
+def _jobs_panel(connection: sqlite3.Connection) -> str:
+    from laboratory.store import latest_job_runs
+
+    try:
+        runs = latest_job_runs(connection)
+    except sqlite3.OperationalError:
+        runs = []
+    if not runs:
+        return (
+            '<section class="panel jobs-panel"><h2>Server jobs</h2>'
+            '<p class="note">No job runs recorded yet. Start '
+            "<code>python -m jobs</code> to price tomorrow and refresh standings.</p>"
+            "</section>"
+        )
+    cards: list[str] = []
+    for run in runs:
+        summary = _json(run["summary_json"])
+        ok = bool(run["ok"])
+        status = "ok" if ok else "failed"
+        title = "Tomorrow predictions" if run["name"] == "tomorrow" else "Standings refresh"
+        when = _short_cairo(str(run["finished_at"]))
+        detail = _job_summary_line(str(run["name"]), summary, ok=ok)
+        cards.append(
+            "<article>"
+            f"<span>{html.escape(title)}</span>"
+            f"<strong class=\"job-{status}\">{html.escape(status)}</strong>"
+            f"<p>{html.escape(when)} · {html.escape(detail)}</p>"
+            "</article>"
+        )
+    return (
+        '<section class="panel jobs-panel"><h2>Server jobs</h2>'
+        f'<div class="job-cards">{"".join(cards)}</div></section>'
+    )
+
+
+def _job_summary_line(name: str, summary: dict[str, Any], *, ok: bool) -> str:
+    if not ok:
+        return str(summary.get("error") or "failed")
+    if name == "tomorrow":
+        return (
+            f"day {summary.get('day') or '—'} · "
+            f"priced {summary.get('priced', 0)} / "
+            f"candidates {summary.get('candidates', 0)} · "
+            f"abstained {summary.get('abstained', 0)} · "
+            f"failed {summary.get('failed', 0)}"
+        )
+    refreshed = summary.get("refreshed") or []
+    if isinstance(refreshed, list):
+        labels = ", ".join(str(item) for item in refreshed) or "none"
+    else:
+        labels = str(refreshed)
+    return f"day {summary.get('day') or '—'} · refreshed {labels}"
+
+
+def _short_cairo(value: str) -> str:
+    from timeutil import format_clock_cairo
+
+    return format_clock_cairo(value) or (value.strip() or "—")
 
 
 def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
@@ -318,9 +380,11 @@ def _filters(
 
 
 def _default_match_date_range(*, today: date | None = None) -> tuple[str, str]:
-    """Matches page default window: 7 days ago through today."""
+    """Matches page default window: 7 Cairo days ago through Cairo today."""
 
-    end = today or date.today()
+    from timeutil import cairo_today
+
+    end = today or cairo_today()
     start = end - timedelta(days=7)
     return start.isoformat(), end.isoformat()
 
@@ -558,6 +622,213 @@ def _market_table(rows: list[dict[str, Any]]) -> str:
             "</tr>"
         )
     return f'<div class="table-wrap"><table>{head}{"".join(body)}</table></div>'
+
+
+def _overview_charts(rows: list[dict[str, Any]]) -> str:
+    """Accuracy, monthly trend, and FT calibration for scored evaluations."""
+
+    market = _market_accuracy_chart(rows)
+    monthly = _monthly_accuracy_chart(rows)
+    calibration = _calibration_chart(rows)
+    if not market and not monthly and not calibration:
+        return ""
+    parts = [item for item in (market, monthly, calibration) if item]
+    return (
+        '<section class="panel charts-panel" aria-label="Evaluation charts">'
+        "<h2>Charts</h2>"
+        '<p class="note">Rates use scored evaluations only under the current filters.</p>'
+        f'<div class="chart-grid">{"".join(parts)}</div>'
+        "</section>"
+    )
+
+
+def _market_accuracy_chart(rows: list[dict[str, Any]]) -> str:
+    bars: list[str] = []
+    any_scored = False
+    for key, label, _kind in MARKETS:
+        summary = _summarize(rows, key)
+        if summary["n"] == 0:
+            continue
+        any_scored = True
+        rate = summary["correct"] / summary["n"]
+        width = max(2.0, rate * 100.0)
+        bars.append(
+            "<div class=\"hbar-row\">"
+            f"<span class=\"hbar-label\">{html.escape(label)}</span>"
+            '<span class="hbar-track" role="img" '
+            f'aria-label="{html.escape(label)} {rate:.1%} on {int(summary["n"])}">'
+            f'<i style="width:{width:.1f}%"></i>'
+            "</span>"
+            f'<span class="hbar-value mono">{rate:.0%} · {int(summary["n"])}</span>'
+            "</div>"
+        )
+    if not any_scored:
+        return ""
+    return (
+        '<figure class="chart">'
+        "<figcaption>Market accuracy</figcaption>"
+        f'<div class="hbar-chart">{"".join(bars)}</div>'
+        "</figure>"
+    )
+
+
+def _monthly_accuracy_chart(rows: list[dict[str, Any]]) -> str:
+    buckets: dict[str, dict[str, float]] = {}
+    for row in rows:
+        metrics = row.get("metrics") or {}
+        market = metrics.get("full_time_1x2") or {}
+        if market.get("status") != "scored":
+            continue
+        month = str(row.get("kickoff") or "")[:7]
+        if len(month) != 7:
+            continue
+        bucket = buckets.setdefault(month, {"n": 0.0, "correct": 0.0})
+        bucket["n"] += 1
+        bucket["correct"] += float(bool(market.get("correct")))
+    if len(buckets) < 2:
+        return ""
+    months = sorted(buckets)
+    # Cap to the most recent 12 months for readability.
+    months = months[-12:]
+    max_rate = max((buckets[m]["correct"] / buckets[m]["n"] for m in months), default=1.0)
+    scale = 100.0 / max(max_rate, 0.01)
+    columns: list[str] = []
+    for month in months:
+        n = buckets[month]["n"]
+        rate = buckets[month]["correct"] / n
+        height = max(4.0, rate * scale)
+        label = f"{month[5:]}'{month[2:4]}"
+        columns.append(
+            "<div class=\"vbar\">"
+            f'<span class="vbar-value mono">{rate:.0%}</span>'
+            '<span class="vbar-track">'
+            f'<i style="height:{height:.1f}%" title="{html.escape(month)}: '
+            f'{rate:.1%} · {int(n)}"></i>'
+            "</span>"
+            f'<span class="vbar-label">{html.escape(label)}</span>'
+            "</div>"
+        )
+    return (
+        '<figure class="chart">'
+        "<figcaption>Full-time accuracy by month</figcaption>"
+        f'<div class="vbar-chart" role="img" aria-label="Monthly full-time accuracy">'
+        f'{"".join(columns)}</div>'
+        "</figure>"
+    )
+
+
+def _calibration_chart(rows: list[dict[str, Any]]) -> str:
+    # Five equal-width confidence buckets for the FT selection probability.
+    edges = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0001)
+    labels = ("0–20%", "20–40%", "40–60%", "60–80%", "80–100%")
+    totals = [{"n": 0, "correct": 0, "prob_sum": 0.0} for _ in labels]
+    for row in rows:
+        sample = _ft_selection_sample(row)
+        if sample is None:
+            continue
+        probability, correct = sample
+        index = min(int(probability * 5), 4)
+        if probability >= 1.0:
+            index = 4
+        totals[index]["n"] += 1
+        totals[index]["correct"] += int(correct)
+        totals[index]["prob_sum"] += probability
+    scored = sum(item["n"] for item in totals)
+    if scored < 5:
+        return ""
+    width, height = 320, 200
+    pad_l, pad_r, pad_t, pad_b = 36, 12, 12, 36
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    points_pred: list[str] = []
+    points_obs: list[str] = []
+    bars: list[str] = []
+    legend_n = 0
+    for index, item in enumerate(totals):
+        mid = (edges[index] + min(edges[index + 1], 1.0)) / 2.0
+        x = pad_l + mid * plot_w
+        # Ideal calibration diagonal marker at this bucket midpoint.
+        y_ideal = pad_t + (1.0 - mid) * plot_h
+        points_pred.append(f"{x:.1f},{y_ideal:.1f}")
+        if item["n"] == 0:
+            continue
+        legend_n += 1
+        observed = item["correct"] / item["n"]
+        predicted = item["prob_sum"] / item["n"]
+        y_obs = pad_t + (1.0 - observed) * plot_h
+        points_obs.append(f"{x:.1f},{y_obs:.1f}")
+        # Bucket bar: height = observed frequency, opacity scales with sample.
+        bar_w = plot_w / 5.0 * 0.55
+        bar_h = observed * plot_h
+        bar_x = pad_l + (index + 0.5) * (plot_w / 5.0) - bar_w / 2.0
+        bar_y = pad_t + plot_h - bar_h
+        opacity = 0.25 + min(0.55, item["n"] / max(scored, 1) * 2.5)
+        bars.append(
+            f'<rect x="{bar_x:.1f}" y="{bar_y:.1f}" width="{bar_w:.1f}" '
+            f'height="{max(bar_h, 1.0):.1f}" rx="2" '
+            f'fill="rgba(52,211,153,{opacity:.2f})"></rect>'
+            f'<text x="{x:.1f}" y="{height - 10}" text-anchor="middle" '
+            f'class="chart-axis">{html.escape(labels[index])}</text>'
+            f'<title>{html.escape(labels[index])}: predicted {predicted:.0%}, '
+            f"observed {observed:.0%} · n={item['n']}</title>"
+        )
+    if legend_n < 2:
+        return ""
+    ideal_line = " ".join(points_pred)
+    obs_line = " ".join(points_obs)
+    obs_dots = "".join(
+        f'<circle cx="{pt.split(",")[0]}" cy="{pt.split(",")[1]}" r="3.5" '
+        f'fill="var(--accent)" stroke="#042f24" stroke-width="1"></circle>'
+        for pt in points_obs
+    )
+    return (
+        '<figure class="chart">'
+        "<figcaption>FT selection calibration</figcaption>"
+        f'<svg class="cal-chart" viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="Full-time selection calibration">'
+        f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t + plot_h}" '
+        'stroke="#35506f" stroke-width="1"></line>'
+        f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{pad_l + plot_w}" '
+        f'y2="{pad_t + plot_h}" stroke="#35506f" stroke-width="1"></line>'
+        f'<polyline fill="none" stroke="rgba(148,163,184,0.55)" stroke-width="1.5" '
+        f'stroke-dasharray="4 4" points="{ideal_line}"></polyline>'
+        f"{''.join(bars)}"
+        f'<polyline fill="none" stroke="var(--accent)" stroke-width="2" '
+        f'points="{obs_line}"></polyline>'
+        f"{obs_dots}"
+        f'<text x="{pad_l - 8}" y="{pad_t + 4}" text-anchor="end" class="chart-axis">100%</text>'
+        f'<text x="{pad_l - 8}" y="{pad_t + plot_h}" text-anchor="end" class="chart-axis">0%</text>'
+        "</svg>"
+        '<p class="chart-legend note">Dashed = perfect calibration · Bars/dots = observed hit rate by stated confidence</p>'
+        "</figure>"
+    )
+
+
+def _ft_selection_sample(row: dict[str, Any]) -> tuple[float, bool] | None:
+    metrics = row.get("metrics") or {}
+    market = metrics.get("full_time_1x2") or {}
+    if market.get("status") != "scored":
+        return None
+    selection = market.get("selection")
+    if not selection:
+        return None
+    body = row.get("body") or {}
+    probability = None
+    if body.get("engine") in ("poisson", "score_model"):
+        block = (body.get("full_time") or {}).get("result_1x2") or {}
+        if selection in block:
+            probability = float(block[selection])
+    if probability is None:
+        block = body.get("full_time_1x2") or {}
+        if selection in block:
+            probability = float(block[selection])
+    if probability is None:
+        # Fall back to probability of actual when selection probability is absent.
+        if "probability_of_actual" in market and market.get("correct"):
+            probability = float(market["probability_of_actual"])
+        else:
+            return None
+    return max(0.0, min(1.0, probability)), bool(market.get("correct"))
 
 
 def _summarize(rows: list[dict[str, Any]], market: str) -> dict[str, float]:
@@ -901,24 +1172,34 @@ def _comparison(
             "over" if int(result["ft_home"]) + int(result["ft_away"]) >= 4 else "under",
         ),
     }
-    rows = ["<tr><th>Market</th><th>Pick</th><th>Actual</th><th>Check</th></tr>"]
+    rows = [
+        "<tr><th>Market</th><th>Pick</th><th>Actual</th>"
+        "<th>Check</th><th>Log loss</th><th>Brier</th></tr>"
+    ]
     for key, (label, actual) in labels.items():
         market = (metrics or {}).get(key) or {}
         if market.get("status") != "scored":
             rows.append(
                 f"<tr><td>{label}</td><td>—</td><td>{html.escape(str(actual or '—'))}</td>"
-                f"<td>{_badge('withheld' if market.get('status') == 'withheld' else 'pending')}</td></tr>"
+                f"<td>{_badge('withheld' if market.get('status') == 'withheld' else 'pending')}</td>"
+                "<td>—</td><td>—</td></tr>"
             )
             continue
         selection = market.get("selection")
         if key == "exact_score":
             selection = "hit" if market.get("correct") else "miss"
+        log_loss = market.get("log_loss")
+        brier = market.get("brier")
+        log_cell = "—" if log_loss is None else f"{float(log_loss):.3f}"
+        brier_cell = "—" if brier is None else f"{float(brier):.3f}"
         rows.append(
             "<tr>"
             f"<td>{label}</td>"
             f"<td>{html.escape(str(selection).replace('_', ' '))}</td>"
             f"<td>{html.escape(str(actual))}</td>"
             f"<td>{_badge('correct' if market.get('correct') else 'incorrect')}</td>"
+            f"<td>{log_cell}</td>"
+            f"<td>{brier_cell}</td>"
             "</tr>"
         )
     return (
@@ -1113,6 +1394,7 @@ def standings(
 
     from laboratory.standings import (
         STANDINGS_COMPETITIONS,
+        backfill_form_from_matches,
         ensure_standings,
         list_standings_rows,
     )
@@ -1165,6 +1447,11 @@ def standings(
     connection.commit()
     emblems = competition_emblem_map(connection, STANDINGS_COMPETITIONS)
     meta, rows = list_standings_rows(connection, competition)
+    if meta is not None and rows and any(
+        not row["form"] or not str(row["form"]).strip() for row in rows
+    ):
+        backfill_form_from_matches(connection, competition, str(meta["season"]))
+        meta, rows = list_standings_rows(connection, competition)
     pills = "".join(
         f'<a class="pill{" active" if code == competition else ""}" '
         f'href="/standings?league={html.escape(code)}">'
@@ -1784,6 +2071,92 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
     .cards span {{ display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 4px; }}
     .cards strong {{ font-size: 1.2rem; font-weight: 700; letter-spacing: -0.02em; }}
     .cards .small {{ font-size: 0.85rem; font-weight: 600; word-break: break-word; }}
+    .jobs-panel {{ margin: 12px 0 16px; }}
+    .job-cards {{
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+      gap: 10px;
+    }}
+    .job-cards article {{
+      background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm);
+      padding: 12px 14px;
+    }}
+    .job-cards span {{ display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 4px; }}
+    .job-cards strong {{ font-size: 1.05rem; font-weight: 700; text-transform: uppercase; }}
+    .job-cards .job-ok {{ color: var(--accent); }}
+    .job-cards .job-failed {{ color: #f87171; }}
+    .job-cards p {{ margin: 6px 0 0; color: var(--muted); font-size: 0.85rem; line-height: 1.35; }}
+    .charts-panel {{ margin: 32px 0 24px; }}
+    .chart-grid {{
+      display: grid; grid-template-columns: 1fr;
+      gap: 16px; margin-top: 16px;
+    }}
+    .chart {{
+      margin: 0; padding: 16px 24px 24px;
+      background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm);
+      min-width: 0;
+    }}
+    .chart figcaption {{
+      font-size: 0.92rem; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 16px;
+    }}
+    .hbar-chart {{ display: grid; gap: 12px; }}
+    .hbar-row {{
+      display: grid; grid-template-columns: minmax(5.5rem, 7.5rem) 1fr minmax(4.5rem, 5.5rem);
+      gap: 12px; align-items: center;
+    }}
+    .hbar-label {{ color: #b7c6dc; font-size: 0.78rem; line-height: 1.25; }}
+    .hbar-track {{
+      display: block; height: 10px; background: #0b1220; border-radius: 999px; overflow: hidden;
+    }}
+    .hbar-track i {{
+      display: block; height: 100%;
+      background: linear-gradient(90deg, #059669, var(--accent));
+      border-radius: 999px;
+      transform-origin: left center;
+      animation: chart-grow-x 520ms var(--ease) both;
+    }}
+    .hbar-value {{
+      color: var(--muted); font-size: 0.78rem; text-align: right;
+      font-variant-numeric: tabular-nums;
+    }}
+    .vbar-chart {{
+      display: flex; align-items: flex-end; gap: 12px; min-height: 140px; padding-top: 4px;
+    }}
+    .vbar {{
+      flex: 1 1 0; min-width: 0; display: grid; justify-items: center;
+      grid-template-rows: auto 1fr auto; gap: 8px; height: 140px;
+    }}
+    .vbar-value {{
+      color: var(--muted); font-size: 0.7rem; font-variant-numeric: tabular-nums; line-height: 1;
+    }}
+    .vbar-track {{
+      width: 100%; max-width: 28px; height: 100%; align-self: stretch;
+      display: flex; align-items: flex-end; background: #0b1220; border-radius: 6px 6px 2px 2px;
+      overflow: hidden;
+    }}
+    .vbar-track i {{
+      display: block; width: 100%;
+      background: linear-gradient(180deg, var(--accent), #059669);
+      border-radius: 6px 6px 2px 2px;
+      transform-origin: bottom center;
+      animation: chart-grow-y 560ms var(--ease) both;
+    }}
+    .vbar-label {{
+      color: #8fa3bd; font-size: 0.68rem; line-height: 1; white-space: nowrap;
+    }}
+    .cal-chart {{ width: 100%; height: auto; display: block; }}
+    .chart-axis {{ fill: #8fa3bd; font-size: 9px; font-family: inherit; }}
+    .chart-legend {{ margin: 12px 0 0; font-size: 0.78rem; }}
+    @keyframes chart-grow-x {{
+      from {{ transform: scaleX(0.15); opacity: 0.35; }}
+      to {{ transform: scaleX(1); opacity: 1; }}
+    }}
+    @keyframes chart-grow-y {{
+      from {{ transform: scaleY(0.15); opacity: 0.35; }}
+      to {{ transform: scaleY(1); opacity: 1; }}
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+      .hbar-track i, .vbar-track i {{ animation: none; }}
+    }}
     .table-wrap {{
       overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-lg);
       background: var(--panel); margin: 8px 0 16px;
@@ -2381,19 +2754,17 @@ def _page_number(filters: dict[str, str]) -> int:
 
 
 def _when(value: str) -> str:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return html.escape(value)
-    return html.escape(parsed.strftime("%d %b %Y · %H:%M UTC"))
+    from timeutil import format_datetime_cairo
+
+    formatted = format_datetime_cairo(value)
+    return html.escape(formatted if formatted is not None else value)
 
 
 def _when_short(value: str) -> str:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return html.escape(value)
-    return html.escape(parsed.strftime("%d %b · %H:%M"))
+    from timeutil import format_datetime_short_cairo
+
+    formatted = format_datetime_short_cairo(value)
+    return html.escape(formatted if formatted is not None else value)
 
 
 def _outcome(home: int, away: int) -> str:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 from config import ConfigError, load_config
 from jobs.standings_job import run_standings_once
 from jobs.tomorrow import run_tomorrow_once
-from laboratory.store import connect
+from laboratory.store import connect, record_job_run
 from main import build_pipeline
 
 DEFAULT_INTERVAL_SECONDS = 3600
@@ -37,26 +38,79 @@ async def jobs_loop(
         "server jobs started (interval=%ss)", int(interval_seconds)
     )
     while not stop.is_set():
-        try:
-            tomorrow = await run_tomorrow_once(pipeline)
-            logging.getLogger(__name__).info("tomorrow job finished: %s", tomorrow)
-        except Exception:
-            logging.getLogger(__name__).exception("tomorrow job crashed")
-        try:
-            standings = await run_standings_once(
-                pipeline,
-                connection,
-                api_key=api_key,
-                state=standings_state,
-            )
-            logging.getLogger(__name__).info("standings job finished: %s", standings)
-        except Exception:
-            logging.getLogger(__name__).exception("standings job crashed")
+        await _run_tomorrow_tracked(pipeline, connection)
+        await _run_standings_tracked(
+            pipeline,
+            connection,
+            api_key=api_key,
+            state=standings_state,
+        )
         try:
             await asyncio.wait_for(stop.wait(), timeout=max(1.0, interval_seconds))
         except asyncio.TimeoutError:
             continue
     logging.getLogger(__name__).info("server jobs stopped")
+
+
+async def _run_tomorrow_tracked(pipeline: Any, connection: Any) -> None:
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        tomorrow = await run_tomorrow_once(pipeline)
+        logging.getLogger(__name__).info("tomorrow job finished: %s", tomorrow)
+        record_job_run(
+            connection,
+            name="tomorrow",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            ok=True,
+            summary=dict(tomorrow),
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("tomorrow job crashed")
+        record_job_run(
+            connection,
+            name="tomorrow",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            ok=False,
+            summary={"error": str(exc)},
+        )
+
+
+async def _run_standings_tracked(
+    pipeline: Any,
+    connection: Any,
+    *,
+    api_key: str,
+    state: dict[str, Any],
+) -> None:
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        standings = await run_standings_once(
+            pipeline,
+            connection,
+            api_key=api_key,
+            state=state,
+        )
+        logging.getLogger(__name__).info("standings job finished: %s", standings)
+        record_job_run(
+            connection,
+            name="standings",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            ok=True,
+            summary=dict(standings),
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("standings job crashed")
+        record_job_run(
+            connection,
+            name="standings",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            ok=False,
+            summary={"error": str(exc)},
+        )
 
 
 def main() -> None:

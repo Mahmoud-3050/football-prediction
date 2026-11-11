@@ -60,6 +60,33 @@ def format_kickoff_short_cairo(value: str | None) -> str:
     return moment.strftime("%H:%M Cairo")
 
 
+def format_datetime_cairo(value: str | datetime | None) -> str | None:
+    """Dashboard-style full timestamp in Cairo."""
+
+    moment = to_cairo(value)
+    if moment is None:
+        return None
+    return moment.strftime("%d %b %Y · %H:%M Cairo")
+
+
+def format_datetime_short_cairo(value: str | datetime | None) -> str | None:
+    """Dashboard-style short timestamp in Cairo (match cards)."""
+
+    moment = to_cairo(value)
+    if moment is None:
+        return None
+    return moment.strftime("%d %b · %H:%M Cairo")
+
+
+def format_clock_cairo(value: str | datetime | None) -> str | None:
+    """Compact date+clock for job run stamps."""
+
+    moment = to_cairo(value)
+    if moment is None:
+        return None
+    return moment.strftime("%Y-%m-%d %H:%M Cairo")
+
+
 def cairo_today() -> date:
     return datetime.now(CAIRO_TZ).date()
 

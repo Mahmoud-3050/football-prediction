@@ -298,6 +298,7 @@ class PipelineResult:
     confidence: int | None = None
     reasoning: str | None = None
     reasoning_ar: str | None = None
+    model_id: str | None = None
     limitations: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     include_half_time: bool = False

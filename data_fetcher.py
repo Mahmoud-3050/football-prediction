@@ -52,8 +52,19 @@ STANDINGS_CACHE_TTL_SECONDS = 15 * 60
 COMPETITION_MATCHES_CACHE_TTL_SECONDS = 15 * 60
 FINISHED_MATCH_LIMIT = 100
 MAX_CALLS_PER_MINUTE = 8
-# Competitions shown by /today. Match ids from that list feed /predict <id>.
-TODAY_MATCH_COMPETITIONS: tuple[str, ...] = ("PL", "CL", "PD", "SA", "BL1", "FL1")
+# Live list + predict + jobs: same leagues everywhere (incl. PPL/DED).
+LIVE_MATCH_COMPETITIONS: tuple[str, ...] = (
+    "PL",
+    "CL",
+    "PD",
+    "SA",
+    "BL1",
+    "FL1",
+    "PPL",
+    "DED",
+)
+# Alias kept for callers that still import the /today name.
+TODAY_MATCH_COMPETITIONS: tuple[str, ...] = LIVE_MATCH_COMPETITIONS
 # Automatic pre-round job prices fixtures whose kickoff is within this many days.
 # On-demand /predict ignores this window and only requires a not-yet-started fixture.
 PROSPECTIVE_LEAD_DAYS = 1

@@ -110,6 +110,14 @@ CREATE TABLE IF NOT EXISTS competitions (
     emblem_url TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS job_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    summary_json TEXT NOT NULL
+);
 """
 
 
@@ -170,6 +178,14 @@ def ensure_laboratory_schema(connection: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             emblem_url TEXT,
             updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS job_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            ok INTEGER NOT NULL,
+            summary_json TEXT NOT NULL
         );
         """
     )
@@ -954,3 +970,53 @@ def prediction_body(connection: sqlite3.Connection, prediction_id: str) -> str:
     if row is None:
         raise KeyError(prediction_id)
     return str(row["body_json"])
+
+
+def record_job_run(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    started_at: str,
+    finished_at: str,
+    ok: bool,
+    summary: dict[str, Any],
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO job_runs (name, started_at, finished_at, ok, summary_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            name,
+            started_at,
+            finished_at,
+            1 if ok else 0,
+            json.dumps(summary, sort_keys=True, default=str),
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
+
+
+def latest_job_runs(
+    connection: sqlite3.Connection,
+    *,
+    names: tuple[str, ...] = ("tomorrow", "standings"),
+) -> list[sqlite3.Row]:
+    """Latest run per job name, newest first among the selected names."""
+
+    rows: list[sqlite3.Row] = []
+    for name in names:
+        row = connection.execute(
+            """
+            SELECT id, name, started_at, finished_at, ok, summary_json
+            FROM job_runs
+            WHERE name = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        if row is not None:
+            rows.append(row)
+    return rows

@@ -7,17 +7,22 @@ from bot import (
     parse_day_argument,
 )
 from data_fetcher import (
+    LIVE_MATCH_COMPETITIONS,
     TODAY_MATCH_COMPETITIONS,
     format_match_list,
     format_todays_matches,
     fixtures_from_payload,
     parse_fixture,
 )
+from jobs import JOB_COMPETITIONS
 from timeutil import format_kickoff_cairo, format_kickoff_short_cairo
 
 
-def test_today_competitions_are_the_six_requested_leagues() -> None:
-    assert TODAY_MATCH_COMPETITIONS == ("PL", "CL", "PD", "SA", "BL1", "FL1")
+def test_live_competitions_match_today_and_jobs() -> None:
+    expected = ("PL", "CL", "PD", "SA", "BL1", "FL1", "PPL", "DED")
+    assert LIVE_MATCH_COMPETITIONS == expected
+    assert TODAY_MATCH_COMPETITIONS == expected
+    assert JOB_COMPETITIONS == expected
 
 
 def test_format_todays_matches_shows_unique_ids_without_predictions() -> None:
@@ -53,17 +58,18 @@ def test_format_todays_matches_shows_unique_ids_without_predictions() -> None:
         ]
     }
     fixtures = fixtures_from_payload(payload)
-    assert [fixture.id for fixture in fixtures] == [101, 202]
+    assert [fixture.id for fixture in fixtures] == [101, 202, 999]
     pages = format_todays_matches(fixtures)
     text = "\n".join(pages)
     assert "#101" in text
     assert "#202" in text
-    assert "999" not in text
+    assert "#999" in text
     assert "Cairo" in text
     assert "no predictions" in text.casefold() or "No predictions" in text
     assert "/predict #101" in text or "Tap a match button" in text
     assert "Premier League" in text
     assert "Serie A" in text
+    assert "Primeira Liga" in text or "Liga Portugal" in text or "Benfica" in text
 
 
 def test_predict_buttons_use_match_ids() -> None:
@@ -105,6 +111,15 @@ def test_kickoffs_are_shown_in_cairo_time() -> None:
     # 15:00 UTC -> 17:00 Cairo (Africa/Cairo is UTC+2 outside DST quirks handled by zoneinfo)
     assert format_kickoff_short_cairo("2026-11-08T15:00:00Z") == "17:00 Cairo"
     assert format_kickoff_cairo("2026-11-08T15:00:00Z") == "2026-11-08 17:00 Cairo"
+    from timeutil import (
+        format_clock_cairo,
+        format_datetime_cairo,
+        format_datetime_short_cairo,
+    )
+
+    assert format_datetime_cairo("2026-11-08T15:00:00Z") == "08 Nov 2026 · 17:00 Cairo"
+    assert format_datetime_short_cairo("2026-11-08T15:00:00Z") == "08 Nov · 17:00 Cairo"
+    assert format_clock_cairo("2026-11-11T03:01:00+00:00") == "2026-11-11 05:01 Cairo"
 
 
 def test_api_date_window_widens_exclusive_date_to() -> None:

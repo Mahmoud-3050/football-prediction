@@ -77,7 +77,7 @@ def parse_standings(body: dict[str, Any], *, competition: str) -> dict[str, Any]
                 "goals_against": _int_or_none(entry.get("goalsAgainst")),
                 "goal_difference": _int_or_none(entry.get("goalDifference")),
                 "points": _int_or_none(entry.get("points")),
-                "form": entry.get("form") if isinstance(entry.get("form"), str) else None,
+                "form": _normalize_form(entry.get("form")),
             }
         )
     matchday = season_info.get("currentMatchday")
@@ -173,7 +173,114 @@ def replace_standings(connection: sqlite3.Connection, parsed: dict[str, Any]) ->
             ),
         )
     connection.commit()
+    backfill_form_from_matches(connection, competition, season)
     return len(parsed["rows"])
+
+
+def _normalize_form(value: Any) -> str | None:
+    """Accept API form as 'W,W,D' or ['W','W','D']."""
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+    if isinstance(value, list):
+        marks = []
+        for item in value:
+            token = str(item).strip().upper()[:1]
+            if token in {"W", "D", "L"}:
+                marks.append(token)
+        return ",".join(marks) if marks else None
+    return None
+
+
+def backfill_form_from_matches(
+    connection: sqlite3.Connection,
+    competition: str,
+    season: str,
+    *,
+    limit: int = 5,
+) -> int:
+    """Fill empty form cells from recent finished matches in the shared DB.
+
+    Football-Data free-tier standings often omit `form`. When league history is
+    already imported, derive last-N W/D/L so the dashboard Form column can show.
+    """
+
+    code = competition.upper()
+    rows = list(
+        connection.execute(
+            """
+            SELECT team_id FROM standings_rows
+            WHERE competition = ? AND season = ?
+              AND (form IS NULL OR TRIM(form) = '')
+            """,
+            (code, season),
+        )
+    )
+    updated = 0
+    for row in rows:
+        team_id = str(row["team_id"])
+        form = _form_from_matches(connection, code, team_id, limit=limit)
+        if not form:
+            continue
+        connection.execute(
+            """
+            UPDATE standings_rows
+            SET form = ?
+            WHERE competition = ? AND season = ? AND team_id = ?
+            """,
+            (form, code, season, team_id),
+        )
+        updated += 1
+    if updated:
+        connection.commit()
+    return updated
+
+
+def _form_from_matches(
+    connection: sqlite3.Connection,
+    competition: str,
+    team_id: str,
+    *,
+    limit: int = 5,
+) -> str | None:
+    matches = list(
+        connection.execute(
+            """
+            SELECT m.home_id, m.away_id, r.ft_home, r.ft_away
+            FROM matches m
+            JOIN result_revisions r
+              ON r.match_id = m.match_id
+             AND r.revision = (
+                 SELECT MAX(revision) FROM result_revisions WHERE match_id = m.match_id
+             )
+            WHERE m.competition = ?
+              AND (m.home_id = ? OR m.away_id = ?)
+              AND r.ft_home IS NOT NULL
+              AND r.ft_away IS NOT NULL
+            ORDER BY m.kickoff DESC
+            LIMIT ?
+            """,
+            (competition, team_id, team_id, limit),
+        )
+    )
+    if not matches:
+        return None
+    # Chronological form (oldest → newest) matches Football-Data style.
+    marks: list[str] = []
+    for match in reversed(matches):
+        home_goals = int(match["ft_home"])
+        away_goals = int(match["ft_away"])
+        is_home = str(match["home_id"]) == team_id
+        for_goals = home_goals if is_home else away_goals
+        against = away_goals if is_home else home_goals
+        if for_goals > against:
+            marks.append("W")
+        elif for_goals < against:
+            marks.append("L")
+        else:
+            marks.append("D")
+    return ",".join(marks)
 
 
 def has_standings(connection: sqlite3.Connection, competition: str) -> bool:
@@ -246,6 +353,11 @@ def ensure_standings(
         raise ValueError(f"Standings are not supported for {code}.")
     if not force and has_standings(connection, code):
         meta, rows = list_standings_rows(connection, code)
+        if meta is not None and any(
+            not row["form"] or not str(row["form"]).strip() for row in rows
+        ):
+            backfill_form_from_matches(connection, code, str(meta["season"]))
+            meta, rows = list_standings_rows(connection, code)
         return {
             "competition": code,
             "season": None if meta is None else meta["season"],

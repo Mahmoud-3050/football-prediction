@@ -11,7 +11,7 @@ Commands:
 /predict #560638
 ```
 
-`/today` and `/matches DD-MM-YYYY` list fixtures in Premier League, UEFA Champions League, Primera Division, Serie A, Bundesliga, and Ligue 1. They do not predict by themselves. Each match also gets a tap button that runs the same analysis as `/predict <id>`. Kickoff times and the `/matches` day use Cairo time.
+`/today` and `/matches DD-MM-YYYY` list fixtures in Premier League, UEFA Champions League, Primera Division, Serie A, Bundesliga, Ligue 1, Liga Portugal, and Eredivisie. They do not predict by themselves. Each match also gets a tap button that runs the same analysis as `/predict <id>`. Kickoff times and the `/matches` day use Cairo time.
 
 `vs` separates the clubs. `|` separates the competition. Home and away stay in the order you wrote them.
 
