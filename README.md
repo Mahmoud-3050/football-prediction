@@ -22,9 +22,21 @@ Commands:
 3. `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
 4. `cp .env.example .env` and fill the three keys. Never commit `.env`.
 5. Set a strong `DASHBOARD_PASSWORD` (and `DASHBOARD_SESSION_SECRET`) before any non-loopback dashboard bind.
-6. `python main.py` — Telegram bot (idle until `/start` in a chat)
-7. `python -m jobs` — server jobs (tomorrow predictions + standings refresh)
-8. In Telegram: `/start`, then `/today` / `/predict …`
+6. Start everything on a Mac with one shortcut:
+   ```bash
+   chmod +x start.sh start.command   # once
+   ./start.sh
+   ```
+   Or double-click `start.command` in Finder. This runs the Telegram bot, jobs, and dashboard together (Ctrl+C stops all). Logs go to `data/logs/`.
+7. Optional one-word alias (add to `~/.zshrc`):
+   ```bash
+   alias fp='cd ~/Desktop/Projects/Football-Predictor/code && ./start.sh'
+   ```
+8. Or run processes yourself:
+   - `python main.py` — Telegram bot (idle until `/start` in a chat)
+   - `python -m jobs` — server jobs (tomorrow predictions + standings refresh)
+   - `python -m laboratory serve` — dashboard at http://127.0.0.1:8765
+9. In Telegram: `/start`, then `/today` / `/predict …`
 
 Production publish steps (HTTPS proxy, process managers, DB backup): [docs/deploy-checklist.md](docs/deploy-checklist.md).
 
