@@ -271,13 +271,43 @@ def test_dashboard_filter_keeps_one_season(tmp_path: Path) -> None:
     connection = connect(tmp_path / "lab.db")
     seed_demo(connection)
     run_poisson(connection)
-    page = match_list(connection, {"season": ["demo"], "verdict": ["correct"]})
+    page = match_list(
+        connection,
+        {
+            "season": ["demo"],
+            "verdict": ["correct"],
+            "date_from": ["2020-01-01"],
+            "date_to": ["2030-12-31"],
+        },
+    )
     assert "Matches" in page
     assert "Clear" in page
     assert 'name="engine" value="score_model"' in page
     assert "disabled" in page
     assert "Bot score model" in page
     assert 'name="league"' in page
+
+
+def test_dashboard_matches_defaults_to_last_seven_days(tmp_path: Path) -> None:
+    from datetime import date, timedelta
+
+    from laboratory.dashboard import _default_match_date_range, match_list
+    from laboratory.__main__ import seed_demo
+
+    connection = connect(tmp_path / "lab.db")
+    seed_demo(connection)
+    today = date(2026, 11, 11)
+    date_from, date_to = _default_match_date_range(today=today)
+    assert date_from == "2026-11-04"
+    assert date_to == "2026-11-11"
+    assert date_to == today.isoformat()
+    assert date.fromisoformat(date_from) == today - timedelta(days=7)
+
+    page = match_list(connection, {})
+    # Live default uses date.today(); assert the form fields are populated.
+    live_from, live_to = _default_match_date_range()
+    assert f'name="date_from" value="{live_from}"' in page
+    assert f'name="date_to" value="{live_to}"' in page
 
 
 def test_dashboard_league_filter_scopes_matches(tmp_path: Path) -> None:

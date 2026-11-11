@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -86,6 +86,8 @@ def overview(connection: sqlite3.Connection, query: dict[str, list[str]] | None 
 
 def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
     filters = _filters(query, connection)
+    if not filters["date_from"] and not filters["date_to"]:
+        filters["date_from"], filters["date_to"] = _default_match_date_range()
     loaded = _load(connection, filters["engine"], filters["experiment"])
     leagues, seasons, teams = _choices(loaded, filters.get("league", ""))
     rows = _apply(loaded, filters)
@@ -313,6 +315,14 @@ def _filters(
         "order": one("order", "newest"),
         "page": one("page", "1"),
     }
+
+
+def _default_match_date_range(*, today: date | None = None) -> tuple[str, str]:
+    """Matches page default window: 7 days ago through today."""
+
+    end = today or date.today()
+    start = end - timedelta(days=7)
+    return start.isoformat(), end.isoformat()
 
 
 def _live_experiment_for_match(engine: str, competition: str) -> str:
@@ -630,12 +640,14 @@ def _match_table(rows: list[dict[str, Any]], filters: dict[str, str]) -> str:
             f"</span>"
             f'<span class="club-name away">'
             f'<span class="club-text">{html.escape(away_label)}</span>{away_crest}</span>'
-            f"{_badge(status)}"
             f"</div>"
             f'<div class="match-sub">'
+            f'<span class="match-meta">'
             f'<span class="league-chip">{league_mark}{league}</span>'
             f"<span>{_when_short(row['kickoff'])}</span>"
             f'<span class="pick">1X2 · {html.escape(pick)}</span>'
+            f"</span>"
+            f"{_badge(status)}"
             f"</div>"
             "</a>"
         )
@@ -1214,6 +1226,7 @@ def standings(
       <article><span>Stored</span><strong class="small">{fetched}</strong></article>
     </section>
     """
+    show_form = any(_form_tokens(row["form"]) for row in rows)
     table_rows = []
     total = len(rows)
     for row in rows:
@@ -1228,6 +1241,9 @@ def standings(
             gd_class = " neg"
         crest = row["crest_url"] or crest_url_for_team(row["team_id"])
         club = str(row["display_name"] or row["team_name"])
+        form_cell = (
+            f'<td class="form-cell">{_form_pills(row["form"])}</td>' if show_form else ""
+        )
         table_rows.append(
             f'<tr class="{zone}">'
             f'<td class="mono pos-cell"><span class="pos-num">{position}</span></td>'
@@ -1242,15 +1258,16 @@ def standings(
             f'<td class="mono num">{row["goals_against"] if row["goals_against"] is not None else "—"}</td>'
             f'<td class="mono num{gd_class}">{html.escape(gd_text)}</td>'
             f'<td class="mono num pts"><strong>{row["points"] if row["points"] is not None else "—"}</strong></td>'
-            f'<td class="form-cell">{_form_pills(row["form"])}</td>'
+            f"{form_cell}"
             "</tr>"
         )
+    form_head = '<th class="form-cell">Form</th>' if show_form else ""
     head = (
         '<tr><th class="num">#</th><th>Club</th>'
         '<th class="num">P</th><th class="num">W</th><th class="num">D</th>'
         '<th class="num">L</th><th class="num">GF</th><th class="num">GA</th>'
         '<th class="num">GD</th><th class="num pts">Pts</th>'
-        '<th class="form-cell">Form</th></tr>'
+        f"{form_head}</tr>"
     )
     body = [
         _masthead("Standings", filters, active="standings"),
@@ -1297,17 +1314,27 @@ def _logo_img(
     )
 
 
-def _form_pills(form: str | None) -> str:
+def _form_tokens(form: str | None) -> list[str]:
     if not form:
-        return '<span class="note">—</span>'
-    parts = []
+        return []
+    marks = []
     for token in str(form).replace(" ", "").split(","):
         mark = token.strip().upper()[:1]
-        if mark not in {"W", "D", "L"}:
-            continue
-        kind = {"W": "win", "D": "draw", "L": "loss"}[mark]
-        parts.append(f'<span class="form-pill {kind}" title="{mark}">{mark}</span>')
-    return f'<span class="form-row">{"".join(parts) or "—"}</span>'
+        if mark in {"W", "D", "L"}:
+            marks.append(mark)
+    return marks
+
+
+def _form_pills(form: str | None) -> str:
+    marks = _form_tokens(form)
+    if not marks:
+        return ""
+    kinds = {"W": "win", "D": "draw", "L": "loss"}
+    parts = [
+        f'<span class="form-pill {kinds[mark]}" title="{mark}">{mark}</span>'
+        for mark in marks
+    ]
+    return f'<span class="form-row">{"".join(parts)}</span>'
 
 
 def _state(
@@ -1779,7 +1806,7 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
     .num.pos {{ color: var(--good); }}
     .num.neg {{ color: var(--bad); }}
     .pts strong {{
-      font-size: 1.25em; font-weight: 700; letter-spacing: -0.02em; line-height: 1;
+      font-size: 18px; font-weight: 700; letter-spacing: -0.02em; line-height: 1;
       color: var(--text);
     }}
     .badge {{
@@ -2073,16 +2100,21 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
     .match-card:active {{ transform: scale(0.96); }}
     .match-row {{
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
       gap: 8px; align-items: center;
     }}
     .match-sub {{
       display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
-      color: var(--muted); font-size: 0.72rem; line-height: 1.3;
-      padding-left: 0;
+      justify-content: space-between; color: var(--muted);
+      font-size: 0.72rem; line-height: 1.3; padding-left: 0;
+    }}
+    .match-meta {{
+      display: inline-flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
+      min-width: 0;
     }}
     .match-card .badge {{
-      min-height: 24px; padding: 4px 8px; font-size: 0.68rem; justify-self: end;
+      min-height: 24px; padding: 4px 8px; font-size: 0.68rem; margin-left: auto;
+      flex-shrink: 0;
     }}
     .club-name {{
       font-weight: 650; letter-spacing: -0.02em; font-size: 0.88rem; line-height: 1.2;
@@ -2110,7 +2142,6 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
     .pick {{ color: var(--muted); font-size: inherit; font-weight: 500; }}
     .match-sub .league-chip {{ gap: 8px; }}
     .match-sub .emblem {{ padding: 4px; border-radius: 4px; }}
-    .standings-wrap {{ max-height: min(70vh, 44rem); }}
     table.standings {{ table-layout: auto; }}
     table.standings th, table.standings td {{
       padding: 12px 8px; vertical-align: middle;
@@ -2137,14 +2168,16 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
       white-space: nowrap;
       padding-left: 8px;
       padding-right: 8px;
+      font-size: 16px;
     }}
     table.standings th.pts,
     table.standings td.pts {{
       padding-left: 12px;
       padding-right: 12px;
+      font-size: 18px;
     }}
     table.standings td.pts strong {{
-      font-size: 1.25em; font-weight: 700; letter-spacing: -0.02em; line-height: 1;
+      font-size: 18px; font-weight: 700; letter-spacing: -0.02em; line-height: 1;
     }}
     table.standings .form-cell {{
       width: 1%;
@@ -2240,17 +2273,16 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
       .match-list {{ gap: 8px; margin: 8px 0 12px; }}
       .match-card {{ padding: 8px 12px; }}
       .match-row {{
-        grid-template-columns: minmax(0, 1fr) auto;
-        grid-template-areas:
-          "home badge"
-          "scores scores"
-          "away away";
-        gap: 8px;
+        grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+        gap: 6px; align-items: center;
       }}
-      .club-name.home {{ grid-area: home; }}
-      .club-name.away {{ grid-area: away; text-align: left; justify-content: flex-start; }}
-      .score-pair {{ grid-area: scores; justify-self: start; }}
-      .match-card .badge {{ grid-area: badge; }}
+      .club-name {{ font-size: 0.82rem; gap: 6px; }}
+      .score {{ padding: 4px 6px; }}
+      .score .mono {{ font-size: 0.8rem; }}
+      .match-sub {{
+        gap: 6px 10px;
+      }}
+      .match-meta {{ gap: 6px 10px; }}
       .legend {{ gap: 8px 12px; margin: 0 0 16px; }}
     }}
     @media (max-width: 480px) {{
@@ -2261,6 +2293,11 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
       }}
       .cards, .cards.compact {{
         grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+      }}
+      .match-row {{ gap: 4px; }}
+      .club-name {{ font-size: 0.78rem; gap: 4px; }}
+      .match-card .badge {{
+        min-height: 22px; padding: 2px 6px; font-size: 0.62rem;
       }}
       .prob {{
         grid-template-columns: 1fr; gap: 4px;
