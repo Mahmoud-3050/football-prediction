@@ -62,6 +62,7 @@ LIVE_MATCH_COMPETITIONS: tuple[str, ...] = (
     "FL1",
     "PPL",
     "DED",
+    "SPL",
 )
 # Alias kept for callers that still import the /today name.
 TODAY_MATCH_COMPETITIONS: tuple[str, ...] = LIVE_MATCH_COMPETITIONS
@@ -182,6 +183,17 @@ FREE_COMPETITIONS: dict[str, dict[str, Any]] = {
             "serie a brazil",
             "bsa",
         ),
+    },
+    "SPL": {
+        "name": "Saudi Pro League",
+        "aliases": (
+            "saudi pro league",
+            "saudi league",
+            "saudi premier league",
+            "roshn saudi league",
+            "spl",
+        ),
+        "provider": "api-ninjas",
     },
 }
 
@@ -668,11 +680,15 @@ class DataFetcher:
         api_key: str,
         cache_dir: Path,
         *,
+        ninjas_api_key: str | None = None,
         client: httpx.AsyncClient | None = None,
         rate_limiter: RateLimiter | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
+        from api_ninjas import NinjasClient, NinjasIdMap
+
         self.api_key = api_key
+        self.ninjas_api_key = (ninjas_api_key or "").strip()
         self.cache_dir = Path(cache_dir)
         self._client = client
         self._sleep = sleep or asyncio.sleep
@@ -681,6 +697,10 @@ class DataFetcher:
             "football_request_state",
             default=None,
         )
+        self._ninjas: NinjasClient | None = None
+        self._ninjas_id_map = NinjasIdMap(self.cache_dir / "ninjas_match_ids.json")
+        if self.ninjas_api_key:
+            self._ninjas = NinjasClient(self.ninjas_api_key, id_map=self._ninjas_id_map)
 
     @asynccontextmanager
     async def request_scope(self) -> AsyncIterator[None]:
@@ -691,6 +711,8 @@ class DataFetcher:
             self._state.reset(token)
 
     async def get_teams(self, competition_code: str) -> dict[str, Any]:
+        if self._uses_ninjas(competition_code):
+            return await self._ninjas_client().teams(competition_code)
         return await self._cached(
             "teams",
             competition_code,
@@ -699,6 +721,8 @@ class DataFetcher:
         )
 
     async def get_standings(self, competition_code: str) -> dict[str, Any]:
+        if self._uses_ninjas(competition_code):
+            return await self._ninjas_client().standings_fd(competition_code)
         return await self._cached(
             "standings",
             competition_code,
@@ -711,6 +735,8 @@ class DataFetcher:
         team_id: int,
         competition_code: str,
     ) -> dict[str, Any]:
+        if self._uses_ninjas(competition_code):
+            return await self._ninjas_client().team_matches(team_id, competition_code)
         return await self._get(
             f"/v4/teams/{team_id}/matches",
             params={"competitions": competition_code, "limit": 100},
@@ -721,6 +747,8 @@ class DataFetcher:
         team_id: int,
         competition_code: str,
     ) -> dict[str, Any]:
+        if self._uses_ninjas(competition_code):
+            return await self._ninjas_client().team_finished(team_id, competition_code)
         return await self._get(
             f"/v4/teams/{team_id}/matches",
             params={
@@ -733,6 +761,8 @@ class DataFetcher:
     async def get_competition_finished_matches(self, competition_code: str) -> dict[str, Any]:
         """Season finished matches for one competition. Cached per request budget."""
 
+        if self._uses_ninjas(competition_code):
+            return await self._ninjas_client().competition_finished(competition_code)
         return await self._cached(
             "competition_finished",
             competition_code,
@@ -742,6 +772,9 @@ class DataFetcher:
         )
 
     async def get_head_to_head(self, match_id: int) -> dict[str, Any]:
+        if self._ninjas_id_map.game_id_for(match_id):
+            # Ninjas has no dedicated H2H endpoint; eligibility tolerates empty.
+            return {"matches": []}
         return await self._get(
             f"/v4/matches/{match_id}/head2head",
             params={"limit": 5},
@@ -760,14 +793,31 @@ class DataFetcher:
     ) -> dict[str, Any]:
         """Fixtures that may fall on one Africa/Cairo calendar day."""
 
+        from api_ninjas import is_ninjas_competition
+
         date_from, date_to = api_date_window_for_cairo_day(day)
         codes = competitions or TODAY_MATCH_COMPETITIONS
-        params: dict[str, Any] = {
-            "competitions": ",".join(codes),
-            "dateFrom": date_from,
-            "dateTo": date_to,
-        }
-        return await self._get("/v4/matches", params=params)
+        fd_codes = tuple(code for code in codes if not is_ninjas_competition(code))
+        ninjas_codes = tuple(code for code in codes if is_ninjas_competition(code))
+        matches: list[dict[str, Any]] = []
+        if fd_codes:
+            params: dict[str, Any] = {
+                "competitions": ",".join(fd_codes),
+                "dateFrom": date_from,
+                "dateTo": date_to,
+            }
+            payload = await self._get("/v4/matches", params=params)
+            matches.extend(payload.get("matches") or [])
+        if ninjas_codes and self._ninjas is not None:
+            for code in ninjas_codes:
+                payload = await self._ninjas.matches_for_cairo_day(code, day)
+                matches.extend(payload.get("matches") or [])
+        elif ninjas_codes and self._ninjas is None:
+            logger.warning(
+                "Skipping %s: set NINJAS_API_KEY to enable API Ninjas leagues.",
+                ",".join(ninjas_codes),
+            )
+        return {"matches": matches}
 
     async def get_matches_for_date(self, api_date: str | None) -> dict[str, Any]:
         """Back-compat wrapper. Prefer get_matches_for_cairo_day."""
@@ -778,7 +828,22 @@ class DataFetcher:
         return await self.get_todays_matches()
 
     async def get_match(self, match_id: int) -> dict[str, Any]:
+        if self._ninjas_id_map.game_id_for(match_id):
+            return await self._ninjas_client().match_by_id(match_id)
         return await self._get(f"/v4/matches/{match_id}")
+
+    def _uses_ninjas(self, competition_code: str) -> bool:
+        from api_ninjas import is_ninjas_competition
+
+        return is_ninjas_competition(competition_code)
+
+    def _ninjas_client(self):
+        if self._ninjas is None:
+            raise ProviderError(
+                "NINJAS_API_KEY is required for Saudi Pro League (SPL) and other "
+                "API Ninjas competitions."
+            )
+        return self._ninjas
 
     async def _cached(
         self,

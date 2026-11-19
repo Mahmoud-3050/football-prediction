@@ -293,6 +293,197 @@ def run_score_model(
     return counts
 
 
+def price_one_score_model(
+    connection: sqlite3.Connection,
+    match_id: str,
+    *,
+    replace: bool = True,
+) -> dict[str, Any]:
+    """Price one stored match with the live bot score_model stack (no Gemini).
+
+    Writes laboratory predictions the dashboard reads. Finished matches also get
+    an evaluation when a full-time result exists. Upcoming fixtures are allowed.
+    """
+
+    from laboratory.store import delete_match_engine_outputs, ensure_experiment
+
+    row = connection.execute(
+        """
+        SELECT m.match_id, m.competition, m.season, m.kickoff,
+               m.home_id, m.home_name, m.away_id, m.away_name,
+               r.ft_home, r.ft_away, r.ht_home, r.ht_away, r.revision
+        FROM matches m
+        LEFT JOIN result_revisions r
+          ON r.match_id = m.match_id
+         AND r.revision = (
+            SELECT MAX(revision) FROM result_revisions WHERE match_id = m.match_id
+         )
+        WHERE m.match_id = ?
+        """,
+        (match_id,),
+    ).fetchone()
+    if row is None and match_id.startswith("fd-"):
+        return price_one_score_model(
+            connection,
+            match_id.removeprefix("fd-"),
+            replace=replace,
+        )
+    if row is None:
+        return {"ok": False, "status": "missing", "detail": "Match not found in laboratory."}
+
+    competition = str(row["competition"] or "PL").upper()
+    if competition == "PL":
+        experiment_id = BOT_EXPERIMENT_ID
+    else:
+        experiment_id = f"BOT-{competition}-live"
+    model_id = "bot-score-model-live"
+    ensure_experiment(
+        connection,
+        {
+            "experiment_id": experiment_id,
+            "competition": competition,
+            "k": 6,
+            "prior_mean": "last_season",
+            "half_time_share_mode": "fixed_0_45",
+            "tail_tolerance": 0.001,
+            "engine": SCORE_MODEL_ENGINE,
+            "score_model_config_id": model_id,
+            "gemini": False,
+            "note": "Dashboard on-demand price (live stack: last_season + fixed_0_45).",
+        },
+    )
+
+    history_rows = list_matches(connection, competition=competition)
+    history = [_record(item) for item in history_rows]
+    target = _record(row)
+    season_ratio_cache = _last_season_ratio_cache(history, k=6.0)
+    payload = build_snapshot(target, history)
+    snapshot_id = save_snapshot(connection, payload, experiment_id=experiment_id)
+    if not payload["leakage_ok"]:
+        record_run(
+            connection,
+            match_id=target.match_id,
+            engine=SCORE_MODEL_ENGINE,
+            status="failed",
+            detail=payload["leakage_reason"] or "Leakage check failed.",
+            experiment_id=experiment_id,
+        )
+        connection.commit()
+        return {
+            "ok": False,
+            "status": "failed",
+            "detail": payload["leakage_reason"] or "Leakage check failed.",
+            "experiment_id": experiment_id,
+            "match_id": target.match_id,
+        }
+
+    means = prior_means_for_fixture(
+        season_ratio_cache.get(target.season) or {},
+        home_id=target.home_id,
+        away_id=target.away_id,
+    )
+    outcome = price_from_snapshot(
+        payload,
+        k=6.0,
+        config_id=model_id,
+        prior_means=means,
+        half_time_share_mode="fixed_0_45",
+    )
+    if outcome.excluded or outcome.body is None:
+        record_run(
+            connection,
+            match_id=target.match_id,
+            engine=SCORE_MODEL_ENGINE,
+            status="excluded",
+            detail=outcome.reason or "Excluded.",
+            experiment_id=experiment_id,
+        )
+        connection.commit()
+        return {
+            "ok": False,
+            "status": "excluded",
+            "detail": outcome.reason or "Excluded.",
+            "experiment_id": experiment_id,
+            "match_id": target.match_id,
+        }
+
+    if replace:
+        delete_match_engine_outputs(
+            connection,
+            match_id=target.match_id,
+            experiment_id=experiment_id,
+            engine=SCORE_MODEL_ENGINE,
+        )
+    prediction_id = insert_prediction(
+        connection,
+        match_id=target.match_id,
+        snapshot_id=snapshot_id,
+        engine=SCORE_MODEL_ENGINE,
+        model_id=model_id,
+        body=outcome.body,
+        experiment_id=experiment_id,
+    )
+    if prediction_id is None:
+        record_run(
+            connection,
+            match_id=target.match_id,
+            engine=SCORE_MODEL_ENGINE,
+            status="completed",
+            detail="Prediction already stored.",
+            experiment_id=experiment_id,
+        )
+        connection.commit()
+        return {
+            "ok": True,
+            "status": "existing",
+            "detail": "Prediction already stored.",
+            "experiment_id": experiment_id,
+            "match_id": target.match_id,
+        }
+
+    record_run(
+        connection,
+        match_id=target.match_id,
+        engine=SCORE_MODEL_ENGINE,
+        status="completed",
+        detail="Priced from dashboard (live score_model stack).",
+        experiment_id=experiment_id,
+    )
+    evaluated = False
+    if row["ft_home"] is not None and row["ft_away"] is not None:
+        metrics = evaluate_prediction(
+            outcome.body,
+            {
+                "ft_home": row["ft_home"],
+                "ft_away": row["ft_away"],
+                "ht_home": row["ht_home"],
+                "ht_away": row["ht_away"],
+            },
+        )
+        insert_evaluation(connection, prediction_id, int(row["revision"] or 1), metrics)
+        evaluated = True
+    connection.commit()
+    body = outcome.body
+    pick = (
+        (body.get("full_time") or {}).get("result_1x2") or {}
+    ).get("most_likely")
+    score = (body.get("full_time") or {}).get("exact_score_most_likely") or {}
+    detail = "Stored score_model prediction."
+    if pick:
+        detail = f"Stored · FT {str(pick).replace('_', ' ').title()}"
+        if score.get("home_goals") is not None:
+            detail += f" · {score.get('home_goals')}–{score.get('away_goals')}"
+    return {
+        "ok": True,
+        "status": "priced",
+        "detail": detail,
+        "experiment_id": experiment_id,
+        "match_id": target.match_id,
+        "prediction_id": prediction_id,
+        "evaluated": evaluated,
+    }
+
+
 def _last_season_ratio_cache(
     history: list[MatchRecord],
     *,

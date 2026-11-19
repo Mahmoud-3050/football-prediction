@@ -19,7 +19,7 @@ from timeutil import format_kickoff_cairo, format_kickoff_short_cairo
 
 
 def test_live_competitions_match_today_and_jobs() -> None:
-    expected = ("PL", "CL", "PD", "SA", "BL1", "FL1", "PPL", "DED")
+    expected = ("PL", "CL", "PD", "SA", "BL1", "FL1", "PPL", "DED", "SPL")
     assert LIVE_MATCH_COMPETITIONS == expected
     assert TODAY_MATCH_COMPETITIONS == expected
     assert JOB_COMPETITIONS == expected

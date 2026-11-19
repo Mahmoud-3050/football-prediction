@@ -296,11 +296,22 @@ def crest_cache_dir() -> Path:
 
 
 def crest_url_for_team(team_id: str | int, crest: str | None = None) -> str:
-    if isinstance(crest, str) and crest.startswith("http"):
-        return crest
+    """Resolve a team crest, preferring a locally cached file under ``/crests/``."""
+
+    key = str(team_id)
+    local = crest_cache_dir() / f"{key}.png"
     if isinstance(crest, str) and crest.startswith("/crests/"):
         return crest
-    return f"{CREST_ROOT}/{team_id}.png"
+    if isinstance(crest, str) and crest.startswith("http"):
+        if cache_remote_crest(local, crest):
+            return f"/crests/{key}.png"
+        return crest
+    if local.is_file() and local.stat().st_size > 0:
+        return f"/crests/{key}.png"
+    remote = f"{CREST_ROOT}/{key}.png"
+    if cache_remote_crest(local, remote):
+        return f"/crests/{key}.png"
+    return remote
 
 
 def emblem_remote_url(code: str, emblem: str | None = None) -> str:
@@ -324,10 +335,15 @@ def emblem_url_for_competition(code: str, emblem: str | None = None) -> str:
     return remote
 
 
-def cache_remote_crest(dest: Path, remote_url: str) -> bool:
+def cache_remote_crest(
+    dest: Path,
+    remote_url: str,
+    *,
+    force: bool = False,
+) -> bool:
     """Download a crest/emblem into ``dest``. Returns True when the file is usable."""
 
-    if dest.is_file() and dest.stat().st_size > 0:
+    if not force and dest.is_file() and dest.stat().st_size > 0:
         return True
     if not isinstance(remote_url, str) or not remote_url.startswith("http"):
         return False
@@ -377,6 +393,79 @@ def upsert_team(
         """,
         (str(team_id), name, label, url, now),
     )
+
+
+def cache_competition_logos(
+    connection: sqlite3.Connection,
+    competition: str,
+    *,
+    league_emblem_url: str | None = None,
+) -> dict[str, int]:
+    """Download team crests and the league emblem into ``data/crests/`` and update SQLite."""
+
+    from laboratory.football_data import COMPETITION_NAMES
+
+    code = competition.upper()
+    team_rows = connection.execute(
+        """
+        SELECT DISTINCT t.team_id, t.name, t.crest_url
+        FROM teams t
+        WHERE t.team_id IN (
+            SELECT home_id FROM matches WHERE competition = ?
+            UNION
+            SELECT away_id FROM matches WHERE competition = ?
+        )
+        ORDER BY t.name
+        """,
+        (code, code),
+    ).fetchall()
+    cached = 0
+    failed = 0
+    for row in team_rows:
+        team_id = str(row["team_id"])
+        remote = row["crest_url"] if isinstance(row["crest_url"], str) else None
+        if not remote or not remote.startswith("http"):
+            # Live Football stable path when only the id is known.
+            if code == "SPL":
+                remote = f"https://live-football-api.com/teams/{team_id}.png"
+            else:
+                remote = f"{CREST_ROOT}/{team_id}.png"
+        local_url = crest_url_for_team(team_id, remote)
+        upsert_team(
+            connection,
+            team_id=team_id,
+            name=str(row["name"]),
+            crest_url=local_url,
+        )
+        if local_url.startswith("/crests/"):
+            cached += 1
+        else:
+            failed += 1
+
+    emblem_remote = league_emblem_url
+    if not emblem_remote and code == "SPL":
+        from live_football_api import lfa_league_id
+
+        emblem_remote = f"https://live-football-api.com/leagues/{lfa_league_id(code)}.png"
+    emblem_path = crest_cache_dir() / f"{code}.png"
+    if emblem_remote and cache_remote_crest(emblem_path, emblem_remote, force=True):
+        emblem_local = f"/crests/{code}.png"
+    else:
+        emblem_local = emblem_url_for_competition(code, emblem_remote)
+    upsert_competition(
+        connection,
+        code=code,
+        name=COMPETITION_NAMES.get(code, code),
+        emblem_url=emblem_local if emblem_local.startswith(("http", "/crests/")) else emblem_remote,
+    )
+    connection.commit()
+    return {
+        "competition": code,
+        "teams": len(team_rows),
+        "crests_cached": cached,
+        "crests_failed": failed,
+        "emblem": 1 if emblem_local.startswith("/crests/") else 0,
+    }
 
 
 def refresh_team_display_names(connection: sqlite3.Connection) -> int:
@@ -845,6 +934,44 @@ def save_snapshot(
         ),
     )
     return snapshot_id
+
+
+def delete_match_engine_outputs(
+    connection: sqlite3.Connection,
+    *,
+    match_id: str,
+    experiment_id: str,
+    engine: str,
+) -> None:
+    """Remove stored prediction/evaluation/run rows for one match engine slot."""
+
+    prediction_ids = [
+        row["prediction_id"]
+        for row in connection.execute(
+            """
+            SELECT prediction_id FROM predictions
+            WHERE match_id = ? AND experiment_id = ? AND engine = ?
+            """,
+            (match_id, experiment_id, engine),
+        )
+    ]
+    if prediction_ids:
+        marks = ",".join("?" for _ in prediction_ids)
+        connection.execute(
+            f"DELETE FROM evaluations WHERE prediction_id IN ({marks})",
+            prediction_ids,
+        )
+        connection.execute(
+            f"DELETE FROM predictions WHERE prediction_id IN ({marks})",
+            prediction_ids,
+        )
+    connection.execute(
+        """
+        DELETE FROM engine_runs
+        WHERE match_id = ? AND experiment_id = ? AND engine = ?
+        """,
+        (match_id, experiment_id, engine),
+    )
 
 
 def insert_prediction(

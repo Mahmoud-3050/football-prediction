@@ -10,9 +10,12 @@ import hashlib
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 SOURCE = "football-data.org"
+NINJAS_SOURCE = "api-ninjas.com"
+LIVE_FOOTBALL_SOURCE = "live-football-api.com"
 API_ROOT = "https://api.football-data.org/v4/competitions/{competition}/matches"
 
 COMPETITION_NAMES = {
@@ -24,16 +27,81 @@ COMPETITION_NAMES = {
     "PPL": "Liga Portugal",
     "DED": "Eredivisie",
     "CL": "Champions League",
+    "SPL": "Saudi Pro League",
 }
 
 
 def dataset_version(competition: str) -> str:
+    code = competition.upper()
+    from live_football_api import is_live_football_competition
+
+    if is_live_football_competition(code):
+        return f"live-football-{code.lower()}"
+    from api_ninjas import is_ninjas_competition
+
+    if is_ninjas_competition(code):
+        return f"api-ninjas-{code.lower()}"
     return f"football-data-{competition.lower()}"
 
 
-def fetch_season(api_key: str, season: int, *, competition: str = "PL") -> dict[str, Any]:
+def fetch_season(
+    api_key: str,
+    season: int,
+    *,
+    competition: str = "PL",
+    ninjas_api_key: str | None = None,
+    live_football_api_key: str | None = None,
+    id_map_path: Path | None = None,
+) -> dict[str, Any]:
     code = competition.upper()
     label = COMPETITION_NAMES.get(code, code)
+    from api_ninjas import (
+        NinjasIdMap,
+        fetch_season_matches,
+        is_ninjas_competition,
+        season_to_fd as ninjas_season_to_fd,
+    )
+    from live_football_api import (
+        fetch_league_fixtures,
+        is_live_football_competition,
+        season_to_fd as lfa_season_to_fd,
+    )
+    from models import ProviderError
+
+    # Prefer Live Football API for SPL history (multi-season archive).
+    if is_live_football_competition(code):
+        key = (live_football_api_key or "").strip()
+        if key:
+            try:
+                data = fetch_league_fixtures(key, competition_code=code, season=season)
+            except ProviderError as exc:
+                raise RuntimeError(str(exc)) from exc
+            return lfa_season_to_fd(data, competition_code=code, season=season)
+        # Fall back to API Ninjas when Live Football key is absent.
+        if not (ninjas_api_key or "").strip():
+            raise RuntimeError(
+                f"{label} history needs LIVE_FOOTBALL_API_KEY "
+                "(or NINJAS_API_KEY as a fallback)."
+            )
+
+    if is_ninjas_competition(code):
+        key = (ninjas_api_key or "").strip()
+        if not key:
+            raise RuntimeError(
+                f"{label} history needs LIVE_FOOTBALL_API_KEY or NINJAS_API_KEY."
+            )
+        path = id_map_path or Path("data/cache/ninjas_match_ids.json")
+        try:
+            rows = fetch_season_matches(key, season, competition_code=code)
+        except ProviderError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return ninjas_season_to_fd(
+            rows,
+            competition_code=code,
+            season=season,
+            id_map=NinjasIdMap(path),
+        )
+
     request = urllib.request.Request(
         f"{API_ROOT.format(competition=code)}?season={season}",
         headers={"X-Auth-Token": api_key},
@@ -152,9 +220,22 @@ def import_bodies(
     )
 
     code = competition.upper()
+    from api_ninjas import is_ninjas_competition
+    from live_football_api import is_live_football_competition
+
+    if is_live_football_competition(code):
+        result_source = LIVE_FOOTBALL_SOURCE
+    elif is_ninjas_competition(code):
+        result_source = NINJAS_SOURCE
+    else:
+        result_source = SOURCE
     ensure_experiment(connection, experiment_config or EXPERIMENT_CONFIG)
     upsert_competition(connection, code=code, name=COMPETITION_NAMES.get(code, code))
     removed = remove_datasets_with_prefix(connection, "demo-")
+    # Drop prior provider copies for the same league so hashed Ninjas ids do not linger.
+    if is_live_football_competition(code):
+        removed += remove_datasets_with_prefix(connection, f"api-ninjas-{code.lower()}")
+        removed += remove_datasets_with_prefix(connection, f"live-football-{code.lower()}")
     counts = {
         "competition": code,
         "demo_removed": removed,
@@ -217,7 +298,9 @@ def import_bodies(
             if result is None:
                 continue
             counts["finished"] += 1
-            _, changed = append_result_if_changed(connection, record["match_id"], result, SOURCE)
+            _, changed = append_result_if_changed(
+                connection, record["match_id"], result, result_source
+            )
             counts["results_added" if changed else "results_unchanged"] += 1
     connection.commit()
     return counts

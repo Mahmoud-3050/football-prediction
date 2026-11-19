@@ -13,12 +13,46 @@ from laboratory.football_data import COMPETITION_NAMES
 
 STANDINGS_URL = "https://api.football-data.org/v4/competitions/{competition}/standings"
 # Cups do not expose a single TOTAL table on this endpoint.
-STANDINGS_COMPETITIONS = ("PL", "PD", "FL1", "BL1", "SA", "PPL", "DED")
+STANDINGS_COMPETITIONS = ("PL", "PD", "FL1", "BL1", "SA", "PPL", "DED", "SPL")
 
 
-def fetch_standings(api_key: str, competition: str, *, season: int | None = None) -> dict[str, Any]:
+def fetch_standings(
+    api_key: str,
+    competition: str,
+    *,
+    season: int | None = None,
+    ninjas_api_key: str | None = None,
+) -> dict[str, Any]:
     code = competition.upper()
     label = COMPETITION_NAMES.get(code, code)
+    from api_ninjas import NINJAS_BASE, is_ninjas_competition, ninjas_league, standings_to_fd
+
+    if is_ninjas_competition(code):
+        key = (ninjas_api_key or "").strip()
+        if not key:
+            raise RuntimeError(
+                f"{label} standings need NINJAS_API_KEY (API Ninjas), not Football-Data."
+            )
+        url = f"{NINJAS_BASE}/v1/soccerstandings?league={ninjas_league(code)}"
+        if season is not None:
+            url = f"{url}&season={season}"
+        request = urllib.request.Request(url, headers={"X-Api-Key": key})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                rows = json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"API Ninjas rejected the {label} standings request with HTTP {exc.code}."
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"API Ninjas could not be reached ({exc.reason}).") from exc
+        if not isinstance(rows, list):
+            raise RuntimeError(f"API Ninjas returned no standings for {label}.")
+        return standings_to_fd(
+            [row for row in rows if isinstance(row, dict)],
+            competition_code=code,
+        )
+
     url = STANDINGS_URL.format(competition=code)
     if season is not None:
         url = f"{url}?season={season}"
@@ -345,6 +379,7 @@ def ensure_standings(
     *,
     force: bool = False,
     season: int | None = None,
+    ninjas_api_key: str | None = None,
 ) -> dict[str, Any]:
     """Fetch from the API only when the DB has no rows (or force refresh)."""
 
@@ -364,7 +399,12 @@ def ensure_standings(
             "rows": len(rows),
             "source": "db",
         }
-    body = fetch_standings(api_key, code, season=season)
+    body = fetch_standings(
+        api_key,
+        code,
+        season=season,
+        ninjas_api_key=ninjas_api_key,
+    )
     parsed = parse_standings(body, competition=code)
     count = replace_standings(connection, parsed)
     return {
@@ -382,6 +422,7 @@ def import_all_standings(
     competitions: tuple[str, ...] = STANDINGS_COMPETITIONS,
     force: bool = True,
     pause_seconds: float = 7.0,
+    ninjas_api_key: str | None = None,
 ) -> list[dict[str, Any]]:
     import time
 
@@ -391,7 +432,13 @@ def import_all_standings(
             time.sleep(pause_seconds)
         try:
             summary.append(
-                ensure_standings(connection, api_key, code, force=force)
+                ensure_standings(
+                    connection,
+                    api_key,
+                    code,
+                    force=force,
+                    ninjas_api_key=ninjas_api_key,
+                )
             )
         except Exception as exc:  # noqa: BLE001 — collect per-league failures
             summary.append(

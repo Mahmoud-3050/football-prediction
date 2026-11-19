@@ -9,7 +9,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from dotenv import load_dotenv
 
@@ -42,6 +42,7 @@ from laboratory.job import (
 )
 from laboratory.store import (
     append_result,
+    cache_competition_logos,
     connect,
     ensure_experiment,
     list_competitions,
@@ -154,18 +155,29 @@ def build_dashboard_server(
                     status = 200
                 elif parsed.path.startswith("/matches/"):
                     match_id = parsed.path.removeprefix("/matches/")
-                    detail = match_detail(connection, match_id, query)
-                    if detail is None:
-                        page = not_found_page(resource="Match")
+                    if match_id.endswith("/predict"):
+                        page = not_found_page(resource="Page")
                         status = 404
                     else:
-                        page = detail
-                        status = 200
+                        detail = match_detail(
+                            connection,
+                            match_id,
+                            query,
+                            csrf_token=credentials.csrf_token(),
+                        )
+                        if detail is None:
+                            page = not_found_page(resource="Match")
+                            status = 404
+                        else:
+                            page = detail
+                            status = 200
                 elif parsed.path == "/standings":
                     page = standings(
                         connection,
                         query,
                         api_key=os.environ.get("FOOTBALL_API_KEY", "").strip() or None,
+                        ninjas_api_key=os.environ.get("NINJAS_API_KEY", "").strip()
+                        or None,
                     )
                     status = 200
                 else:
@@ -178,9 +190,15 @@ def build_dashboard_server(
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path != "/login":
-                self._plain(b"Not found\n", status=404)
+            if parsed.path == "/login":
+                self._post_login()
                 return
+            if parsed.path.startswith("/matches/") and parsed.path.endswith("/predict"):
+                self._post_predict(parsed.path)
+                return
+            self._plain(b"Not found\n", status=404)
+
+        def _post_login(self) -> None:
             if not credentials.enabled:
                 self._redirect("/")
                 return
@@ -210,6 +228,51 @@ def build_dashboard_server(
             self.send_header("Set-Cookie", credentials.session_cookie_header(token))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
+
+        def _post_predict(self, path: str) -> None:
+            if credentials.enabled and not self._authenticated():
+                self._redirect(f"/login?next={quote(path, safe='/?&=')}")
+                return
+            match_id = path.removeprefix("/matches/").removesuffix("/predict")
+            form = parse_form(read_request_body(self))
+            if credentials.enabled and not secrets.compare_digest(
+                form.get("csrf") or "", credentials.csrf_token()
+            ):
+                self._redirect(
+                    f"/matches/{quote(match_id, safe='')}?"
+                    + urlencode(
+                        {
+                            "predict_status": "failed",
+                            "predict_detail": "Session expired. Try again.",
+                        }
+                    )
+                )
+                return
+            from laboratory.job import price_one_score_model
+
+            try:
+                result = price_one_score_model(connection, match_id, replace=True)
+            except Exception as exc:  # noqa: BLE001 — surface on the match page
+                result = {
+                    "ok": False,
+                    "status": "failed",
+                    "detail": str(exc),
+                    "match_id": match_id,
+                }
+            target_id = str(result.get("match_id") or match_id)
+            params = {
+                "predict_status": str(result.get("status") or "failed"),
+                "predict_detail": str(result.get("detail") or ""),
+            }
+            if result.get("ok"):
+                params["predicted"] = "1"
+            retained = (form.get("next") or "").strip().lstrip("?")
+            if retained.startswith("http") or retained.startswith("/"):
+                retained = ""
+            query = urlencode(params)
+            if retained:
+                query = f"{retained}&{query}"
+            self._redirect(f"/matches/{quote(target_id, safe='')}?{query}")
 
         def _authenticated(self) -> bool:
             token = cookie_value(self.headers.get("Cookie"))
@@ -301,6 +364,8 @@ def import_competition_history(
     competition: str,
     seasons: list[int],
     pause_seconds: float = IMPORT_PAUSE_SECONDS,
+    ninjas_api_key: str | None = None,
+    live_football_api_key: str | None = None,
 ) -> dict[str, Any]:
     """Fetch and store finished/unfinished fixtures for one competition. No pricing."""
 
@@ -310,12 +375,33 @@ def import_competition_history(
             f"Unknown competition {competition!r}. Known: {', '.join(COMPETITION_NAMES)}"
         )
     bodies: list[tuple[int, dict[str, Any]]] = []
+    errors: list[str] = []
     for index, season in enumerate(seasons):
         if index:
             time.sleep(pause_seconds)
         print(f"Fetching {code} {season}…", flush=True)
-        bodies.append((season, fetch_season(api_key, season, competition=code)))
-    config = _dataset_config(code, seasons)
+        try:
+            bodies.append(
+                (
+                    season,
+                    fetch_season(
+                        api_key,
+                        season,
+                        competition=code,
+                        ninjas_api_key=ninjas_api_key,
+                        live_football_api_key=live_football_api_key,
+                    ),
+                )
+            )
+        except RuntimeError as exc:
+            print(f"  skipped {code} {season}: {exc}", flush=True)
+            errors.append(f"{code} {season}: {exc}")
+    if not bodies:
+        raise SystemExit(
+            f"No {code} seasons imported. "
+            + ("; ".join(errors) if errors else "No seasons requested.")
+        )
+    config = _dataset_config(code, [season for season, _ in bodies])
     ensure_experiment(connection, config)
     counts = import_bodies(
         connection,
@@ -323,6 +409,8 @@ def import_competition_history(
         competition=code,
         experiment_config=config,
     )
+    if errors:
+        counts["season_errors"] = len(errors)
     return counts
 
 
@@ -342,6 +430,7 @@ def main() -> None:
             "price-finished",
             "migrate-db",
             "import-standings",
+            "cache-logos",
         ),
     )
     parser.add_argument(
@@ -382,6 +471,7 @@ def main() -> None:
         return
     if args.command == "import-standings":
         api_key = _football_key()
+        ninjas_key = os.environ.get("NINJAS_API_KEY", "").strip() or None
         connection = connect(path)
         competitions = tuple(
             code.upper() for code in (args.competitions or list(STANDINGS_COMPETITIONS))
@@ -391,9 +481,21 @@ def main() -> None:
             api_key,
             competitions=competitions,
             force=True,
+            ninjas_api_key=ninjas_key,
         )
         print({"standings": summary})
         print(f"Stored league standings in {path}")
+        return
+    if args.command == "cache-logos":
+        connection = connect(path)
+        competitions = tuple(
+            code.upper() for code in (args.competitions or ["SPL"])
+        )
+        summary = [
+            cache_competition_logos(connection, code) for code in competitions
+        ]
+        print({"logos": summary})
+        print(f"Cached crests under {path.parent / 'crests'}")
         return
     if args.command == "import-pl":
         seasons = args.seasons or [2023, 2024, 2025, 2026]
@@ -416,6 +518,9 @@ def main() -> None:
             api_key=api_key,
             competition="PD",
             seasons=seasons,
+            ninjas_api_key=os.environ.get("NINJAS_API_KEY", "").strip() or None,
+            live_football_api_key=os.environ.get("LIVE_FOOTBALL_API_KEY", "").strip()
+            or None,
         )
         print(counts)
         print(f"Stored La Liga seasons {seasons} in {path} (no pricing)")
@@ -426,6 +531,10 @@ def main() -> None:
             code.upper() for code in (args.competitions or list(DEFAULT_LEAGUE_IMPORTS))
         )
         api_key = _football_key()
+        ninjas_key = os.environ.get("NINJAS_API_KEY", "").strip() or None
+        live_football_key = (
+            os.environ.get("LIVE_FOOTBALL_API_KEY", "").strip() or None
+        )
         connection = connect(path)
         summary: list[dict[str, Any]] = []
         for index, code in enumerate(competitions):
@@ -436,6 +545,8 @@ def main() -> None:
                 api_key=api_key,
                 competition=code,
                 seasons=seasons,
+                ninjas_api_key=ninjas_key,
+                live_football_api_key=live_football_key,
             )
             print(counts, flush=True)
             summary.append(counts)

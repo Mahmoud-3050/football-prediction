@@ -82,6 +82,7 @@ async def run_standings_once(
     connection: sqlite3.Connection,
     *,
     api_key: str,
+    ninjas_api_key: str | None = None,
     state: dict[str, Any] | None = None,
     day: date | None = None,
 ) -> dict[str, Any]:
@@ -118,7 +119,13 @@ async def run_standings_once(
                 summary["skipped"].append(code)
             continue
         try:
-            result = ensure_standings(connection, api_key, code, force=True)
+            result = ensure_standings(
+                connection,
+                api_key,
+                code,
+                force=True,
+                ninjas_api_key=ninjas_api_key,
+            )
             summary["refreshed"].append(result)
             logger.info(
                 "standings refreshed for %s season=%s rows=%s",

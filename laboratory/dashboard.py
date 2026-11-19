@@ -202,6 +202,8 @@ def match_detail(
     connection: sqlite3.Connection,
     match_id: str,
     query: dict[str, list[str]] | None = None,
+    *,
+    csrf_token: str | None = None,
 ) -> str | None:
     match_row = connection.execute("SELECT * FROM matches WHERE match_id = ?", (match_id,)).fetchone()
     if match_row is None and match_id.startswith("fd-"):
@@ -297,6 +299,13 @@ def match_detail(
             back_href=back,
         ),
         _scoreboard(match, result, connection),
+        _predict_flash(filters),
+        _predict_panel(
+            match_id=canonical_id,
+            has_prediction=bool(predictions),
+            csrf_token=csrf_token,
+            query=filters,
+        ),
         _facts(match, snapshot),
     ]
     preferred = next((item for item in predictions if item["engine"] == filters["engine"]), None)
@@ -376,7 +385,74 @@ def _filters(
         "verdict": one("verdict", "all"),
         "order": one("order", "newest"),
         "page": one("page", "1"),
+        "predicted": one("predicted"),
+        "predict_status": one("predict_status"),
+        "predict_detail": one("predict_detail"),
     }
+
+
+def _predict_flash(filters: dict[str, str]) -> str:
+    status = (filters.get("predict_status") or "").strip()
+    detail = (filters.get("predict_detail") or "").strip()
+    predicted = (filters.get("predicted") or "").strip()
+    if not status and not predicted:
+        return ""
+    if status in {"priced", "existing"} or predicted == "1":
+        kind = "info"
+        title = "Prediction stored"
+        lead = detail or "Score model prediction is saved for this match."
+    elif status == "excluded":
+        kind = "info"
+        title = "Prediction abstained"
+        lead = detail or "Not enough prior data to price this match."
+    else:
+        kind = "error"
+        title = "Prediction failed"
+        lead = detail or "Could not price this match."
+    return _state(kind=kind, title=title, lead=lead)
+
+
+def _predict_panel(
+    *,
+    match_id: str,
+    has_prediction: bool,
+    csrf_token: str | None,
+    query: dict[str, str],
+) -> str:
+    action = f"/matches/{html.escape(match_id)}/predict"
+    retained = _query(
+        query,
+        predicted="",
+        predict_status="",
+        predict_detail="",
+        page="",
+    )
+    label = "Re-run prediction" if has_prediction else "Run prediction"
+    lead = (
+        "Prices this fixture with the live score model (no Gemini) and stores it "
+        "for the dashboard. Finished matches are also scored."
+    )
+    csrf = ""
+    if csrf_token:
+        csrf = (
+            f'<input type="hidden" name="csrf" value="{html.escape(csrf_token)}">'
+        )
+    next_field = (
+        f'<input type="hidden" name="next" value="'
+        f'{html.escape(retained)}">'
+        if retained
+        else ""
+    )
+    return (
+        '<section class="panel predict-panel">'
+        "<h2>Predict</h2>"
+        f'<p class="note">{html.escape(lead)}</p>'
+        f'<form class="predict-form" method="post" action="{action}">'
+        f"{csrf}{next_field}"
+        f'<button type="submit">{html.escape(label)}</button>'
+        "</form>"
+        "</section>"
+    )
 
 
 def _default_match_date_range(*, today: date | None = None) -> tuple[str, str]:
@@ -1389,8 +1465,9 @@ def standings(
     query: dict[str, list[str]] | None = None,
     *,
     api_key: str | None = None,
+    ninjas_api_key: str | None = None,
 ) -> str:
-    """League table from SQLite. Fetches from Football-Data.org once if missing."""
+    """League table from SQLite. Fetches from the provider once if missing."""
 
     from laboratory.standings import (
         STANDINGS_COMPETITIONS,
@@ -1405,24 +1482,38 @@ def standings(
         competition = STANDINGS_COMPETITIONS[0]
     filters["league"] = competition
     notice = ""
-    if api_key:
+    can_fetch = (
+        bool((ninjas_api_key or "").strip())
+        if competition == "SPL"
+        else bool((api_key or "").strip())
+    )
+    if can_fetch:
         try:
-            result = ensure_standings(connection, api_key, competition, force=False)
+            result = ensure_standings(
+                connection,
+                api_key or "",
+                competition,
+                force=False,
+                ninjas_api_key=ninjas_api_key,
+            )
             if result["source"] == "api":
+                source_name = (
+                    "API Ninjas" if competition == "SPL" else "Football-Data.org"
+                )
                 if result["rows"]:
                     notice = _state(
                         kind="info",
                         title="Standings refreshed",
                         lead=(
                             f"Fetched {result['rows']} rows for {competition} "
-                            "from Football-Data.org and stored them."
+                            f"from {source_name} and stored them."
                         ),
                     )
                 else:
                     notice = _state(
                         kind="empty",
                         title="Standings refresh returned no rows",
-                        lead=f"Football-Data.org responded without a TOTAL table for {competition}.",
+                        lead=f"{source_name} responded without a TOTAL table for {competition}.",
                     )
         except Exception as exc:  # noqa: BLE001 — show error-state guidance
             notice = _state(
@@ -2085,6 +2176,19 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
     .job-cards .job-ok {{ color: var(--accent); }}
     .job-cards .job-failed {{ color: #f87171; }}
     .job-cards p {{ margin: 6px 0 0; color: var(--muted); font-size: 0.85rem; line-height: 1.35; }}
+    .predict-panel {{ margin: 16px 0; }}
+    .predict-form {{
+      display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px;
+    }}
+    .predict-form button {{
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: 44px; padding: 0 16px; border: 0; border-radius: var(--radius-sm);
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      color: #042f24; font: inherit; font-weight: 700; cursor: pointer;
+      transition: transform 160ms var(--ease), filter 160ms var(--ease);
+    }}
+    .predict-form button:hover {{ filter: brightness(1.05); }}
+    .predict-form button:active {{ transform: scale(0.96); }}
     .charts-panel {{ margin: 32px 0 24px; }}
     .chart-grid {{
       display: grid; grid-template-columns: 1fr;
@@ -2735,6 +2839,8 @@ def _query(filters: dict[str, str], **overrides: str) -> str:
     kept: dict[str, str] = {}
     for key, value in data.items():
         if not value:
+            continue
+        if key in {"predicted", "predict_status", "predict_detail"}:
             continue
         if key in {"fixture", "status", "verdict"} and value == "all":
             continue

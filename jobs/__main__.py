@@ -29,6 +29,7 @@ async def jobs_loop(
     connection: Any,
     *,
     api_key: str,
+    ninjas_api_key: str | None = None,
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
     stop_event: asyncio.Event | None = None,
 ) -> None:
@@ -43,6 +44,7 @@ async def jobs_loop(
             pipeline,
             connection,
             api_key=api_key,
+            ninjas_api_key=ninjas_api_key,
             state=standings_state,
         )
         try:
@@ -82,6 +84,7 @@ async def _run_standings_tracked(
     connection: Any,
     *,
     api_key: str,
+    ninjas_api_key: str | None = None,
     state: dict[str, Any],
 ) -> None:
     started = datetime.now(timezone.utc).isoformat()
@@ -90,6 +93,7 @@ async def _run_standings_tracked(
             pipeline,
             connection,
             api_key=api_key,
+            ninjas_api_key=ninjas_api_key,
             state=state,
         )
         logging.getLogger(__name__).info("standings job finished: %s", standings)
@@ -135,6 +139,7 @@ def main() -> None:
             pipeline,
             connection,
             api_key=config.football_api_key,
+            ninjas_api_key=config.ninjas_api_key or None,
             interval_seconds=interval,
         )
     )

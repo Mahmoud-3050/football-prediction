@@ -21,7 +21,11 @@ def build_pipeline(config: object) -> Pipeline:
 
     if not isinstance(config, Config):
         raise TypeError("config must be a Config instance.")
-    fetcher = DataFetcher(api_key=config.football_api_key, cache_dir=config.cache_dir)
+    fetcher = DataFetcher(
+        api_key=config.football_api_key,
+        cache_dir=config.cache_dir,
+        ninjas_api_key=config.ninjas_api_key,
+    )
     predictor = Predictor(
         api_key=config.gemini_api_key,
         model=config.gemini_model,

@@ -50,7 +50,7 @@ START_TEXT = (
     "/predict #560638\n\n"
     "On /today and /matches, tap a match button to predict it.\n"
     "Fixture lists cover Premier League, UEFA Champions League, Primera Division, "
-    "Serie A, Bundesliga, and Ligue 1.\n"
+    "Serie A, Bundesliga, Ligue 1, Liga Portugal, Eredivisie, and Saudi Pro League.\n"
     "Kickoff times and /matches days use Cairo time.\n"
     "If a match is finished or the data is missing, the bot abstains.\n\n"
     "A result is a statistical estimate, not a betting tip."

@@ -30,6 +30,7 @@ class ConfigError(Exception):
 class Config:
     bot_token: str
     football_api_key: str
+    ninjas_api_key: str
     gemini_api_key: str
     gemini_model: str
     gemini_fallback_models: tuple[str, ...]
@@ -64,6 +65,7 @@ def load_config(environ: Mapping[str, str] | None = None) -> Config:
     return Config(
         bot_token=source["BOT_TOKEN"].strip(),
         football_api_key=source["FOOTBALL_API_KEY"].strip(),
+        ninjas_api_key=(source.get("NINJAS_API_KEY") or "").strip(),
         gemini_api_key=source["GEMINI_API_KEY"].strip(),
         gemini_model=gemini_model,
         gemini_fallback_models=_fallback_models(

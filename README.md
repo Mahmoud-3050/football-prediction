@@ -11,16 +11,16 @@ Commands:
 /predict #560638
 ```
 
-`/today` and `/matches DD-MM-YYYY` list fixtures in Premier League, UEFA Champions League, Primera Division, Serie A, Bundesliga, Ligue 1, Liga Portugal, and Eredivisie. They do not predict by themselves. Each match also gets a tap button that runs the same analysis as `/predict <id>`. Kickoff times and the `/matches` day use Cairo time.
+`/today` and `/matches DD-MM-YYYY` list fixtures in Premier League, UEFA Champions League, Primera Division, Serie A, Bundesliga, Ligue 1, Liga Portugal, Eredivisie, and Saudi Pro League (API Ninjas when `NINJAS_API_KEY` is set). They do not predict by themselves. Each match also gets a tap button that runs the same analysis as `/predict <id>`. Kickoff times and the `/matches` day use Cairo time.
 
 `vs` separates the clubs. `|` separates the competition. Home and away stay in the order you wrote them.
 
 ## Run
 
 1. Use **Python 3.9 or newer** (3.10+ recommended; 3.9 is end-of-life).
-2. Create a BotFather token, a free token from [football-data.org](https://www.football-data.org/client/register), and a Google AI Studio key.
+2. Create a BotFather token, a free token from [football-data.org](https://www.football-data.org/client/register), a Google AI Studio key, and (for Saudi Pro League history) a [Live Football API](https://www.live-football-api.com) key. Optional: [API Ninjas](https://api-ninjas.com) for SPL live fixtures.
 3. `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
-4. `cp .env.example .env` and fill the three keys. Never commit `.env`.
+4. `cp .env.example .env` and fill `BOT_TOKEN`, `FOOTBALL_API_KEY`, `GEMINI_API_KEY`, plus optional `LIVE_FOOTBALL_API_KEY` / `NINJAS_API_KEY`. Never commit `.env`.
 5. Set a strong `DASHBOARD_PASSWORD` (and `DASHBOARD_SESSION_SECRET`) before any non-loopback dashboard bind.
 6. Start everything on a Mac with one shortcut:
    ```bash
