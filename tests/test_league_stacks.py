@@ -21,7 +21,7 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-pl-v2",
+        "model_id": "bot-score-model-pl-v3",
     },
     "PD": {
         "k": 12.0,
@@ -29,7 +29,7 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-pd-v2",
+        "model_id": "bot-score-model-pd-v3",
     },
     "SA": {
         "k": 12.0,
@@ -37,7 +37,7 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-sa-v2",
+        "model_id": "bot-score-model-sa-v3",
     },
     "BL1": {
         "k": 12.0,
@@ -45,7 +45,7 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-bl1-v2",
+        "model_id": "bot-score-model-bl1-v3",
     },
     "FL1": {
         "k": 12.0,
@@ -53,7 +53,7 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-fl1-v2",
+        "model_id": "bot-score-model-fl1-v3",
     },
     "PPL": {
         "k": 8.0,
@@ -61,7 +61,7 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-ppl-v2",
+        "model_id": "bot-score-model-ppl-v3",
     },
     "DED": {
         "k": 8.0,
@@ -69,7 +69,7 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-ded-v2",
+        "model_id": "bot-score-model-ded-v3",
     },
     "CL": {
         "k": 12.0,
@@ -197,7 +197,7 @@ def test_live_stack_passes_calibration_knobs(tmp_path: Path, monkeypatch) -> Non
             "dependence": "independent",
             "half_time_share_mode": "club_shrunk",
             "ratio_mode": "one_pass",
-            "model_id": "bot-score-model-pl-v2",
+            "model_id": "bot-score-model-pl-v3",
             "decay_half_life_days": 150.0,
             "draw_boost": 1.06,
             "goal_cap": 4.0,

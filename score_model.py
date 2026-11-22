@@ -77,6 +77,13 @@ class ScoreEstimate:
     nb_alpha: float = 0.0
     promoted_attack_prior: float | None = None
     promoted_defence_prior: float | None = None
+    venue_k: float | None = None
+    short_rest_days: int | None = None
+    rest_attack_factor: float = 0.94
+    rest_defence_factor: float = 1.05
+    target_kickoff: str | None = None
+    standings_blend: float = 0.0
+    standings_min_games: int = 6
 
     def probability(self, home_goals: int, away_goals: int) -> float:
         if home_goals >= len(self.matrix) or away_goals >= len(self.matrix[0]):
@@ -282,6 +289,13 @@ def estimate_from_lambdas(
     goal_cap_slope: float = 0.5,
     promoted_attack_prior: float | None = None,
     promoted_defence_prior: float | None = None,
+    venue_k: float | None = None,
+    short_rest_days: int | None = None,
+    rest_attack_factor: float = 0.94,
+    rest_defence_factor: float = 1.05,
+    target_kickoff: str | None = None,
+    standings_blend: float = 0.0,
+    standings_min_games: int = 6,
 ) -> ScoreEstimate:
     """Price a full-time grid, and a half-time grid when that market is eligible."""
 
@@ -394,6 +408,13 @@ def estimate_from_lambdas(
         nb_alpha=nb_alpha_val,
         promoted_attack_prior=promoted_attack_prior,
         promoted_defence_prior=promoted_defence_prior,
+        venue_k=venue_k,
+        short_rest_days=short_rest_days,
+        rest_attack_factor=rest_attack_factor,
+        rest_defence_factor=rest_defence_factor,
+        target_kickoff=target_kickoff,
+        standings_blend=standings_blend,
+        standings_min_games=standings_min_games,
     )
 
 
@@ -425,6 +446,14 @@ def estimate_score(
     nb_alpha: float = 0.0,
     promoted_attack_prior: float | None = None,
     promoted_defence_prior: float | None = None,
+    venue_k: float | None = None,
+    short_rest_days: int | None = None,
+    rest_attack_factor: float = 0.94,
+    rest_defence_factor: float = 1.05,
+    target_kickoff: str | None = None,
+    last_kickoff_by_team: dict[int, str] | None = None,
+    standings_blend: float = 0.0,
+    standings_min_games: int = 6,
 ) -> ScoreEstimate:
     """Expected goals from shrunk multiplicative rates, then modal scores and markets."""
 
@@ -536,6 +565,46 @@ def estimate_score(
             ]
         )
 
+    # Pre-kickoff standings blend (optional, default 0 => no-op).
+    if standings_blend and standings_blend > 0.0 and priors:
+        # Filter to strictly earlier matches.
+        stand_priors = priors
+        if target_kickoff is not None:
+            stand_priors = [m for m in priors if m.kickoff < target_kickoff]
+        # tally per club
+        stats: dict[int, dict[str, float]] = {}
+        for m in stand_priors:
+            for tid, gf, ga in ((m.home_id, m.ft_home, m.ft_away), (m.away_id, m.ft_away, m.ft_home)):
+                st = stats.setdefault(tid, {"games": 0, "points": 0, "gf": 0, "ga": 0})
+                st["games"] += 1
+                st["gf"] += m.ft_home if tid == m.home_id else m.ft_away
+                st["ga"] += m.ft_away if tid == m.home_id else m.ft_home
+                if gf > ga:
+                    st["points"] += 3
+                elif gf == ga:
+                    st["points"] += 1
+        if stats:
+            total_games = sum(v["games"] for v in stats.values())
+            avg_ppg = (sum(v["points"] for v in stats.values()) / total_games) if total_games else 1.0
+            avg_gpg = (sum(v["gf"] for v in stats.values()) / total_games) if total_games else 1.0
+            if avg_ppg <= 0:
+                avg_ppg = 1.0
+            # blend into means for home/away clubs
+            def _blend(club_id, att_key, def_key):
+                st = stats.get(club_id)
+                if not st or st["games"] < standings_min_games:
+                    return
+                ppg = st["points"] / st["games"] if st["games"] else 0.0
+                ppg_ratio = ppg / avg_ppg
+                ppg_ratio = max(0.65, min(1.45, ppg_ratio))
+                w = standings_blend * min(1.0, st["games"] / 19.0)
+                base_att = means.get(att_key, 1.0)
+                base_def = means.get(def_key, 1.0)
+                means[att_key] = (1.0 - w) * base_att + w * (ppg_ratio ** 0.35)
+                means[def_key] = (1.0 - w) * base_def + w * (ppg_ratio ** -0.35)
+            _blend(home_team_id, "attack_home", "defence_home")
+            _blend(away_team_id, "attack_away", "defence_away")
+
     if ratio_mode == "joint" and priors:
         ratios = _joint_fixture_ratios(
             priors,
@@ -608,8 +677,93 @@ def estimate_score(
             "attack_away": attack_away_detail,
             "defence_home": defence_home_detail,
         }
-    lambda_home = league_home * attack_home * defence_away
-    lambda_away = league_away * attack_away * defence_home
+    # Venue-specific shrinkage (optional, default None => bit-for-bit identical).
+    if venue_k is not None and venue_k > 0:
+        home_venue_items_att = [
+            (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
+            for index, match in enumerate(priors)
+            if match.home_id == home_team_id
+        ]
+        home_venue_items_def = [
+            (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
+            for index, match in enumerate(priors)
+            if match.home_id == home_team_id
+        ]
+        away_venue_items_att = [
+            (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
+            for index, match in enumerate(priors)
+            if match.away_id == away_team_id
+        ]
+        away_venue_items_def = [
+            (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
+            for index, match in enumerate(priors)
+            if match.away_id == away_team_id
+        ]
+        w_home = sum(w for _, w in home_venue_items_att) if home_venue_items_att else 0.0
+        w_away = sum(w for _, w in away_venue_items_att) if away_venue_items_att else 0.0
+
+        # empirical venue ratios
+        def _venue_empirical(items, baseline):
+            res = _weighted_per_game(items)
+            if res is None or baseline == 0:
+                return 1.0
+            per_game, _ = res
+            return per_game / baseline
+
+        r_home_att_venue = _venue_empirical(home_venue_items_att, league_home)
+        r_home_def_venue = _venue_empirical(home_venue_items_def, league_away)
+        r_away_att_venue = _venue_empirical(away_venue_items_att, league_away)
+        r_away_def_venue = _venue_empirical(away_venue_items_def, league_home)
+
+        if w_home == 0:
+            home_att_venue = attack_home
+            home_def_venue = defence_home
+        else:
+            home_att_venue = (w_home * r_home_att_venue + venue_k * attack_home) / (w_home + venue_k)
+            home_def_venue = (w_home * r_home_def_venue + venue_k * defence_home) / (w_home + venue_k)
+        if w_away == 0:
+            away_att_venue = attack_away
+            away_def_venue = defence_away
+        else:
+            away_att_venue = (w_away * r_away_att_venue + venue_k * attack_away) / (w_away + venue_k)
+            away_def_venue = (w_away * r_away_def_venue + venue_k * defence_away) / (w_away + venue_k)
+
+        lambda_home = league_home * home_att_venue * away_def_venue
+        lambda_away = league_away * away_att_venue * home_def_venue
+    else:
+        lambda_home = league_home * attack_home * defence_away
+        lambda_away = league_away * attack_away * defence_home
+
+    # Fixture congestion / rest-days adjustment (optional).
+    if short_rest_days is not None and target_kickoff is not None:
+        target_dt = _parse_kickoff(target_kickoff)
+        if target_dt is not None:
+            # Determine last kickoff per team.
+            last_map: dict[int, str] = {}
+            if last_kickoff_by_team:
+                last_map = {int(k): v for k, v in last_kickoff_by_team.items()}
+            else:
+                for m in priors:
+                    if m.kickoff >= target_kickoff:
+                        continue
+                    for tid in (m.home_id, m.away_id):
+                        if tid not in last_map or m.kickoff > last_map[tid]:
+                            last_map[tid] = m.kickoff
+            for team_id, is_home in ((home_team_id, True), (away_team_id, False)):
+                last_kc = last_map.get(team_id)
+                if not last_kc or last_kc >= target_kickoff:
+                    continue
+                last_dt = _parse_kickoff(last_kc)
+                if last_dt is None:
+                    continue
+                rest_days = (target_dt - last_dt).total_seconds() / 86400.0
+                if rest_days <= short_rest_days:
+                    if is_home:
+                        lambda_home = lambda_home * rest_attack_factor
+                        lambda_away = lambda_away * rest_defence_factor
+                    else:
+                        lambda_away = lambda_away * rest_attack_factor
+                        lambda_home = lambda_home * rest_defence_factor
 
     share_home = 0.45
     share_away = 0.45
@@ -672,6 +826,7 @@ def estimate_score(
         goal_cap_slope=slope_val,
         promoted_attack_prior=promo_atk,
         promoted_defence_prior=promo_def,
+        venue_k=venue_k,
     )
 
 

@@ -161,6 +161,12 @@ def run_score_model(
     nb_alpha: float = 0.0,
     promoted_attack_prior: float | None = None,
     promoted_defence_prior: float | None = None,
+    venue_k: float | None = None,
+    short_rest_days: int | None = None,
+    rest_attack_factor: float = 0.94,
+    rest_defence_factor: float = 1.05,
+    standings_blend: float = 0.0,
+    standings_min_games: int = 6,
 ) -> dict[str, int]:
     """Walk-forward using the Telegram bot scorer. No Gemini."""
 
@@ -254,6 +260,14 @@ def run_score_model(
             nb_alpha=nb_alpha,
             promoted_attack_prior=promoted_attack_prior,
             promoted_defence_prior=promoted_defence_prior,
+            venue_k=venue_k,
+            short_rest_days=short_rest_days,
+            rest_attack_factor=rest_attack_factor,
+            rest_defence_factor=rest_defence_factor,
+            target_kickoff=target.kickoff,
+            last_kickoff_by_team=_last_kickoff_by_team(history, target.kickoff) if short_rest_days is not None else None,
+            standings_blend=standings_blend,
+            standings_min_games=standings_min_games,
         )
         if outcome.excluded or outcome.body is None:
             record_run(
@@ -879,3 +893,18 @@ def json_dumps(value: dict[str, Any]) -> str:
     import json
 
     return json.dumps(value, sort_keys=True)
+
+
+def _last_kickoff_by_team(history, target_kickoff):
+    from laboratory.score_model_adapter import team_int_id
+    last = {}
+    for m in history:
+        if m.kickoff >= target_kickoff:
+            continue
+        if m.ft_home is None or m.ft_away is None:
+            continue
+        for tid in (m.home_id, m.away_id):
+            key = team_int_id(str(tid))
+            if key not in last or m.kickoff > last[key]:
+                last[key] = m.kickoff
+    return last

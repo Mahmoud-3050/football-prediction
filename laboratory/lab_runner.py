@@ -26,6 +26,7 @@ from laboratory.store import (
     save_snapshot,
 )
 from score_model import club_venue_ratios, prior_means_for_fixture
+from laboratory.score_model_adapter import team_int_id
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +243,14 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
     promoted_attack_prior = None if promo_atk_raw is None else float(promo_atk_raw)
     promo_def_raw = input_data.config.get("promoted_defence_prior")
     promoted_defence_prior = None if promo_def_raw is None else float(promo_def_raw)
+    vk_raw = input_data.config.get("venue_k")
+    venue_k = None if vk_raw is None else float(vk_raw)
+    srd_raw = input_data.config.get("short_rest_days")
+    short_rest_days = None if srd_raw is None else int(srd_raw)
+    rest_attack_factor = float(input_data.config.get("rest_attack_factor", 0.94))
+    rest_defence_factor = float(input_data.config.get("rest_defence_factor", 1.05))
+    standings_blend = float(input_data.config.get("standings_blend", 0.0))
+    standings_min_games = int(input_data.config.get("standings_min_games", 6))
 
     cache, all_history = _build_snapshot_cache(
         live_db,
@@ -304,6 +313,14 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                 nb_alpha=nb_alpha,
                 promoted_attack_prior=promoted_attack_prior,
                 promoted_defence_prior=promoted_defence_prior,
+                venue_k=venue_k,
+                short_rest_days=short_rest_days,
+                rest_attack_factor=rest_attack_factor,
+                rest_defence_factor=rest_defence_factor,
+                target_kickoff=target.kickoff,
+                last_kickoff_by_team=_last_kickoff_by_team(all_history, target.kickoff) if short_rest_days is not None else None,
+                standings_blend=standings_blend,
+                standings_min_games=standings_min_games,
             )
 
             if outcome.excluded or outcome.body is None:
@@ -735,3 +752,18 @@ def _merge_configs(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str,
     for key, value in overrides.items():
         result[key] = value
     return result
+
+
+def _last_kickoff_by_team(history, target_kickoff):
+    from laboratory.score_model_adapter import team_int_id
+    last = {}
+    for m in history:
+        if m.kickoff >= target_kickoff:
+            continue
+        if m.ft_home is None or m.ft_away is None:
+            continue
+        for tid in (m.home_id, m.away_id):
+            key = team_int_id(str(tid))
+            if key not in last or m.kickoff > last[key]:
+                last[key] = m.kickoff
+    return last

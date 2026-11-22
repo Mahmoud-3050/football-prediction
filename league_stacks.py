@@ -31,6 +31,12 @@ DEFAULT_LIVE_STACK: dict[str, Any] = {
     "nb_alpha": 0.0,
     "promoted_attack_prior": None,
     "promoted_defence_prior": None,
+    "venue_k": None,
+    "short_rest_days": None,
+    "rest_attack_factor": 0.94,
+    "rest_defence_factor": 1.05,
+    "standings_blend": 0.0,
+    "standings_min_games": 6,
     "code_version": "score_model_v1",
 }
 
@@ -53,6 +59,12 @@ _STACK_KEYS = (
     "nb_alpha",
     "promoted_attack_prior",
     "promoted_defence_prior",
+    "venue_k",
+    "short_rest_days",
+    "rest_attack_factor",
+    "rest_defence_factor",
+    "standings_blend",
+    "standings_min_games",
     "code_version",
     "selected_experiment_id",
 )
@@ -160,6 +172,12 @@ def draw_calibration_kwargs(stack: Mapping[str, Any]) -> dict[str, Any]:
         "promoted_defence_prior": _optional_positive_float(
             stack.get("promoted_defence_prior")
         ),
+        "venue_k": _optional_positive_float(stack.get("venue_k")),
+        "short_rest_days": (None if stack.get("short_rest_days") is None else int(stack.get("short_rest_days"))),
+        "rest_attack_factor": float(stack.get("rest_attack_factor") or 0.94),
+        "rest_defence_factor": float(stack.get("rest_defence_factor") or 1.05),
+        "standings_blend": float(stack.get("standings_blend") or 0.0),
+        "standings_min_games": int(stack.get("standings_min_games") or 6),
     }
 
 
@@ -217,7 +235,7 @@ def _merge_stack(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[st
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number
-        elif key in {"promoted_attack_prior", "promoted_defence_prior"}:
+        elif key in {"promoted_attack_prior", "promoted_defence_prior", "venue_k"}:
             if value is None or value == "":
                 merged[key] = None
                 continue

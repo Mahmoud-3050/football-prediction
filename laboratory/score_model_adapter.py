@@ -51,6 +51,14 @@ def price_from_snapshot(
     nb_alpha: float = 0.0,
     promoted_attack_prior: float | None = None,
     promoted_defence_prior: float | None = None,
+    venue_k: float | None = None,
+    short_rest_days: int | None = None,
+    rest_attack_factor: float = 0.94,
+    rest_defence_factor: float = 1.05,
+    target_kickoff: str | None = None,
+    last_kickoff_by_team: dict | None = None,
+    standings_blend: float = 0.0,
+    standings_min_games: int = 6,
 ) -> ScoreModelOutcome:
     """Price one pre-kickoff snapshot with the bot scorer."""
 
@@ -120,6 +128,14 @@ def price_from_snapshot(
         nb_alpha=nb_alpha,
         promoted_attack_prior=promoted_attack_prior,
         promoted_defence_prior=promoted_defence_prior,
+        venue_k=venue_k,
+        short_rest_days=short_rest_days,
+        rest_attack_factor=rest_attack_factor,
+        rest_defence_factor=rest_defence_factor,
+        target_kickoff=target_kickoff if target_kickoff is not None else str(payload.get('kickoff')),
+        last_kickoff_by_team=last_kickoff_by_team,
+        standings_blend=standings_blend,
+        standings_min_games=standings_min_games,
     )
     return ScoreModelOutcome(
         excluded=False,
