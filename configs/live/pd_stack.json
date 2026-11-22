@@ -1,0 +1,22 @@
+{
+  "code_version": "score_model_v1",
+  "decay_half_life_days": 150.0,
+  "dependence": "independent",
+  "draw_boost": 1.0,
+  "draw_pick_margin": null,
+  "draw_pick_threshold": null,
+  "draw_tightness_ref": 1.0,
+  "draw_tightness_scale": null,
+  "draw_weights": null,
+  "goal_cap": 4.0,
+  "goal_cap_slope": 0.5,
+  "half_time_share_mode": "club_shrunk",
+  "k": 12.0,
+  "model_id": "bot-score-model-pd-v2",
+  "nb_alpha": 0.0,
+  "prior_mean": "last_season",
+  "promoted_attack_prior": 0.8,
+  "promoted_defence_prior": 1.25,
+  "ratio_mode": "one_pass",
+  "selected_experiment_id": "EXP-EURO-DOMESTIC-01-PD"
+}

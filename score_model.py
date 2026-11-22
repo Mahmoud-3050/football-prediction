@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Sequence
 
 from models import Markets
 
@@ -65,6 +65,18 @@ class ScoreEstimate:
     ratio_mode: str = "one_pass"
     rho: float | None = None
     half_time_share_mode: str = "club_shrunk"
+    draw_boost: float = 1.0
+    draw_weights: tuple[float, ...] | None = None
+    draw_pick_threshold: float | None = None
+    draw_pick_margin: float | None = None
+    draw_tightness_scale: float | None = None
+    draw_tightness_ref: float = 1.0
+    effective_draw_boost: float = 1.0
+    goal_cap: float | None = None
+    goal_cap_slope: float = 0.5
+    nb_alpha: float = 0.0
+    promoted_attack_prior: float | None = None
+    promoted_defence_prior: float | None = None
 
     def probability(self, home_goals: int, away_goals: int) -> float:
         if home_goals >= len(self.matrix) or away_goals >= len(self.matrix[0]):
@@ -165,7 +177,76 @@ class ScoreEstimate:
                     if self.half_time_share_mode == "league_only"
                     else "Half-time rates use club shares shrunk toward the league share."
                 ),
+                *(
+                    [f"Draw scorelines are boosted by ×{self.draw_boost:g} before markets."]
+                    if abs(self.draw_boost - 1.0) > 1e-9
+                    else []
+                ),
+                *(
+                    [
+                        "Draw boost uses scoreline weights "
+                        f"{list(self.draw_weights)} on the diagonal."
+                    ]
+                    if self.draw_weights
+                    else []
+                ),
+                *(
+                    [
+                        "Draw boost decays with match tightness "
+                        f"(scale={self.draw_tightness_scale:g}, "
+                        f"ref={self.draw_tightness_ref:g}; "
+                        f"effective×{self.effective_draw_boost:g})."
+                    ]
+                    if self.draw_tightness_scale is not None
+                    and abs(self.effective_draw_boost - self.draw_boost) > 1e-9
+                    else []
+                ),
+                *(
+                    [
+                        "1X2 draw picks use threshold/margin "
+                        f"(thr={self.draw_pick_threshold}, "
+                        f"margin={self.draw_pick_margin})."
+                    ]
+                    if self.draw_pick_threshold is not None
+                    or self.draw_pick_margin is not None
+                    else []
+                ),
+                *(
+                    [
+                        f"Prior-match goals use soft cap={self.goal_cap:g} "
+                        f"(slope={self.goal_cap_slope:g})."
+                    ]
+                    if self.goal_cap is not None
+                    else []
+                ),
+                *(
+                    [
+                        f"Score marginals use Negative Binomial overdispersion "
+                        f"nb_alpha={self.nb_alpha:g}."
+                    ]
+                    if self.nb_alpha > 0
+                    else []
+                ),
+                *(
+                    [
+                        "Promoted-team prior fallback uses "
+                        f"attack={self.promoted_attack_prior}, "
+                        f"defence={self.promoted_defence_prior}."
+                    ]
+                    if self.promoted_attack_prior is not None
+                    or self.promoted_defence_prior is not None
+                    else []
+                ),
             ],
+            "draw_boost": round(self.draw_boost, 4),
+            "effective_draw_boost": round(self.effective_draw_boost, 4),
+            "draw_weights": (
+                None if self.draw_weights is None else [round(w, 4) for w in self.draw_weights]
+            ),
+            "draw_pick_threshold": self.draw_pick_threshold,
+            "draw_pick_margin": self.draw_pick_margin,
+            "draw_tightness_scale": self.draw_tightness_scale,
+            "draw_tightness_ref": self.draw_tightness_ref,
         }
 
 
@@ -190,6 +271,17 @@ def estimate_from_lambdas(
     dependence: str = "independent",
     rho: float | None = None,
     half_time_share_mode: str = "club_shrunk",
+    draw_boost: float = 1.0,
+    draw_weights: Sequence[float] | None = None,
+    draw_pick_threshold: float | None = None,
+    draw_pick_margin: float | None = None,
+    draw_tightness_scale: float | None = None,
+    draw_tightness_ref: float = 1.0,
+    nb_alpha: float = 0.0,
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
+    promoted_attack_prior: float | None = None,
+    promoted_defence_prior: float | None = None,
 ) -> ScoreEstimate:
     """Price a full-time grid, and a half-time grid when that market is eligible."""
 
@@ -205,16 +297,40 @@ def estimate_from_lambdas(
             "half_time_share_mode must be 'club_shrunk', 'league_only', "
             "'fixed_0_45', or 'fixed_0_50'."
         )
-    matrix, max_goals = _matrix(lambda_home, lambda_away, tail_tolerance)
+    if draw_boost <= 0 or not math.isfinite(draw_boost):
+        raise ValueError("draw_boost must be a finite positive number.")
+    nb_alpha_val = _validate_nb_alpha(nb_alpha)
+    normalized_weights = _normalize_draw_weights(draw_weights)
+    _validate_draw_pick_params(draw_pick_threshold, draw_pick_margin)
+    tightness_ref = _validate_tightness_params(draw_tightness_scale, draw_tightness_ref)
+    matrix, max_goals = _matrix(lambda_home, lambda_away, tail_tolerance, nb_alpha=nb_alpha_val)
     used_rho = None
     used_dependence = "independent"
     if dependence == "dixon_coles" and rho is not None:
         matrix = _apply_dixon_coles(matrix, lambda_home, lambda_away, rho)
         used_rho = float(rho)
         used_dependence = "dixon_coles"
+    tightness = _tightness_factor(
+        lambda_home,
+        lambda_away,
+        tightness_scale=draw_tightness_scale,
+        tightness_ref=tightness_ref,
+    )
+    # Report scalar boost after tightness; per-cell weights still apply inside.
+    effective_boost = 1.0 + (float(draw_boost) - 1.0) * tightness
+    matrix = _boost_draw_scorelines(
+        matrix,
+        float(draw_boost),
+        draw_weights=normalized_weights,
+        tightness_factor=tightness,
+    )
     home_goals, away_goals, score_probability = _mode(matrix)
     probabilities = _market_probabilities(matrix)
-    markets = _markets(probabilities)
+    markets = _markets(
+        probabilities,
+        draw_pick_threshold=draw_pick_threshold,
+        draw_pick_margin=draw_pick_margin,
+    )
     half_score: str | None = None
     half_label: str | None = None
     half_probabilities: dict[str, float] | None = None
@@ -225,6 +341,7 @@ def estimate_from_lambdas(
             lambda_home * half_time_share_home,
             lambda_away * half_time_share_away,
             tail_tolerance,
+            nb_alpha=nb_alpha_val,
         )
         half_home, half_away, _half_probability = _mode(half_matrix)
         half_score = f"{half_home}-{half_away}"
@@ -263,6 +380,20 @@ def estimate_from_lambdas(
         ratio_mode=ratio_mode,
         rho=used_rho,
         half_time_share_mode=half_time_share_mode,
+        draw_boost=float(draw_boost),
+        draw_weights=normalized_weights,
+        draw_pick_threshold=draw_pick_threshold,
+        draw_pick_margin=draw_pick_margin,
+        draw_tightness_scale=(
+            None if draw_tightness_scale is None else float(draw_tightness_scale)
+        ),
+        draw_tightness_ref=float(tightness_ref),
+        effective_draw_boost=float(effective_boost),
+        goal_cap=goal_cap,
+        goal_cap_slope=float(goal_cap_slope),
+        nb_alpha=nb_alpha_val,
+        promoted_attack_prior=promoted_attack_prior,
+        promoted_defence_prior=promoted_defence_prior,
     )
 
 
@@ -283,6 +414,17 @@ def estimate_score(
     ratio_mode: str = "one_pass",
     dependence: str = "independent",
     half_time_share_mode: str = "club_shrunk",
+    draw_boost: float = 1.0,
+    draw_weights: Sequence[float] | None = None,
+    draw_pick_threshold: float | None = None,
+    draw_pick_margin: float | None = None,
+    draw_tightness_scale: float | None = None,
+    draw_tightness_ref: float = 1.0,
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
+    nb_alpha: float = 0.0,
+    promoted_attack_prior: float | None = None,
+    promoted_defence_prior: float | None = None,
 ) -> ScoreEstimate:
     """Expected goals from shrunk multiplicative rates, then modal scores and markets."""
 
@@ -308,6 +450,16 @@ def estimate_score(
             "half_time_share_mode must be 'club_shrunk', 'league_only', "
             "'fixed_0_45', or 'fixed_0_50'."
         )
+    if draw_boost <= 0 or not math.isfinite(draw_boost):
+        raise ValueError("draw_boost must be a finite positive number.")
+    cap_val, slope_val = _validate_goal_cap(goal_cap, goal_cap_slope)
+    nb_alpha_val = _validate_nb_alpha(nb_alpha)
+    promo_atk, promo_def = _validate_promoted_priors(
+        promoted_attack_prior, promoted_defence_prior
+    )
+    normalized_weights = _normalize_draw_weights(draw_weights)
+    _validate_draw_pick_params(draw_pick_threshold, draw_pick_margin)
+    tightness_ref = _validate_tightness_params(draw_tightness_scale, draw_tightness_ref)
 
     all_priors, prior_notes = _prior_matches(
         competition_finished_payload,
@@ -351,12 +503,16 @@ def estimate_score(
                         for match in previous
                     ],
                     k=k,
+                    goal_cap=cap_val,
+                    goal_cap_slope=slope_val,
                 )
                 means = _normalized_prior_means(
                     prior_means_for_fixture(
                         club_ratios,
                         home_id=str(home_team_id),
                         away_id=str(away_team_id),
+                        promoted_attack_prior=promo_atk,
+                        promoted_defence_prior=promo_def,
                     )
                 )
     weights = _prior_weights(priors, kickoff=kickoff, half_life_days=decay_half_life_days)
@@ -368,10 +524,16 @@ def estimate_score(
         league_away = 1.0
     else:
         league_home = _weighted_mean(
-            [(match.ft_home, weights[index]) for index, match in enumerate(priors)]
+            [
+                (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
+                for index, match in enumerate(priors)
+            ]
         )
         league_away = _weighted_mean(
-            [(match.ft_away, weights[index]) for index, match in enumerate(priors)]
+            [
+                (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
+                for index, match in enumerate(priors)
+            ]
         )
 
     if ratio_mode == "joint" and priors:
@@ -384,6 +546,8 @@ def estimate_score(
             away_team_id=away_team_id,
             k=k,
             prior_means=means,
+            goal_cap=cap_val,
+            goal_cap_slope=slope_val,
         )
         attack_home = ratios["attack_home"].shrunk
         defence_away = ratios["defence_away"].shrunk
@@ -393,7 +557,7 @@ def estimate_score(
         attack_home, attack_home_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (match.ft_home, weights[index])
+                    (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.home_id == home_team_id
                 ]
@@ -405,7 +569,7 @@ def estimate_score(
         defence_away, defence_away_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (match.ft_home, weights[index])
+                    (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.away_id == away_team_id
                 ]
@@ -417,7 +581,7 @@ def estimate_score(
         attack_away, attack_away_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (match.ft_away, weights[index])
+                    (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.away_id == away_team_id
                 ]
@@ -429,7 +593,7 @@ def estimate_score(
         defence_home, defence_home_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (match.ft_away, weights[index])
+                    (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.home_id == home_team_id
                 ]
@@ -495,6 +659,19 @@ def estimate_score(
         dependence=used_dependence,
         rho=rho,
         half_time_share_mode=half_time_share_mode,
+        draw_boost=draw_boost,
+        draw_weights=normalized_weights,
+        draw_pick_threshold=draw_pick_threshold,
+        draw_pick_margin=draw_pick_margin,
+        draw_tightness_scale=(
+            None if draw_tightness_scale is None else float(draw_tightness_scale)
+        ),
+        draw_tightness_ref=float(tightness_ref),
+        nb_alpha=nb_alpha_val,
+        goal_cap=cap_val,
+        goal_cap_slope=slope_val,
+        promoted_attack_prior=promo_atk,
+        promoted_defence_prior=promo_def,
     )
 
 
@@ -681,6 +858,8 @@ def _joint_fixture_ratios(
     away_team_id: int,
     k: float,
     prior_means: dict[str, float],
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
 ) -> dict[str, RatioDetail]:
     """Iteratively solve venue attack/defence, then shrink the fixture's four ratios."""
 
@@ -689,6 +868,8 @@ def _joint_fixture_ratios(
         weights,
         league_home=league_home,
         league_away=league_away,
+        goal_cap=goal_cap,
+        goal_cap_slope=goal_cap_slope,
     )
     mapping = {
         "attack_home": (home_team_id, "attack_home"),
@@ -715,6 +896,8 @@ def _joint_venue_strengths(
     league_home: float,
     league_away: float,
     iterations: int = JOINT_RATIO_ITERATIONS,
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
 ) -> tuple[dict[int, dict[str, float]], dict[int, dict[str, float]]]:
     """Return per-club venue strengths and effective sample sizes."""
 
@@ -745,7 +928,7 @@ def _joint_venue_strengths(
         attack_home = _update_strength(
             clubs,
             numerator=lambda club: sum(
-                weight * match.ft_home
+                weight * _soft_cap_goals(match.ft_home, goal_cap, goal_cap_slope)
                 for match, weight in zip(priors, weights)
                 if match.home_id == club
             ),
@@ -758,7 +941,7 @@ def _joint_venue_strengths(
         defence_away = _update_strength(
             clubs,
             numerator=lambda club: sum(
-                weight * match.ft_home
+                weight * _soft_cap_goals(match.ft_home, goal_cap, goal_cap_slope)
                 for match, weight in zip(priors, weights)
                 if match.away_id == club
             ),
@@ -771,7 +954,7 @@ def _joint_venue_strengths(
         attack_away = _update_strength(
             clubs,
             numerator=lambda club: sum(
-                weight * match.ft_away
+                weight * _soft_cap_goals(match.ft_away, goal_cap, goal_cap_slope)
                 for match, weight in zip(priors, weights)
                 if match.away_id == club
             ),
@@ -784,7 +967,7 @@ def _joint_venue_strengths(
         defence_home = _update_strength(
             clubs,
             numerator=lambda club: sum(
-                weight * match.ft_away
+                weight * _soft_cap_goals(match.ft_away, goal_cap, goal_cap_slope)
                 for match, weight in zip(priors, weights)
                 if match.home_id == club
             ),
@@ -865,9 +1048,12 @@ def club_venue_ratios(
     matches: list[dict[str, Any]],
     *,
     k: float = K,
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
 ) -> dict[str, dict[str, float]]:
     """Shrunk venue attack/defence ratios by club id from one finished-season sample."""
 
+    cap_val, slope_val = _validate_goal_cap(goal_cap, goal_cap_slope)
     finished = [
         match
         for match in matches
@@ -875,8 +1061,12 @@ def club_venue_ratios(
     ]
     if not finished:
         return {}
-    league_home = sum(int(match["ft_home"]) for match in finished) / len(finished)
-    league_away = sum(int(match["ft_away"]) for match in finished) / len(finished)
+    league_home = sum(
+        _soft_cap_goals(int(match["ft_home"]), cap_val, slope_val) for match in finished
+    ) / len(finished)
+    league_away = sum(
+        _soft_cap_goals(int(match["ft_away"]), cap_val, slope_val) for match in finished
+    ) / len(finished)
     clubs = {
         str(match["home_id"]) for match in finished
     } | {str(match["away_id"]) for match in finished}
@@ -885,7 +1075,7 @@ def club_venue_ratios(
         attack_home, _ = _ratio(
             goals=_weighted_per_game(
                 [
-                    (int(match["ft_home"]), 1.0)
+                    (_soft_cap_goals(int(match["ft_home"]), cap_val, slope_val), 1.0)
                     for match in finished
                     if str(match["home_id"]) == club_id
                 ]
@@ -896,7 +1086,7 @@ def club_venue_ratios(
         defence_home, _ = _ratio(
             goals=_weighted_per_game(
                 [
-                    (int(match["ft_away"]), 1.0)
+                    (_soft_cap_goals(int(match["ft_away"]), cap_val, slope_val), 1.0)
                     for match in finished
                     if str(match["home_id"]) == club_id
                 ]
@@ -907,7 +1097,7 @@ def club_venue_ratios(
         attack_away, _ = _ratio(
             goals=_weighted_per_game(
                 [
-                    (int(match["ft_away"]), 1.0)
+                    (_soft_cap_goals(int(match["ft_away"]), cap_val, slope_val), 1.0)
                     for match in finished
                     if str(match["away_id"]) == club_id
                 ]
@@ -918,7 +1108,7 @@ def club_venue_ratios(
         defence_away, _ = _ratio(
             goals=_weighted_per_game(
                 [
-                    (int(match["ft_home"]), 1.0)
+                    (_soft_cap_goals(int(match["ft_home"]), cap_val, slope_val), 1.0)
                     for match in finished
                     if str(match["away_id"]) == club_id
                 ]
@@ -940,20 +1130,31 @@ def prior_means_for_fixture(
     *,
     home_id: str,
     away_id: str,
+    promoted_attack_prior: float | None = None,
+    promoted_defence_prior: float | None = None,
 ) -> dict[str, float]:
-    """Map last-season club ratios onto the four fixture prior means."""
+    """Map last-season club ratios onto the four fixture prior means.
 
+    When a club has no previous-season ratio (e.g. newly promoted), falls back to
+    ``promoted_attack_prior`` / ``promoted_defence_prior`` if configured, else 1.0.
+    """
+
+    promo_atk, promo_def = _validate_promoted_priors(
+        promoted_attack_prior, promoted_defence_prior
+    )
+    atk_default = 1.0 if promo_atk is None else promo_atk
+    def_default = 1.0 if promo_def is None else promo_def
     home = club_ratios.get(str(home_id)) or {}
     away = club_ratios.get(str(away_id)) or {}
     return {
-        "attack_home": float(home.get("attack_home", 1.0)),
-        "defence_home": float(home.get("defence_home", 1.0)),
-        "attack_away": float(away.get("attack_away", 1.0)),
-        "defence_away": float(away.get("defence_away", 1.0)),
+        "attack_home": float(home.get("attack_home", atk_default)),
+        "defence_home": float(home.get("defence_home", def_default)),
+        "attack_away": float(away.get("attack_away", atk_default)),
+        "defence_away": float(away.get("defence_away", def_default)),
     }
 
 
-def _weighted_per_game(items: list[tuple[int, float]]) -> tuple[float, float] | None:
+def _weighted_per_game(items: list[tuple[int | float, float]]) -> tuple[float, float] | None:
     if not items:
         return None
     n_eff = sum(weight for _, weight in items)
@@ -962,7 +1163,7 @@ def _weighted_per_game(items: list[tuple[int, float]]) -> tuple[float, float] | 
     return sum(goals * weight for goals, weight in items) / n_eff, n_eff
 
 
-def _weighted_mean(items: list[tuple[int, float]]) -> float:
+def _weighted_mean(items: list[tuple[int | float, float]]) -> float:
     n_eff = sum(weight for _, weight in items)
     if n_eff <= 0:
         return 0.0
@@ -1233,11 +1434,12 @@ def inspect_grid(
     lambda_away: float,
     *,
     tail_tolerance: float = TAIL_TOLERANCE,
+    nb_alpha: float = 0.0,
 ) -> dict[str, float | int | bool]:
     """Arithmetic check for D7: raw omitted mass and renormalized sums."""
 
     matrix, max_goals, raw_tail, hit_cap = _matrix_with_tail(
-        lambda_home, lambda_away, tail_tolerance
+        lambda_home, lambda_away, tail_tolerance, nb_alpha=nb_alpha
     )
     renormalized_sum = sum(sum(row) for row in matrix)
     markets = _market_probabilities(matrix)
@@ -1258,9 +1460,11 @@ def _matrix(
     lambda_home: float,
     lambda_away: float,
     tail_tolerance: float,
+    *,
+    nb_alpha: float = 0.0,
 ) -> tuple[tuple[tuple[float, ...], ...], int]:
     matrix, max_goals, _raw_tail, _hit_cap = _matrix_with_tail(
-        lambda_home, lambda_away, tail_tolerance
+        lambda_home, lambda_away, tail_tolerance, nb_alpha=nb_alpha
     )
     return matrix, max_goals
 
@@ -1269,25 +1473,46 @@ def _matrix_with_tail(
     lambda_home: float,
     lambda_away: float,
     tail_tolerance: float,
+    *,
+    nb_alpha: float = 0.0,
 ) -> tuple[tuple[tuple[float, ...], ...], int, float, bool]:
     lambda_home = max(lambda_home, 0.0)
     lambda_away = max(lambda_away, 0.0)
+    alpha = _validate_nb_alpha(nb_alpha)
     max_goals = 0
     raw_tail = 1.0
-    while True:
-        home_mass = sum(_poisson(goals, lambda_home) for goals in range(max_goals + 1))
-        away_mass = sum(_poisson(goals, lambda_away) for goals in range(max_goals + 1))
-        raw_tail = 1.0 - (home_mass * away_mass)
-        if raw_tail <= tail_tolerance or max_goals >= MAX_GRID_GOALS:
-            break
-        max_goals += 1
+    if alpha == 0.0:
+        while True:
+            home_mass = sum(_poisson(goals, lambda_home) for goals in range(max_goals + 1))
+            away_mass = sum(_poisson(goals, lambda_away) for goals in range(max_goals + 1))
+            raw_tail = 1.0 - (home_mass * away_mass)
+            if raw_tail <= tail_tolerance or max_goals >= MAX_GRID_GOALS:
+                break
+            max_goals += 1
+        home_pmf = [_poisson(goals, lambda_home) for goals in range(max_goals + 1)]
+        away_pmf = [_poisson(goals, lambda_away) for goals in range(max_goals + 1)]
+    else:
+        home_full = _nb_pmf(MAX_GRID_GOALS, lambda_home, alpha)
+        away_full = _nb_pmf(MAX_GRID_GOALS, lambda_away, alpha)
+        home_mass = 0.0
+        away_mass = 0.0
+        while True:
+            home_mass += home_full[max_goals]
+            away_mass += away_full[max_goals]
+            raw_tail = 1.0 - (home_mass * away_mass)
+            if raw_tail <= tail_tolerance or max_goals >= MAX_GRID_GOALS:
+                break
+            max_goals += 1
+        home_pmf = home_full[: max_goals + 1]
+        away_pmf = away_full[: max_goals + 1]
     hit_cap = max_goals >= MAX_GRID_GOALS and raw_tail > tail_tolerance
     raw: list[list[float]] = []
     total = 0.0
     for home_goals in range(max_goals + 1):
         row: list[float] = []
+        p_h = home_pmf[home_goals]
         for away_goals in range(max_goals + 1):
-            probability = _poisson(home_goals, lambda_home) * _poisson(away_goals, lambda_away)
+            probability = p_h * away_pmf[away_goals]
             row.append(probability)
             total += probability
         raw.append(row)
@@ -1306,6 +1531,61 @@ def _poisson(goals: int, expected: float) -> float:
     for count in range(1, goals + 1):
         probability *= expected / count
     return probability
+
+
+def _nb_pmf(max_goals: int, expected: float, alpha: float) -> list[float]:
+    """Negative Binomial PMF (mean=λ, Var=λ+αλ²) via exact stdlib-math recurrence."""
+
+    if expected <= 0.0:
+        return [1.0 if g == 0 else 0.0 for g in range(max_goals + 1)]
+    p0 = math.exp(-math.log1p(alpha * expected) / alpha)
+    pmf = [p0]
+    denom_base = 1.0 + alpha * expected
+    for g in range(1, max_goals + 1):
+        prev = pmf[-1]
+        pmf.append(prev * (expected * (1.0 + alpha * (g - 1))) / (g * denom_base))
+    return pmf
+
+
+def _soft_cap_goals(goals: float, cap: float | None, slope: float = 0.5) -> float:
+    if cap is None or goals <= cap:
+        return float(goals)
+    return float(cap) + float(slope) * (float(goals) - float(cap))
+
+
+def _validate_goal_cap(
+    goal_cap: float | None,
+    goal_cap_slope: float,
+) -> tuple[float | None, float]:
+    cap_val: float | None = None
+    if goal_cap is not None:
+        cap_val = float(goal_cap)
+        if not math.isfinite(cap_val) or cap_val < 0.0:
+            raise ValueError("goal_cap must be a finite non-negative number when set.")
+    slope_val = float(goal_cap_slope)
+    if not math.isfinite(slope_val) or slope_val < 0.0:
+        raise ValueError("goal_cap_slope must be a finite non-negative number.")
+    return cap_val, slope_val
+
+
+def _validate_nb_alpha(nb_alpha: float) -> float:
+    alpha = float(nb_alpha)
+    if not math.isfinite(alpha) or alpha < 0.0:
+        raise ValueError("nb_alpha must be a finite non-negative number.")
+    return alpha
+
+
+def _validate_promoted_priors(
+    promoted_attack_prior: float | None,
+    promoted_defence_prior: float | None,
+) -> tuple[float | None, float | None]:
+    atk = None if promoted_attack_prior is None else float(promoted_attack_prior)
+    if atk is not None and (not math.isfinite(atk) or atk <= 0.0):
+        raise ValueError("promoted_attack_prior must be a finite positive number when set.")
+    dfn = None if promoted_defence_prior is None else float(promoted_defence_prior)
+    if dfn is not None and (not math.isfinite(dfn) or dfn <= 0.0):
+        raise ValueError("promoted_defence_prior must be a finite positive number when set.")
+    return atk, dfn
 
 
 def _mode(matrix: tuple[tuple[float, ...], ...]) -> tuple[int, int, float]:
@@ -1353,6 +1633,142 @@ def _market_probabilities(matrix: tuple[tuple[float, ...], ...]) -> dict[str, fl
     }
 
 
+def _normalize_draw_weights(
+    draw_weights: Sequence[float] | None,
+) -> tuple[float, ...] | None:
+    if draw_weights is None:
+        return None
+    weights = tuple(float(value) for value in draw_weights)
+    if not weights:
+        return None
+    if any(value <= 0 or not math.isfinite(value) for value in weights):
+        raise ValueError("draw_weights must be finite positive numbers.")
+    return weights
+
+
+def _validate_draw_pick_params(
+    draw_pick_threshold: float | None,
+    draw_pick_margin: float | None,
+) -> None:
+    for name, value in (
+        ("draw_pick_threshold", draw_pick_threshold),
+        ("draw_pick_margin", draw_pick_margin),
+    ):
+        if value is None:
+            continue
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"{name} must be a finite non-negative number.")
+
+
+def _validate_tightness_params(
+    draw_tightness_scale: float | None,
+    draw_tightness_ref: float,
+) -> float:
+    if draw_tightness_scale is not None:
+        scale = float(draw_tightness_scale)
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError("draw_tightness_scale must be a finite non-negative number.")
+    ref = float(draw_tightness_ref)
+    if not math.isfinite(ref) or ref <= 0:
+        raise ValueError("draw_tightness_ref must be a finite positive number.")
+    return ref
+
+
+def _tightness_factor(
+    lambda_home: float,
+    lambda_away: float,
+    *,
+    tightness_scale: float | None,
+    tightness_ref: float,
+) -> float:
+    """1.0 when evenly matched; decays toward 0 as |λh−λa| grows."""
+
+    if tightness_scale is None or float(tightness_scale) <= 0:
+        return 1.0
+    gap = abs(float(lambda_home) - float(lambda_away))
+    return math.exp(-float(tightness_scale) * gap / float(tightness_ref))
+
+
+def select_1x2_outcome(
+    home: float,
+    draw: float,
+    away: float,
+    *,
+    draw_pick_threshold: float | None = None,
+    draw_pick_margin: float | None = None,
+) -> str:
+    """Choose FT 1X2 label, optionally promoting draws without changing probabilities.
+
+    Draw is selected when both configured gates pass:
+    ``P(D) >= draw_pick_threshold`` and ``max(P(H), P(A)) - P(D) <= draw_pick_margin``.
+    Omitted gates are inactive (threshold defaults to 0, margin to +inf).
+    """
+
+    _validate_draw_pick_params(draw_pick_threshold, draw_pick_margin)
+    default = _argmax_1x2(home, draw, away)
+    if draw_pick_threshold is None and draw_pick_margin is None:
+        return default
+    threshold = 0.0 if draw_pick_threshold is None else float(draw_pick_threshold)
+    margin = math.inf if draw_pick_margin is None else float(draw_pick_margin)
+    favorite = max(float(home), float(away))
+    if float(draw) >= threshold and (favorite - float(draw)) <= margin:
+        return "draw"
+    return default
+
+
+def _argmax_1x2(home: float, draw: float, away: float) -> str:
+    if home >= draw and home >= away:
+        return "home"
+    if draw >= away:
+        return "draw"
+    return "away"
+
+
+def _boost_draw_scorelines(
+    matrix: tuple[tuple[float, ...], ...],
+    draw_boost: float,
+    draw_weights: Sequence[float] | None = None,
+    *,
+    tightness_factor: float = 1.0,
+) -> tuple[tuple[float, ...], ...]:
+    """Multiply diagonal (draw) cells and renormalize.
+
+    Per-cell multiplier is ``draw_boost * draw_weights[i]`` when weights are set and
+    ``i < len(weights)``; otherwise ``draw_boost``. Match tightness then blends each
+    multiplier toward 1.0: ``1 + (mult - 1) * tightness_factor``.
+    """
+
+    weights = _normalize_draw_weights(draw_weights)
+    factor = float(tightness_factor)
+    if not math.isfinite(factor) or factor < 0:
+        raise ValueError("tightness_factor must be a finite non-negative number.")
+    if weights is None and abs(draw_boost - 1.0) <= 1e-12 and abs(factor - 1.0) <= 1e-12:
+        return matrix
+    raw = [list(row) for row in matrix]
+    size = len(raw)
+    changed = False
+    for index in range(size):
+        if index >= len(raw[index]):
+            continue
+        if weights is None:
+            base = float(draw_boost)
+        elif index < len(weights):
+            base = float(draw_boost) * float(weights[index])
+        else:
+            base = float(draw_boost)
+        multiplier = 1.0 + (base - 1.0) * factor
+        if abs(multiplier - 1.0) > 1e-12:
+            changed = True
+        raw[index][index] *= multiplier
+    if not changed:
+        return matrix
+    total = sum(sum(row) for row in raw)
+    if total <= 0:
+        return matrix
+    return tuple(tuple(cell / total for cell in row) for row in raw)
+
+
 def ranked_exact_scores(
     matrix: tuple[tuple[float, ...], ...],
     *,
@@ -1369,14 +1785,26 @@ def ranked_exact_scores(
     return cells[: max(0, limit)]
 
 
-def _markets(probabilities: dict[str, float]) -> Markets:
-    result, result_probability = _pick(
-        (
-            ("Home", probabilities["home"]),
-            ("Draw", probabilities["draw"]),
-            ("Away", probabilities["away"]),
-        )
+def _markets(
+    probabilities: dict[str, float],
+    *,
+    draw_pick_threshold: float | None = None,
+    draw_pick_margin: float | None = None,
+) -> Markets:
+    label = select_1x2_outcome(
+        probabilities["home"],
+        probabilities["draw"],
+        probabilities["away"],
+        draw_pick_threshold=draw_pick_threshold,
+        draw_pick_margin=draw_pick_margin,
     )
+    label_map = {"home": "Home", "draw": "Draw", "away": "Away"}
+    result = label_map[label]
+    result_probability = {
+        "Home": probabilities["home"],
+        "Draw": probabilities["draw"],
+        "Away": probabilities["away"],
+    }[result]
     btts = "Yes" if probabilities["btts_yes"] > 0.5 else "No"
     btts_probability = probabilities["btts_yes"] if btts == "Yes" else 1.0 - probabilities["btts_yes"]
     over_under = "Over" if probabilities["over_25"] > 0.5 else "Under"

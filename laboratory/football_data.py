@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -102,8 +104,100 @@ def fetch_season(
             id_map=NinjasIdMap(path),
         )
 
+    return _fetch_football_data_matches(api_key, code, label, season=season)
+
+
+def filter_matches_by_utc_date_window(
+    body: dict[str, Any],
+    *,
+    date_from: str,
+    date_to: str,
+) -> dict[str, Any]:
+    """Keep matches whose UTC calendar date is inside ``[date_from, date_to]`` inclusive."""
+
+    kept: list[Any] = []
+    for match in body.get("matches") or []:
+        if not isinstance(match, dict):
+            continue
+        utc = match.get("utcDate")
+        if not isinstance(utc, str) or len(utc) < 10:
+            continue
+        day = utc[:10]
+        if date_from <= day <= date_to:
+            kept.append(match)
+    filtered = dict(body)
+    filtered["matches"] = kept
+    return filtered
+
+
+def fetch_matches_window(
+    api_key: str,
+    season: int,
+    *,
+    competition: str = "PL",
+    date_from: str,
+    date_to: str,
+    ninjas_api_key: str | None = None,
+    live_football_api_key: str | None = None,
+    id_map_path: Path | None = None,
+) -> dict[str, Any]:
+    """Fetch a date window of fixtures for sync (recent results + upcoming).
+
+    Football-Data.org supports ``dateFrom``/``dateTo`` server-side.
+    SPL / Ninjas providers fetch the season then filter client-side.
+    """
+
+    code = competition.upper()
+    label = COMPETITION_NAMES.get(code, code)
+    from api_ninjas import is_ninjas_competition
+    from live_football_api import is_live_football_competition
+
+    if is_live_football_competition(code) or is_ninjas_competition(code):
+        body = fetch_season(
+            api_key,
+            season,
+            competition=code,
+            ninjas_api_key=ninjas_api_key,
+            live_football_api_key=live_football_api_key,
+            id_map_path=id_map_path,
+        )
+        return filter_matches_by_utc_date_window(
+            body, date_from=date_from, date_to=date_to
+        )
+
+    # Football-Data treats dateTo as exclusive on /matches; widen by one day.
+    try:
+        exclusive_to = (date.fromisoformat(date_to) + timedelta(days=1)).isoformat()
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid date_to {date_to!r} for {label}.") from exc
+
+    return _fetch_football_data_matches(
+        api_key,
+        code,
+        label,
+        season=season,
+        date_from=date_from,
+        date_to=exclusive_to,
+    )
+
+
+def _fetch_football_data_matches(
+    api_key: str,
+    code: str,
+    label: str,
+    *,
+    season: int,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    params: dict[str, str] = {"season": str(season)}
+    if date_from:
+        params["dateFrom"] = date_from
+    if date_to:
+        params["dateTo"] = date_to
+    query = urllib.parse.urlencode(params)
     request = urllib.request.Request(
-        f"{API_ROOT.format(competition=code)}?season={season}",
+        f"{API_ROOT.format(competition=code)}?{query}",
         headers={"X-Auth-Token": api_key},
     )
     try:
@@ -232,10 +326,10 @@ def import_bodies(
     ensure_experiment(connection, experiment_config or EXPERIMENT_CONFIG)
     upsert_competition(connection, code=code, name=COMPETITION_NAMES.get(code, code))
     removed = remove_datasets_with_prefix(connection, "demo-")
-    # Drop prior provider copies for the same league so hashed Ninjas ids do not linger.
+    # Drop hashed Ninjas copies only. Live Football rows upsert by match id so
+    # importing extra seasons does not wipe seasons already stored.
     if is_live_football_competition(code):
         removed += remove_datasets_with_prefix(connection, f"api-ninjas-{code.lower()}")
-        removed += remove_datasets_with_prefix(connection, f"live-football-{code.lower()}")
     counts = {
         "competition": code,
         "demo_removed": removed,

@@ -64,11 +64,13 @@ class Storage:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=60.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA busy_timeout = 30000")
+        self._conn.execute("PRAGMA busy_timeout = 60000")
         self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA wal_autocheckpoint = 1000")
         # Bot + laboratory tables live in the same file.
         from database import ensure_shared_schemas
 

@@ -17,6 +17,31 @@ CREATE TABLE IF NOT EXISTS experiments (
     config_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lab_experiments (
+    experiment_id TEXT PRIMARY KEY,
+    competition TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    best_config_json TEXT,
+    best_metrics_json TEXT,
+    error TEXT
+);
+CREATE TABLE IF NOT EXISTS lab_experiment_runs (
+    run_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    metrics_json TEXT,
+    matches_priced INTEGER,
+    matches_evaluated INTEGER,
+    error TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    FOREIGN KEY (experiment_id) REFERENCES lab_experiments(experiment_id)
+);
 CREATE TABLE IF NOT EXISTS matches (
     match_id TEXT PRIMARY KEY,
     dataset_version TEXT NOT NULL,
@@ -131,6 +156,9 @@ def ensure_laboratory_schema(connection: sqlite3.Connection) -> None:
     team_columns = {row[1] for row in connection.execute("PRAGMA table_info(teams)")}
     if "display_name" not in team_columns:
         connection.execute("ALTER TABLE teams ADD COLUMN display_name TEXT")
+    lab_exp_columns = {row[1] for row in connection.execute("PRAGMA table_info(lab_experiments)")}
+    if "error" not in lab_exp_columns:
+        connection.execute("ALTER TABLE lab_experiments ADD COLUMN error TEXT")
     refresh_team_display_names(connection)
     migrate_strip_fd_match_prefix(connection)
     connection.executescript(
@@ -193,6 +221,25 @@ def ensure_laboratory_schema(connection: sqlite3.Connection) -> None:
     team_count = connection.execute("SELECT COUNT(*) AS n FROM teams").fetchone()["n"]
     if team_count == 0:
         backfill_logos_from_payloads(connection)
+    # Dashboard match-list filters / joins (safe IF NOT EXISTS on every connect).
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_matches_kickoff
+            ON matches(kickoff);
+        CREATE INDEX IF NOT EXISTS idx_matches_comp_season_kickoff
+            ON matches(competition, season, kickoff);
+        CREATE INDEX IF NOT EXISTS idx_result_revisions_match
+            ON result_revisions(match_id);
+        CREATE INDEX IF NOT EXISTS idx_predictions_match_engine_exp
+            ON predictions(match_id, engine, experiment_id);
+        CREATE INDEX IF NOT EXISTS idx_evaluations_prediction_rev
+            ON evaluations(prediction_id, revision);
+        CREATE INDEX IF NOT EXISTS idx_engine_runs_match_engine_exp
+            ON engine_runs(match_id, engine, experiment_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_match_experiment
+            ON snapshots(match_id, experiment_id);
+        """
+    )
 
 
 def migrate_strip_fd_match_prefix(connection: sqlite3.Connection) -> int:
@@ -250,17 +297,38 @@ def migrate_strip_fd_match_prefix(connection: sqlite3.Connection) -> int:
 
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+    # Long timeout: dashboard + bot + lab jobs share one file; heavy WAL
+    # checkpoints after tune/reprice can briefly block writers.
+    connection = sqlite3.connect(path, check_same_thread=False, timeout=60.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA busy_timeout = 60000")
     # WAL lets the dashboard read while the bot writes.
     connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = NORMAL")
+    connection.execute("PRAGMA wal_autocheckpoint = 1000")
+    connection.execute("PRAGMA temp_store = MEMORY")
     # Laboratory + bot tables live in the same file.
     from database import ensure_shared_schemas
 
     ensure_shared_schemas(connection)
     return connection
+
+
+def checkpoint_wal(connection: sqlite3.Connection, *, mode: str = "TRUNCATE") -> dict[str, Any]:
+    """Flush the WAL into the main DB so writers stop contending on a huge log."""
+
+    label = str(mode or "TRUNCATE").upper()
+    if label not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+        raise ValueError("mode must be PASSIVE, FULL, RESTART, or TRUNCATE")
+    row = connection.execute(f"PRAGMA wal_checkpoint({label})").fetchone()
+    connection.commit()
+    return {
+        "mode": label,
+        "busy": None if row is None else int(row[0]),
+        "log": None if row is None else int(row[1]),
+        "checkpointed": None if row is None else int(row[2]),
+    }
 
 
 def ensure_experiment(
@@ -295,21 +363,29 @@ def crest_cache_dir() -> Path:
     return resolve_database_path(prefer_lab_override=True).parent / "crests"
 
 
-def crest_url_for_team(team_id: str | int, crest: str | None = None) -> str:
-    """Resolve a team crest, preferring a locally cached file under ``/crests/``."""
+def crest_url_for_team(
+    team_id: str | int,
+    crest: str | None = None,
+    *,
+    fetch: bool = True,
+) -> str:
+    """Resolve a team crest, preferring a locally cached file under ``/crests/``.
+
+    Set ``fetch=False`` on hot list paths so missing crests do not block on HTTP.
+    """
 
     key = str(team_id)
     local = crest_cache_dir() / f"{key}.png"
     if isinstance(crest, str) and crest.startswith("/crests/"):
         return crest
     if isinstance(crest, str) and crest.startswith("http"):
-        if cache_remote_crest(local, crest):
+        if fetch and cache_remote_crest(local, crest):
             return f"/crests/{key}.png"
         return crest
     if local.is_file() and local.stat().st_size > 0:
         return f"/crests/{key}.png"
     remote = f"{CREST_ROOT}/{key}.png"
-    if cache_remote_crest(local, remote):
+    if fetch and cache_remote_crest(local, remote):
         return f"/crests/{key}.png"
     return remote
 
@@ -322,15 +398,23 @@ def emblem_remote_url(code: str, emblem: str | None = None) -> str:
     return f"{CREST_ROOT}/{filename}"
 
 
-def emblem_url_for_competition(code: str, emblem: str | None = None) -> str:
-    """Prefer a locally cached emblem so dashboard pills do not hotlink (and break)."""
+def emblem_url_for_competition(
+    code: str,
+    emblem: str | None = None,
+    *,
+    fetch: bool = True,
+) -> str:
+    """Prefer a locally cached emblem so dashboard pills do not hotlink (and break).
+
+    Set ``fetch=False`` on hot list paths to avoid synchronous HTTP downloads.
+    """
 
     key = code.upper()
     local = crest_cache_dir() / f"{key}.png"
     if local.is_file() and local.stat().st_size > 0:
         return f"/crests/{key}.png"
     remote = emblem_remote_url(key, emblem)
-    if cache_remote_crest(local, remote):
+    if fetch and cache_remote_crest(local, remote):
         return f"/crests/{key}.png"
     return remote
 
@@ -578,6 +662,8 @@ def team_crest_map(
 def competition_emblem_map(
     connection: sqlite3.Connection,
     codes: list[str] | set[str] | None = None,
+    *,
+    fetch: bool = True,
 ) -> dict[str, str]:
     if codes is not None:
         keys = [str(item).upper() for item in codes if item]
@@ -594,12 +680,15 @@ def competition_emblem_map(
     for row in rows:
         code = str(row["code"]).upper()
         stored = str(row["emblem_url"]) if row["emblem_url"] else None
+        if stored and stored.startswith("/crests/"):
+            resolved[code] = stored
+            continue
         remote = stored if stored and stored.startswith("http") else None
-        resolved[code] = emblem_url_for_competition(code, remote)
+        resolved[code] = emblem_url_for_competition(code, remote, fetch=fetch)
     # Ensure requested codes still resolve even when the competitions row is missing.
     if codes is not None:
         for code in keys:
-            resolved.setdefault(code, emblem_url_for_competition(code))
+            resolved.setdefault(code, emblem_url_for_competition(code, fetch=fetch))
     return resolved
 
 
@@ -974,6 +1063,42 @@ def delete_match_engine_outputs(
     )
 
 
+def delete_experiment_engine_outputs(
+    connection: sqlite3.Connection,
+    *,
+    experiment_id: str,
+    engine: str,
+) -> int:
+    """Remove all prediction/evaluation/run rows for one experiment engine."""
+
+    prediction_ids = [
+        row["prediction_id"]
+        for row in connection.execute(
+            """
+            SELECT prediction_id FROM predictions
+            WHERE experiment_id = ? AND engine = ?
+            """,
+            (experiment_id, engine),
+        )
+    ]
+    if prediction_ids:
+        marks = ",".join("?" for _ in prediction_ids)
+        connection.execute(
+            f"DELETE FROM evaluations WHERE prediction_id IN ({marks})",
+            prediction_ids,
+        )
+        connection.execute(
+            f"DELETE FROM predictions WHERE prediction_id IN ({marks})",
+            prediction_ids,
+        )
+    connection.execute(
+        "DELETE FROM engine_runs WHERE experiment_id = ? AND engine = ?",
+        (experiment_id, engine),
+    )
+    connection.commit()
+    return len(prediction_ids)
+
+
 def insert_prediction(
     connection: sqlite3.Connection,
     *,
@@ -1147,3 +1272,356 @@ def latest_job_runs(
         if row is not None:
             rows.append(row)
     return rows
+
+
+# =====================================================================
+# Lab Experiment Storage
+# =====================================================================
+
+def create_lab_experiment(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+    competition: str,
+    config: dict[str, Any],
+) -> None:
+    """Register a new lab experiment."""
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute(
+        """
+        INSERT INTO lab_experiments (
+            experiment_id, competition, config_json, status, created_at
+        ) VALUES (?, ?, ?, 'running', ?)
+        ON CONFLICT(experiment_id) DO NOTHING
+        """,
+        (experiment_id, competition, json.dumps(config, sort_keys=True), now),
+    )
+    connection.commit()
+
+
+def get_lab_experiment(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+) -> dict[str, Any] | None:
+    """Fetch a lab experiment by ID."""
+    row = connection.execute(
+        """
+        SELECT *
+        FROM lab_experiments WHERE experiment_id = ?
+        """,
+        (experiment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    keys = row.keys()
+    return {
+        "experiment_id": row["experiment_id"],
+        "competition": row["competition"],
+        "config": json.loads(row["config_json"]),
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
+        "best_config": json.loads(row["best_config_json"]) if row["best_config_json"] else None,
+        "best_metrics": json.loads(row["best_metrics_json"]) if row["best_metrics_json"] else None,
+        "error": row["error"] if "error" in keys else None,
+    }
+
+
+def fail_lab_experiment(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+    error: str,
+) -> None:
+    """Mark experiment as failed with error message / traceback."""
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute(
+        """
+        UPDATE lab_experiments
+        SET status = 'failed', completed_at = ?, error = ?
+        WHERE experiment_id = ?
+        """,
+        (now, error, experiment_id),
+    )
+    connection.commit()
+
+
+def delete_lab_experiment(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+    *,
+    cascade_predictions: bool = True,
+) -> int:
+    """Delete a lab experiment and its runs. Returns rows deleted."""
+    def _table_exists(table_name: str) -> bool:
+        r = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        return r is not None
+
+    deleted = 0
+    if _table_exists("lab_experiment_runs"):
+        cur = connection.execute(
+            "DELETE FROM lab_experiment_runs WHERE experiment_id = ?",
+            (experiment_id,),
+        )
+        deleted += cur.rowcount
+
+    if cascade_predictions:
+        if _table_exists("evaluations") and _table_exists("predictions"):
+            connection.execute(
+                """DELETE FROM evaluations WHERE prediction_id IN (
+                    SELECT prediction_id FROM predictions WHERE experiment_id = ?
+                )""",
+                (experiment_id,),
+            )
+        if _table_exists("predictions"):
+            connection.execute(
+                "DELETE FROM predictions WHERE experiment_id = ?",
+                (experiment_id,),
+            )
+        if _table_exists("snapshots"):
+            connection.execute(
+                "DELETE FROM snapshots WHERE experiment_id = ?",
+                (experiment_id,),
+            )
+
+    if _table_exists("lab_experiments"):
+        cur = connection.execute(
+            "DELETE FROM lab_experiments WHERE experiment_id = ?",
+            (experiment_id,),
+        )
+        deleted += cur.rowcount
+
+    connection.commit()
+    return deleted
+
+
+def reset_lab_experiment_for_rerun(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+    *,
+    cascade_predictions: bool = True,
+) -> int:
+    """Clear runs/outputs and mark the experiment ``running`` for a fresh lab-run.
+
+    Keeps the ``lab_experiments`` row and its stored config. Returns rows deleted
+    from ``lab_experiment_runs`` (0 if the experiment does not exist).
+    """
+
+    def _table_exists(table_name: str) -> bool:
+        r = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        return r is not None
+
+    if not _table_exists("lab_experiments"):
+        return 0
+    exists = connection.execute(
+        "SELECT 1 FROM lab_experiments WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if exists is None:
+        return 0
+
+    deleted_runs = 0
+    if _table_exists("lab_experiment_runs"):
+        cur = connection.execute(
+            "DELETE FROM lab_experiment_runs WHERE experiment_id = ?",
+            (experiment_id,),
+        )
+        deleted_runs = int(cur.rowcount)
+
+    if cascade_predictions:
+        if _table_exists("evaluations") and _table_exists("predictions"):
+            connection.execute(
+                """DELETE FROM evaluations WHERE prediction_id IN (
+                    SELECT prediction_id FROM predictions WHERE experiment_id = ?
+                )""",
+                (experiment_id,),
+            )
+        if _table_exists("predictions"):
+            connection.execute(
+                "DELETE FROM predictions WHERE experiment_id = ?",
+                (experiment_id,),
+            )
+        if _table_exists("snapshots"):
+            connection.execute(
+                "DELETE FROM snapshots WHERE experiment_id = ?",
+                (experiment_id,),
+            )
+
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute(
+        """
+        UPDATE lab_experiments
+        SET status = 'running',
+            created_at = ?,
+            completed_at = NULL,
+            best_config_json = NULL,
+            best_metrics_json = NULL,
+            error = NULL
+        WHERE experiment_id = ?
+        """,
+        (now, experiment_id),
+    )
+    connection.commit()
+    return deleted_runs
+
+
+def available_competitions(connection: sqlite3.Connection) -> list[str]:
+    """Distinct competition codes from matches table, or fallback defaults."""
+    from laboratory.football_data import COMPETITION_NAMES
+
+    try:
+        rows = connection.execute(
+            "SELECT DISTINCT competition FROM matches ORDER BY competition"
+        ).fetchall()
+        codes = [str(row["competition"]) for row in rows if row["competition"]]
+        if codes:
+            return codes
+    except sqlite3.OperationalError:
+        pass
+    return list(COMPETITION_NAMES.keys())
+
+
+def available_seasons(connection: sqlite3.Connection) -> list[str]:
+    """Distinct seasons from matches table, or fallback defaults."""
+    try:
+        rows = connection.execute(
+            "SELECT DISTINCT season FROM matches ORDER BY season DESC"
+        ).fetchall()
+        szns = [str(row["season"]) for row in rows if row["season"]]
+        if szns:
+            return szns
+    except sqlite3.OperationalError:
+        pass
+    from datetime import datetime
+    now_year = datetime.now().year
+    return [str(now_year - 2), str(now_year - 1), str(now_year)]
+
+
+def list_lab_experiments(
+    connection: sqlite3.Connection,
+    competition: str | None = None,
+) -> list[dict[str, Any]]:
+    """List all lab experiments, optionally filtered by competition."""
+    sql = """
+        SELECT experiment_id, competition, status, created_at, completed_at
+        FROM lab_experiments
+    """
+    params: tuple[Any, ...] = ()
+    if competition:
+        sql += " WHERE competition = ?"
+        params = (competition.upper(),)
+    sql += " ORDER BY created_at DESC"
+    rows = connection.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def complete_lab_experiment(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+    best_config: dict[str, Any] | None,
+    best_metrics: dict[str, Any] | None,
+) -> None:
+    """Mark experiment as completed with winning config and metrics."""
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute(
+        """
+        UPDATE lab_experiments
+        SET status = 'completed', completed_at = ?,
+            best_config_json = ?, best_metrics_json = ?
+        WHERE experiment_id = ?
+        """,
+        (
+            now,
+            json.dumps(best_config, sort_keys=True) if best_config else None,
+            json.dumps(best_metrics, sort_keys=True) if best_metrics else None,
+            experiment_id,
+        ),
+    )
+    connection.commit()
+
+
+def upsert_lab_experiment_run(
+    connection: sqlite3.Connection,
+    run_id: str,
+    experiment_id: str,
+    model_id: str,
+    config: dict[str, Any],
+    status: str = "pending",
+    metrics: dict[str, Any] | None = None,
+    matches_priced: int | None = None,
+    matches_evaluated: int | None = None,
+    error: str | None = None,
+) -> None:
+    """Insert or update a lab experiment run."""
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute(
+        """
+        INSERT INTO lab_experiment_runs (
+            run_id, experiment_id, model_id, config_json, status,
+            metrics_json, matches_priced, matches_evaluated, error,
+            started_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+            status = excluded.status,
+            metrics_json = excluded.metrics_json,
+            matches_priced = excluded.matches_priced,
+            matches_evaluated = excluded.matches_evaluated,
+            error = excluded.error,
+            completed_at = excluded.completed_at
+        """,
+        (
+            run_id,
+            experiment_id,
+            model_id,
+            json.dumps(config, sort_keys=True),
+            status,
+            json.dumps(metrics, sort_keys=True) if metrics else None,
+            matches_priced,
+            matches_evaluated,
+            error,
+            now if status != "pending" else None,
+            now if status in ("completed", "failed") else None,
+        ),
+    )
+    connection.commit()
+
+
+def get_lab_experiment_runs(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch all runs for an experiment, optionally filtered by status."""
+    sql = """
+        SELECT run_id, experiment_id, model_id, config_json, status,
+               metrics_json, matches_priced, matches_evaluated, error,
+               started_at, completed_at
+        FROM lab_experiment_runs
+        WHERE experiment_id = ?
+    """
+    params: list[Any] = [experiment_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY started_at"
+    rows = connection.execute(sql, params).fetchall()
+    return [
+        {
+            "run_id": row["run_id"],
+            "experiment_id": row["experiment_id"],
+            "model_id": row["model_id"],
+            "config": json.loads(row["config_json"]),
+            "status": row["status"],
+            "metrics": json.loads(row["metrics_json"]) if row["metrics_json"] else None,
+            "matches_priced": row["matches_priced"],
+            "matches_evaluated": row["matches_evaluated"],
+            "error": row["error"],
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+        }
+        for row in rows
+    ]

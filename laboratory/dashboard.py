@@ -8,10 +8,11 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode
 
 from laboratory import BOT_EXPERIMENT_ID, EXPERIMENT_ID
 from laboratory.football_data import COMPETITION_NAMES
+from laboratory.store import connect as lab_connect, emblem_url_for_competition
 
 PAGE_SIZE = 40
 MARKETS = (
@@ -28,17 +29,100 @@ ENGINE_LABELS = {
 }
 
 
-def overview(connection: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
+def _market_pair_from_metrics(
+    metrics: dict[str, Any] | None,
+    market: str,
+) -> tuple[float | None, float | None]:
+    """Return ``(accuracy_or_hit, log_loss)`` from ``metrics[market]``.
+
+    Prefers the nested aggregate/evaluation object. Falls back to flat keys
+    ``{market}_accuracy`` / ``{market}_log_loss`` written by older runs.
+    """
+
+    if not metrics:
+        return None, None
+    nested = metrics.get(market)
+    hit: float | None = None
+    log_loss: float | None = None
+    if isinstance(nested, dict):
+        for key in ("hit", "accuracy", "hit_rate", "correct"):
+            raw = nested.get(key)
+            if raw is None or isinstance(raw, bool):
+                continue
+            hit = float(raw)
+            break
+        if nested.get("log_loss") is not None:
+            log_loss = float(nested["log_loss"])
+    if hit is None and metrics.get(f"{market}_accuracy") is not None:
+        hit = float(metrics[f"{market}_accuracy"])
+    if hit is None and metrics.get(f"{market}_hit_rate") is not None:
+        hit = float(metrics[f"{market}_hit_rate"])
+    if log_loss is None and metrics.get(f"{market}_log_loss") is not None:
+        log_loss = float(metrics[f"{market}_log_loss"])
+    return hit, log_loss
+
+
+def _exact_score_from_metrics(metrics: dict[str, Any] | None) -> tuple[float | None, float | None]:
+    """Return ``(hit_rate, log_loss)`` for exact score.
+
+    Accepts nested ``metrics['exact_score']`` (``hit`` / ``accuracy`` / ``hit_rate`` /
+    numeric ``correct``, plus ``log_loss``) and flat keys ``exact_score_hit_rate``,
+    ``exact_score_accuracy``, ``exact_score_log_loss``.
+    """
+
+    hit, log_loss = _market_pair_from_metrics(metrics, "exact_score")
+    if metrics:
+        if hit is None and metrics.get("exact_score_hit_rate") is not None:
+            hit = float(metrics["exact_score_hit_rate"])
+        if log_loss is None and metrics.get("exact_score_log_loss") is not None:
+            log_loss = float(metrics["exact_score_log_loss"])
+    return hit, log_loss
+
+
+def _fmt_pct(value: float | None, *, digits: int = 1) -> str:
+    return f"{value:.{digits}%}" if value is not None else "—"
+
+
+def _fmt_ll(value: float | None) -> str:
+    return f"{value:.4f}" if value is not None else "—"
+
+
+def _metric_cell(text: str, *, win: bool = False) -> str:
+    """Leaderboard cell; optional win highlight via existing good token."""
+
+    if not win or text == "—":
+        return text
+    return f'<span class="metric-win mono">{text}</span>'
+
+
+def overview(
+    connection: sqlite3.Connection,
+    query: dict[str, list[str]] | None = None,
+    *,
+    csrf_token: str | None = None,
+) -> str:
+    from laboratory.sync import get_latest_sync_job
+
     filters = _filters(query, connection)
-    loaded = _load(connection, filters["engine"], filters["experiment"])
+    # SQL-prefilter when possible; still need bodies for calibration charts.
+    loaded = _load(
+        connection,
+        filters["engine"],
+        filters["experiment"],
+        filters=filters,
+        include_body=True,
+    )
     rows = _apply(loaded, filters)
-    leagues, seasons, teams = _choices(loaded, filters.get("league", ""))
+    leagues, seasons, teams = _filter_choices(connection, filters.get("league", ""))
+    has_any = (
+        connection.execute("SELECT 1 FROM matches LIMIT 1").fetchone() is not None
+    )
     body = [
         _masthead("Overview", filters, active="overview"),
-        _jobs_panel(connection),
+        _jobs_panel(connection, filters, csrf_token=csrf_token),
         _filter_form("/", filters, leagues, seasons, teams, submit="Update"),
     ]
-    if not loaded:
+    if not has_any:
         body.append(
             _state(
                 kind="empty",
@@ -83,41 +167,257 @@ def overview(connection: sqlite3.Connection, query: dict[str, list[str]] | None 
                     lead="Fixtures are loaded, but this engine has no scored market metrics for the current filters.",
                 )
             )
-    return _page("Overview", "\n".join(body), filters)
+    try:
+        latest_sync = get_latest_sync_job(connection)
+    except sqlite3.OperationalError:
+        latest_sync = None
+    is_sync_running = latest_sync is not None and latest_sync.get("status") == "running"
+    sync_flash = (filters.get("sync_status") or "").strip()
+    # Keep polling while the job runs. After POST lands on sync_status=started,
+    # bounce once to clean "/" so the final job summary (ok/partial/failed) shows.
+    if is_sync_running:
+        extra_head = '<meta http-equiv="refresh" content="5;url=/">'
+    elif sync_flash == "started":
+        extra_head = '<meta http-equiv="refresh" content="2;url=/">'
+    else:
+        extra_head = ""
+    return _page("Overview", "\n".join(body), filters, extra_head=extra_head)
 
 
-def _jobs_panel(connection: sqlite3.Connection) -> str:
+def _jobs_panel(
+    connection: sqlite3.Connection,
+    filters: dict[str, str] | None = None,
+    *,
+    csrf_token: str | None = None,
+) -> str:
     from laboratory.store import latest_job_runs
+    from laboratory.sync import get_latest_sync_job
 
+    filters = filters or {}
     try:
         runs = latest_job_runs(connection)
     except sqlite3.OperationalError:
         runs = []
+
+    try:
+        sync_job = get_latest_sync_job(connection)
+    except sqlite3.OperationalError:
+        sync_job = None
+
+    is_running = sync_job is not None and sync_job.get("status") == "running"
+    sync_flash_status = (filters.get("sync_status") or "").strip()
+    sync_flash_detail = (filters.get("sync_detail") or "").strip()
+
+    header_html = (
+        '<div class="jobs-header">'
+        '<div class="jobs-title-wrap">'
+        "<h2>Server jobs</h2>"
+        '<p class="note">Fetches recent results, upcoming fixtures, and tables for all leagues (background).</p>'
+        "</div>"
+        '<form method="POST" action="/sync" class="sync-form">'
+        f'<input type="hidden" name="csrf" value="{html.escape(csrf_token or "")}">'
+        f'<button type="submit" class="sync-btn"{" disabled" if is_running else ""}>'
+        f'{"Sync in progress…" if is_running else "Sync matches & standings"}'
+        "</button>"
+        "</form>"
+        "</div>"
+        '<p class="note">Incremental: recent results + upcoming fixtures (±14 days); '
+        "full season only on first import.</p>"
+    )
+
+    status_callout = ""
+    terminal_job = (
+        sync_job
+        if sync_job and sync_job.get("status") in {"ok", "partial", "failed", "empty"}
+        else None
+    )
+
+    if is_running:
+        status_callout = _state(
+            kind="wait",
+            title="Sync running in background… refreshing this page.",
+            lead="Fetching fixtures, finished scores, and league standings across all competitions.",
+        )
+    elif sync_flash_status == "busy":
+        status_callout = _state(
+            kind="wait",
+            title="A sync is already in progress. Wait for it to finish.",
+            lead=sync_flash_detail,
+        )
+    elif sync_flash_status == "config":
+        status_callout = _state(
+            kind="error",
+            title="Missing configuration",
+            lead=sync_flash_detail or "Missing FOOTBALL_API_KEY in environment.",
+        )
+    elif sync_flash_status in ("unauthorized", "invalid", "auth"):
+        status_callout = _state(
+            kind="error",
+            title="Authentication error",
+            lead=sync_flash_detail or "Session expired. Try again.",
+        )
+    elif sync_flash_status == "failed" and not terminal_job:
+        status_callout = _state(
+            kind="error",
+            title="Sync failed",
+            lead=sync_flash_detail or "Session expired. Try again.",
+        )
+    elif terminal_job:
+        # Prefer persisted job summary over a stale sync_status=started flash.
+        st = str(terminal_job.get("status") or "")
+        dtl = str(terminal_job.get("detail") or "")
+        if st == "ok":
+            status_callout = _state(kind="info", title="Sync completed", lead=dtl)
+        elif st == "partial":
+            status_callout = _state(kind="wait", title="Partial sync completed", lead=dtl)
+        elif st == "failed":
+            status_callout = _state(
+                kind="error",
+                title="Sync failed",
+                lead=dtl or str(terminal_job.get("error") or ""),
+            )
+        elif st == "empty":
+            status_callout = _state(kind="empty", title="No fixtures returned", lead=dtl)
+    elif sync_flash_status == "started":
+        status_callout = _state(
+            kind="wait",
+            title="Sync started… waiting for results.",
+            lead=sync_flash_detail or "This page will refresh automatically when the sync finishes.",
+        )
+    elif sync_flash_status == "ok":
+        status_callout = _state(
+            kind="info",
+            title="Sync completed",
+            lead=sync_flash_detail,
+        )
+    elif sync_flash_status == "partial":
+        status_callout = _state(
+            kind="wait",
+            title="Partial sync completed",
+            lead=sync_flash_detail,
+        )
+    elif sync_flash_status == "empty":
+        status_callout = _state(
+            kind="empty",
+            title="No fixtures returned",
+            lead=sync_flash_detail or "No fixtures returned for any league (check season year / provider).",
+        )
+    elif sync_flash_status == "failed":
+        status_callout = _state(
+            kind="error",
+            title="Sync failed",
+            lead=sync_flash_detail or "Sync failed.",
+        )
+
+    breakdown_html = ""
+    if sync_job and sync_job.get("leagues") and not is_running:
+        breakdown_html = _sync_breakdown_table(sync_job["leagues"])
+
     if not runs:
-        return (
-            '<section class="panel jobs-panel"><h2>Server jobs</h2>'
+        runs_html = (
             '<p class="note">No job runs recorded yet. Start '
             "<code>python -m jobs</code> to price tomorrow and refresh standings.</p>"
-            "</section>"
         )
-    cards: list[str] = []
-    for run in runs:
-        summary = _json(run["summary_json"])
-        ok = bool(run["ok"])
-        status = "ok" if ok else "failed"
-        title = "Tomorrow predictions" if run["name"] == "tomorrow" else "Standings refresh"
-        when = _short_cairo(str(run["finished_at"]))
-        detail = _job_summary_line(str(run["name"]), summary, ok=ok)
-        cards.append(
-            "<article>"
-            f"<span>{html.escape(title)}</span>"
-            f"<strong class=\"job-{status}\">{html.escape(status)}</strong>"
-            f"<p>{html.escape(when)} · {html.escape(detail)}</p>"
-            "</article>"
+    else:
+        cards: list[str] = []
+        for run in runs:
+            summary = _json(run["summary_json"])
+            ok = bool(run["ok"])
+            status = "ok" if ok else "failed"
+            title = "Tomorrow predictions" if run["name"] == "tomorrow" else "Standings refresh"
+            when = _short_cairo(str(run["finished_at"]))
+            detail = _job_summary_line(str(run["name"]), summary, ok=ok)
+            cards.append(
+                "<article>"
+                f"<span>{html.escape(title)}</span>"
+                f'<strong class="job-{status}">{html.escape(status)}</strong>'
+                f"<p>{html.escape(when)} · {html.escape(detail)}</p>"
+                "</article>"
+            )
+        runs_html = f'<div class="job-cards">{"".join(cards)}</div>'
+
+    return (
+        f'<section class="panel jobs-panel">'
+        f"{header_html}"
+        f"{status_callout}"
+        f"{breakdown_html}"
+        f"{runs_html}"
+        f"</section>"
+    )
+
+
+def _sync_breakdown_table(leagues: dict[str, dict[str, Any]]) -> str:
+    rows = []
+    for code, item in leagues.items():
+        name = item.get("name") or code
+        matches = item.get("matches", 0)
+        res_added = item.get("results_added", 0)
+        res_unchanged = item.get("results_unchanged", 0)
+        priced_new = item.get("priced_new", 0)
+        evaluated = item.get("evaluated", 0)
+        already_evaluated = item.get("already_evaluated", 0)
+        st_status = item.get("standings_status", "n/a")
+        st_rows = item.get("standings_rows", 0)
+        if st_status == "ok":
+            st_display = f"{st_rows} rows"
+        elif st_status == "failed":
+            st_display = f"failed ({item.get('standings_error', '')})"
+        else:
+            st_display = "n/a"
+
+        m_status = item.get("matches_status", "pending")
+        m_err = item.get("matches_error") or ""
+        p_err = item.get("price_error") or ""
+
+        if m_status == "failed" or st_status == "failed":
+            badge = '<strong class="job-failed">failed</strong>'
+        elif m_status in ("ok", "empty") and st_status in ("ok", "n/a"):
+            badge = '<strong class="job-ok">ok</strong>'
+        else:
+            badge = f"<strong>{html.escape(m_status)}</strong>"
+
+        notes = []
+        if m_err:
+            notes.append(m_err)
+        if p_err:
+            notes.append(f"price: {p_err}")
+        err_note = (
+            f' <span class="note" style="color:var(--bad)">({html.escape("; ".join(notes))})</span>'
+            if notes
+            else ""
+        )
+        eval_display = f"{evaluated}"
+        if already_evaluated:
+            eval_display = f"{evaluated} (+{already_evaluated} prior)"
+
+        rows.append(
+            f"<tr>"
+            f"<td><strong>{html.escape(code)}</strong> · {html.escape(name)}{err_note}</td>"
+            f'<td class="mono num">{matches}</td>'
+            f'<td class="mono num">{res_added}</td>'
+            f'<td class="mono num">{res_unchanged}</td>'
+            f'<td class="mono num">{priced_new}</td>'
+            f'<td class="mono num">{html.escape(eval_display)}</td>'
+            f"<td>{html.escape(st_display)}</td>"
+            f"<td>{badge}</td>"
+            f"</tr>"
         )
     return (
-        '<section class="panel jobs-panel"><h2>Server jobs</h2>'
-        f'<div class="job-cards">{"".join(cards)}</div></section>'
+        '<div class="sync-breakdown table-wrap">'
+        '<table class="sync-table">'
+        "<thead><tr>"
+        "<th>League</th>"
+        "<th>Fixtures</th>"
+        "<th>Results added</th>"
+        "<th>Results unchanged</th>"
+        "<th>Priced</th>"
+        "<th>Evaluated</th>"
+        "<th>Standings</th>"
+        "<th>Status</th>"
+        "</tr></thead>"
+        f'<tbody>{"".join(rows)}</tbody>'
+        "</table>"
+        "</div>"
     )
 
 
@@ -150,14 +450,14 @@ def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | Non
     filters = _filters(query, connection)
     if not filters["date_from"] and not filters["date_to"]:
         filters["date_from"], filters["date_to"] = _default_match_date_range()
-    loaded = _load(connection, filters["engine"], filters["experiment"])
-    leagues, seasons, teams = _choices(loaded, filters.get("league", ""))
-    rows = _apply(loaded, filters)
-    pages = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
+    leagues, seasons, teams = _filter_choices(connection, filters.get("league", ""))
+    has_any = (
+        connection.execute("SELECT 1 FROM matches LIMIT 1").fetchone() is not None
+    )
+    total, window = _load_match_page(connection, filters)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(_page_number(filters), pages)
-    start = (page - 1) * PAGE_SIZE
-    window = rows[start : start + PAGE_SIZE]
-    if not loaded:
+    if not has_any:
         listing = _state(
             kind="empty",
             title="No matches in the laboratory yet",
@@ -167,7 +467,7 @@ def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | Non
         )
         toolbar = ""
         pager = ""
-    elif not rows:
+    elif total == 0:
         listing = _state(
             kind="empty",
             title="No matches match these filters",
@@ -184,7 +484,7 @@ def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | Non
         listing = _match_table(window, filters)
         toolbar = (
             f'<div class="toolbar"><p class="note">Showing '
-            f"<strong>{len(window)}</strong> of <strong>{len(rows)}</strong>"
+            f"<strong>{len(window)}</strong> of <strong>{total}</strong>"
             f" · page {page} of {pages}</p></div>"
         )
         pager = _pager("/matches", filters, page, pages)
@@ -230,9 +530,13 @@ def match_detail(
         """,
         (canonical_id,),
     ).fetchone()
+    # Avoid SELECT payload_json (large blobs). Coverage fields + leakage_ok are enough for UI.
     snapshot = connection.execute(
         """
-        SELECT payload_json FROM snapshots
+        SELECT leakage_ok,
+               json_extract(payload_json, '$.coverage.prior_full_time_matches') AS prior_ft,
+               json_extract(payload_json, '$.coverage.prior_half_time_matches') AS prior_ht
+        FROM snapshots
         WHERE match_id = ? AND experiment_id = ?
         LIMIT 1
         """,
@@ -240,7 +544,14 @@ def match_detail(
     ).fetchone()
     if snapshot is None:
         snapshot = connection.execute(
-            "SELECT payload_json FROM snapshots WHERE match_id = ? LIMIT 1",
+            """
+            SELECT leakage_ok,
+                   json_extract(payload_json, '$.coverage.prior_full_time_matches') AS prior_ft,
+                   json_extract(payload_json, '$.coverage.prior_half_time_matches') AS prior_ht
+            FROM snapshots
+            WHERE match_id = ?
+            LIMIT 1
+            """,
             (canonical_id,),
         ).fetchone()
     predictions = connection.execute(
@@ -259,7 +570,11 @@ def match_detail(
               AND (
                 experiment_id = ?
                 OR experiment_id = ('BOT-' || ? || '-live')
-                OR model_id IN ('bot-score-model-v1', 'bot-score-model-live')
+                OR model_id IN (
+                  'bot-score-model-v1',
+                  'bot-score-model-live',
+                  'bot-score-model-pl-v2'
+                )
               )
             ORDER BY
               CASE
@@ -383,11 +698,16 @@ def _filters(
         "fixture": one("fixture", "all"),
         "status": one("status", "all"),
         "verdict": one("verdict", "all"),
+        "confidence": one("confidence", "all"),
         "order": one("order", "newest"),
         "page": one("page", "1"),
         "predicted": one("predicted"),
         "predict_status": one("predict_status"),
         "predict_detail": one("predict_detail"),
+        "run_status": one("run_status"),
+        "run_detail": one("run_detail"),
+        "sync_status": one("sync_status"),
+        "sync_detail": one("sync_detail"),
     }
 
 
@@ -476,18 +796,26 @@ def _live_experiment_for_match(engine: str, competition: str) -> str:
     return f"BOT-{code}-live"
 
 
-def _load(connection: sqlite3.Connection, engine: str, experiment_id: str) -> list[dict[str, Any]]:
+def _needs_body_postfilter(filters: dict[str, str]) -> bool:
+    return _confidence_threshold(filters.get("confidence") or "all") is not None
+
+
+def _needs_metrics_postfilter(filters: dict[str, str]) -> bool:
+    return (filters.get("verdict") or "all") != "all" or _needs_body_postfilter(filters)
+
+
+def _match_join_sql(
+    engine: str,
+    experiment_id: str,
+    *,
+    include_body: bool = False,
+) -> tuple[str, list[Any]]:
+    """Shared FROM/JOIN for match list / overview queries."""
+
+    _ = include_body  # SELECT decides body columns; join shape is identical.
     if engine == "score_model":
-        # Live bot view: PL stays on BOT-PL-001; other leagues use BOT-{code}-live.
-        # Challenger variants (BOT-PL-001-k6, …) are intentionally excluded.
-        rows = connection.execute(
-            """
-            SELECT m.match_id, m.competition, m.season, m.kickoff,
-                   m.home_id, m.home_name, m.away_id, m.away_name,
-                   r.ft_home, r.ft_away, r.ht_home, r.ht_away,
-                   er.status AS engine_status,
-                   ev.metrics_json AS metrics_json,
-                   pr.body_json AS body_json
+        # Live bot view: PL → BOT-PL-001; peers → BOT-{code}-live.
+        sql = """
             FROM matches m
             LEFT JOIN result_revisions r
               ON r.match_id = m.match_id
@@ -513,19 +841,9 @@ def _load(connection: sqlite3.Connection, engine: str, experiment_id: str) -> li
              AND ev.revision = (
                 SELECT MAX(revision) FROM evaluations WHERE prediction_id = pr.prediction_id
              )
-            ORDER BY m.kickoff DESC, m.match_id
-            """,
-            (BOT_EXPERIMENT_ID, BOT_EXPERIMENT_ID),
-        ).fetchall()
-    else:
-        rows = connection.execute(
-            """
-            SELECT m.match_id, m.competition, m.season, m.kickoff,
-                   m.home_id, m.home_name, m.away_id, m.away_name,
-                   r.ft_home, r.ft_away, r.ht_home, r.ht_away,
-                   er.status AS engine_status,
-                   ev.metrics_json AS metrics_json,
-                   pr.body_json AS body_json
+        """
+        return sql, [BOT_EXPERIMENT_ID, BOT_EXPERIMENT_ID]
+    sql = """
             FROM matches m
             LEFT JOIN result_revisions r
               ON r.match_id = m.match_id
@@ -545,10 +863,77 @@ def _load(connection: sqlite3.Connection, engine: str, experiment_id: str) -> li
              AND ev.revision = (
                 SELECT MAX(revision) FROM evaluations WHERE prediction_id = pr.prediction_id
              )
-            ORDER BY m.kickoff DESC, m.match_id
-            """,
-            (engine, experiment_id, engine, experiment_id),
-        ).fetchall()
+        """
+    return sql, [engine, experiment_id, engine, experiment_id]
+
+
+def _sql_filter_clauses(filters: dict[str, str] | None) -> tuple[str, list[Any]]:
+    """Push list filters into SQL. Verdict/confidence stay in Python."""
+
+    if not filters:
+        return "", []
+    clauses: list[str] = []
+    params: list[Any] = []
+    league = (filters.get("league") or "").strip()
+    if league:
+        clauses.append("m.competition = ?")
+        params.append(league.upper())
+    season = (filters.get("season") or "").strip()
+    if season:
+        clauses.append("m.season = ?")
+        params.append(season)
+    team = (filters.get("team") or "").strip()
+    if team:
+        clauses.append(
+            """(
+                m.home_name = ? OR m.away_name = ?
+                OR EXISTS (
+                    SELECT 1 FROM teams t
+                    WHERE t.team_id = m.home_id
+                      AND COALESCE(NULLIF(t.display_name, ''), t.name) = ?
+                )
+                OR EXISTS (
+                    SELECT 1 FROM teams t
+                    WHERE t.team_id = m.away_id
+                      AND COALESCE(NULLIF(t.display_name, ''), t.name) = ?
+                )
+            )"""
+        )
+        params.extend([team, team, team, team])
+    date_from = (filters.get("date_from") or "").strip()
+    if date_from:
+        clauses.append("substr(m.kickoff, 1, 10) >= ?")
+        params.append(date_from)
+    date_to = (filters.get("date_to") or "").strip()
+    if date_to:
+        clauses.append("substr(m.kickoff, 1, 10) <= ?")
+        params.append(date_to)
+    fixture = (filters.get("fixture") or "all").strip()
+    if fixture == "finished":
+        clauses.append("r.ft_home IS NOT NULL")
+    elif fixture == "scheduled":
+        clauses.append("r.ft_home IS NULL")
+    status = (filters.get("status") or "all").strip()
+    if status != "all":
+        clauses.append("COALESCE(er.status, 'pending') = ?")
+        params.append(status)
+    if not clauses:
+        return "", []
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def _order_sql(filters: dict[str, str] | None) -> str:
+    if filters and filters.get("order") == "oldest":
+        return " ORDER BY m.kickoff ASC, m.match_id ASC"
+    return " ORDER BY m.kickoff DESC, m.match_id DESC"
+
+
+def _enrich_match_rows(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row] | list[dict[str, Any]],
+    *,
+    include_body: bool,
+) -> list[dict[str, Any]]:
     from laboratory.store import (
         competition_emblem_map,
         crest_url_for_team,
@@ -556,26 +941,185 @@ def _load(connection: sqlite3.Connection, engine: str, experiment_id: str) -> li
         team_display_map,
     )
 
-    loaded = []
+    if not rows:
+        return []
     team_ids = {str(row["home_id"]) for row in rows} | {str(row["away_id"]) for row in rows}
     league_codes = {str(row["competition"] or "PL").upper() for row in rows}
     crests = team_crest_map(connection, team_ids)
     displays = team_display_map(connection, team_ids)
-    emblems = competition_emblem_map(connection, league_codes)
+    # Never block match lists on crest HTTP downloads (fetch=False).
+    emblems = competition_emblem_map(connection, league_codes, fetch=False)
+    loaded: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
-        item["metrics"] = _json(row["metrics_json"])
-        item["body"] = _json(row["body_json"])
+        item["metrics"] = _json(item.get("metrics_json"))
+        if include_body:
+            item["body"] = _json(item.get("body_json"))
+        else:
+            item["body"] = item.get("body") or {}
         home_id = str(row["home_id"])
         away_id = str(row["away_id"])
         code = str(row["competition"] or "PL").upper()
-        item["home_crest"] = crests.get(home_id) or crest_url_for_team(home_id)
-        item["away_crest"] = crests.get(away_id) or crest_url_for_team(away_id)
+        item["home_crest"] = crests.get(home_id) or crest_url_for_team(
+            home_id, fetch=False
+        )
+        item["away_crest"] = crests.get(away_id) or crest_url_for_team(
+            away_id, fetch=False
+        )
         item["home_display"] = displays.get(home_id) or str(row["home_name"])
         item["away_display"] = displays.get(away_id) or str(row["away_name"])
         item["league_emblem"] = emblems.get(code)
         loaded.append(item)
     return loaded
+
+
+def _attach_prediction_bodies(
+    connection: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    engine: str,
+    experiment_id: str,
+) -> None:
+    """Fill ``body`` for an already-enriched page window (mutates rows)."""
+
+    if not rows:
+        return
+    ids = [str(row["match_id"]) for row in rows]
+    marks = ",".join("?" for _ in ids)
+    if engine == "score_model":
+        sql = f"""
+            SELECT pr.match_id, pr.body_json, m.competition
+            FROM predictions pr
+            JOIN matches m ON m.match_id = pr.match_id
+            WHERE pr.match_id IN ({marks})
+              AND pr.engine = 'score_model'
+              AND pr.experiment_id = CASE
+                WHEN m.competition = 'PL' THEN ?
+                ELSE 'BOT-' || m.competition || '-live'
+              END
+        """
+        params: list[Any] = [*ids, BOT_EXPERIMENT_ID]
+    else:
+        sql = f"""
+            SELECT match_id, body_json
+            FROM predictions
+            WHERE match_id IN ({marks})
+              AND engine = ?
+              AND experiment_id = ?
+        """
+        params = [*ids, engine, experiment_id]
+    by_id = {
+        str(row["match_id"]): _json(row["body_json"])
+        for row in connection.execute(sql, params)
+    }
+    for row in rows:
+        row["body"] = by_id.get(str(row["match_id"])) or {}
+
+
+def _load(
+    connection: sqlite3.Connection,
+    engine: str,
+    experiment_id: str,
+    *,
+    filters: dict[str, str] | None = None,
+    include_body: bool = True,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    select = """
+            SELECT m.match_id, m.competition, m.season, m.kickoff,
+                   m.home_id, m.home_name, m.away_id, m.away_name,
+                   r.ft_home, r.ft_away, r.ht_home, r.ht_away,
+                   er.status AS engine_status,
+                   ev.metrics_json AS metrics_json
+    """
+    if include_body:
+        select += ",\n                   pr.body_json AS body_json"
+    join_sql, join_params = _match_join_sql(
+        engine, experiment_id, include_body=include_body
+    )
+    where_sql, where_params = _sql_filter_clauses(filters)
+    sql = select + join_sql + where_sql + _order_sql(filters)
+    params: list[Any] = [*join_params, *where_params]
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([int(limit), int(offset)])
+    rows = connection.execute(sql, params).fetchall()
+    return _enrich_match_rows(connection, rows, include_body=include_body)
+
+
+def _count_matches(
+    connection: sqlite3.Connection,
+    engine: str,
+    experiment_id: str,
+    filters: dict[str, str] | None = None,
+) -> int:
+    join_sql, join_params = _match_join_sql(
+        engine, experiment_id, include_body=False
+    )
+    where_sql, where_params = _sql_filter_clauses(filters)
+    row = connection.execute(
+        "SELECT COUNT(*) AS n " + join_sql + where_sql,
+        [*join_params, *where_params],
+    ).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def _load_match_page(
+    connection: sqlite3.Connection,
+    filters: dict[str, str],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Return ``(total_matching, enriched page window)`` for the Matches screen."""
+
+    engine = filters.get("engine") or "score_model"
+    experiment_id = filters.get("experiment") or BOT_EXPERIMENT_ID
+    page = _page_number(filters)
+    offset = (page - 1) * PAGE_SIZE
+
+    if _needs_metrics_postfilter(filters):
+        # Verdict / confidence need metrics (and maybe body) before paging.
+        candidates = _load(
+            connection,
+            engine,
+            experiment_id,
+            filters=filters,
+            include_body=_needs_body_postfilter(filters),
+        )
+        matched = _apply(candidates, filters)
+        total = len(matched)
+        window = matched[offset : offset + PAGE_SIZE]
+        if not _needs_body_postfilter(filters):
+            _attach_prediction_bodies(
+                connection,
+                window,
+                engine=engine,
+                experiment_id=experiment_id,
+            )
+        return total, window
+
+    total = _count_matches(connection, engine, experiment_id, filters)
+    if total == 0:
+        return 0, []
+    # Re-clamp page against total so OFFSET stays valid.
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, pages)
+    offset = (page - 1) * PAGE_SIZE
+    window = _load(
+        connection,
+        engine,
+        experiment_id,
+        filters=filters,
+        include_body=False,
+        limit=PAGE_SIZE,
+        offset=offset,
+    )
+    _attach_prediction_bodies(
+        connection,
+        window,
+        engine=engine,
+        experiment_id=experiment_id,
+    )
+    return total, window
 
 
 def _apply(rows: list[dict[str, Any]], filters: dict[str, str]) -> list[dict[str, Any]]:
@@ -608,6 +1152,11 @@ def _apply(rows: list[dict[str, Any]], filters: dict[str, str]) -> list[dict[str
         verdict = _verdict(row["metrics"])
         if filters["verdict"] != "all" and verdict != filters["verdict"]:
             continue
+        min_confidence = _confidence_threshold(filters.get("confidence") or "all")
+        if min_confidence is not None:
+            sample = _ft_selection_sample(row)
+            if sample is None or sample[0] < min_confidence:
+                continue
         chosen.append(row)
     if filters["order"] == "oldest":
         chosen.sort(key=lambda item: (item["kickoff"], item["match_id"]))
@@ -618,6 +1167,8 @@ def _choices(
     rows: list[dict[str, Any]],
     league: str = "",
 ) -> tuple[list[str], list[str], list[str]]:
+    """Build filter dropdowns from an already-loaded row set (tests / legacy)."""
+
     leagues = sorted({str(row.get("competition") or "PL") for row in rows})
     scoped = [
         row for row in rows if not league or str(row.get("competition") or "") == league
@@ -633,6 +1184,61 @@ def _choices(
             for row in scoped
         }
     )
+    return leagues, seasons, teams
+
+
+def _filter_choices(
+    connection: sqlite3.Connection,
+    league: str = "",
+) -> tuple[list[str], list[str], list[str]]:
+    """Lightweight DISTINCT queries for Matches/Overview filter dropdowns."""
+
+    leagues = [
+        str(row["competition"] or "PL")
+        for row in connection.execute(
+            """
+            SELECT DISTINCT competition FROM matches
+            WHERE competition IS NOT NULL AND competition != ''
+            ORDER BY competition
+            """
+        )
+    ]
+    season_sql = "SELECT DISTINCT season FROM matches"
+    season_params: list[Any] = []
+    if league:
+        season_sql += " WHERE competition = ?"
+        season_params.append(league.upper())
+    season_sql += " ORDER BY season"
+    seasons = [
+        str(row["season"])
+        for row in connection.execute(season_sql, season_params)
+        if row["season"] is not None
+    ]
+    team_sql = """
+        SELECT DISTINCT label FROM (
+            SELECT COALESCE(NULLIF(t.display_name, ''), m.home_name) AS label
+            FROM matches m
+            LEFT JOIN teams t ON t.team_id = m.home_id
+            {where}
+            UNION
+            SELECT COALESCE(NULLIF(t.display_name, ''), m.away_name) AS label
+            FROM matches m
+            LEFT JOIN teams t ON t.team_id = m.away_id
+            {where}
+        )
+        WHERE label IS NOT NULL AND label != ''
+        ORDER BY label
+    """
+    if league:
+        where = "WHERE m.competition = ?"
+        team_params = [league.upper(), league.upper()]
+    else:
+        where = ""
+        team_params = []
+    teams = [
+        str(row["label"])
+        for row in connection.execute(team_sql.format(where=where), team_params)
+    ]
     return leagues, seasons, teams
 
 
@@ -880,6 +1486,243 @@ def _calibration_chart(rows: list[dict[str, Any]]) -> str:
     )
 
 
+def _ft_1x2_from_body(body: dict[str, Any] | None) -> tuple[str | None, float | None]:
+    """Return (selection, probability) for the FT 1X2 pick from a prediction body."""
+
+    markets = _prediction_market_confidences(body)
+    item = markets.get("full_time_1x2") or {}
+    selection = item.get("selection")
+    confidence = item.get("confidence")
+    return (
+        None if selection is None else str(selection),
+        None if confidence is None else float(confidence),
+    )
+
+
+def _prediction_market_confidences(
+    body: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Pick + confidence for FT 1X2, HT, exact score, O/U 2.5, and O/U 3.5."""
+
+    empty = {
+        "full_time_1x2": {"label": "FT 1X2", "selection": None, "confidence": None},
+        "half_time_1x2": {"label": "HT", "selection": None, "confidence": None},
+        "exact_score": {"label": "Score", "selection": None, "confidence": None},
+        "over_under_2_5": {"label": "Goals 2.5", "selection": None, "confidence": None},
+        "over_under_3_5": {"label": "Goals 3.5", "selection": None, "confidence": None},
+    }
+    if not body:
+        return empty
+
+    def _clamp(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number:  # NaN
+            return None
+        return max(0.0, min(1.0, number))
+
+    def _result_pick(market: dict[str, Any]) -> tuple[str | None, float | None]:
+        selection = market.get("most_likely")
+        if not selection:
+            return None, None
+        label = str(selection)
+        return label, _clamp(market.get(label))
+
+    def _ou_pick(market: dict[str, Any]) -> tuple[str | None, float | None]:
+        selection = market.get("most_likely")
+        if selection in {"over", "under"}:
+            return str(selection), _clamp(market.get(selection))
+        try:
+            over = float(market.get("over"))
+        except (TypeError, ValueError):
+            return None, None
+        under = _clamp(market.get("under", 1.0 - over))
+        over_c = _clamp(over)
+        if over_c is None or under is None:
+            return None, None
+        if over_c >= under:
+            return "over", over_c
+        return "under", under
+
+    out = dict(empty)
+    if body.get("engine") in ("poisson", "score_model"):
+        full_time = body.get("full_time") or {}
+        sel, conf = _result_pick(full_time.get("result_1x2") or {})
+        out["full_time_1x2"] = {
+            "label": "FT 1X2",
+            "selection": None if sel is None else sel.replace("_", " ").title(),
+            "confidence": conf,
+        }
+        half = body.get("half_time") or {}
+        if half.get("withheld"):
+            out["half_time_1x2"] = {
+                "label": "HT",
+                "selection": "withheld",
+                "confidence": None,
+            }
+        else:
+            sel, conf = _result_pick(half.get("result_1x2") or {})
+            out["half_time_1x2"] = {
+                "label": "HT",
+                "selection": None if sel is None else sel.replace("_", " ").title(),
+                "confidence": conf,
+            }
+        mode = full_time.get("exact_score_most_likely") or {}
+        cells = full_time.get("exact_scores") or []
+        if mode:
+            home = mode.get("home_goals")
+            away = mode.get("away_goals")
+            chance = None
+            for cell in cells:
+                if int(cell.get("home_goals", -1)) == int(home) and int(
+                    cell.get("away_goals", -1)
+                ) == int(away):
+                    chance = _clamp(cell.get("probability"))
+                    break
+            out["exact_score"] = {
+                "label": "Score",
+                "selection": f"{home}–{away}",
+                "confidence": chance,
+            }
+        sel, conf = _ou_pick(full_time.get("over_under_2_5") or {})
+        out["over_under_2_5"] = {
+            "label": "Goals 2.5",
+            "selection": None if sel is None else sel.title(),
+            "confidence": conf,
+        }
+        sel, conf = _ou_pick(full_time.get("over_under_3_5") or {})
+        out["over_under_3_5"] = {
+            "label": "Goals 3.5",
+            "selection": None if sel is None else sel.title(),
+            "confidence": conf,
+        }
+        return out
+
+    # Flat Gemini-shaped bodies.
+    sel, conf = _result_pick(body.get("full_time_1x2") or {})
+    if sel is None and body.get("full_time_most_likely"):
+        sel = str(body.get("full_time_most_likely"))
+        conf = _clamp((body.get("full_time_1x2") or {}).get(sel))
+    out["full_time_1x2"] = {
+        "label": "FT 1X2",
+        "selection": None if sel is None else sel.replace("_", " ").title(),
+        "confidence": conf,
+    }
+    if body.get("half_time_withheld"):
+        out["half_time_1x2"] = {
+            "label": "HT",
+            "selection": "withheld",
+            "confidence": None,
+        }
+    else:
+        sel, conf = _result_pick(body.get("half_time_1x2") or {})
+        if sel is None and body.get("half_time_most_likely"):
+            sel = str(body.get("half_time_most_likely"))
+            conf = _clamp((body.get("half_time_1x2") or {}).get(sel))
+        out["half_time_1x2"] = {
+            "label": "HT",
+            "selection": None if sel is None else sel.replace("_", " ").title(),
+            "confidence": conf,
+        }
+    mode = body.get("exact_score_most_likely") or {}
+    if mode:
+        out["exact_score"] = {
+            "label": "Score",
+            "selection": f"{mode.get('home_goals')}–{mode.get('away_goals')}",
+            "confidence": None,
+        }
+    for key, label, flat_key in (
+        ("over_under_2_5", "Goals 2.5", "over_under_2_5"),
+        ("over_under_3_5", "Goals 3.5", "over_under_3_5"),
+    ):
+        sel, conf = _ou_pick(body.get(flat_key) or {})
+        most = body.get(f"{flat_key}_most_likely")
+        if sel is None and most:
+            sel = str(most)
+            conf = _clamp((body.get(flat_key) or {}).get(sel))
+        out[key] = {
+            "label": label,
+            "selection": None if sel is None else sel.title(),
+            "confidence": conf,
+        }
+    return out
+
+
+def _market_confidence_strip(body: dict[str, Any] | None) -> str:
+    """Compact pick+confidence chips for match cards."""
+
+    markets = _prediction_market_confidences(body)
+    order = (
+        "full_time_1x2",
+        "half_time_1x2",
+        "exact_score",
+        "over_under_2_5",
+        "over_under_3_5",
+    )
+    chips: list[str] = []
+    for key in order:
+        item = markets[key]
+        selection = item.get("selection")
+        if not selection:
+            continue
+        conf = item.get("confidence")
+        conf_html = (
+            f'<span class="ft-conf mono">{float(conf):.0%}</span>'
+            if conf is not None
+            else ""
+        )
+        chips.append(
+            '<span class="market-chip">'
+            f'<span class="market-chip-label">{html.escape(str(item["label"]))}</span>'
+            f'<span class="market-chip-pick">{html.escape(str(selection))}</span>'
+            f"{conf_html}"
+            "</span>"
+        )
+    if not chips:
+        return ""
+    return f'<div class="market-strip" aria-label="Market confidences">{"".join(chips)}</div>'
+
+
+def _market_confidence_panel(body: dict[str, Any] | None) -> str:
+    """Detail panel listing each market pick with confidence."""
+
+    markets = _prediction_market_confidences(body)
+    order = (
+        "full_time_1x2",
+        "half_time_1x2",
+        "exact_score",
+        "over_under_2_5",
+        "over_under_3_5",
+    )
+    cards: list[str] = []
+    for key in order:
+        item = markets[key]
+        selection = item.get("selection") or "—"
+        conf = item.get("confidence")
+        conf_html = (
+            f'<span class="ft-conf mono">{float(conf):.0%}</span>'
+            if conf is not None
+            else '<span class="ft-conf muted">—</span>'
+        )
+        cards.append(
+            '<article class="ft-pick market-conf-card" role="group" '
+            f'aria-label="{html.escape(str(item["label"]))} '
+            f'{html.escape(str(selection))}'
+            f'{f", {float(conf):.0%}" if conf is not None else ""}">'
+            f'<span class="ft-pick-label">{html.escape(str(item["label"]))}</span>'
+            f'<strong class="ft-pick-value">{html.escape(str(selection))}</strong>'
+            f"{conf_html}"
+            "</article>"
+        )
+    return (
+        '<div class="market-conf-grid" role="group" aria-label="Prediction confidences">'
+        f"{''.join(cards)}"
+        "</div>"
+    )
+
+
 def _ft_selection_sample(row: dict[str, Any]) -> tuple[float, bool] | None:
     metrics = row.get("metrics") or {}
     market = metrics.get("full_time_1x2") or {}
@@ -947,16 +1790,12 @@ def _match_table(rows: list[dict[str, Any]], filters: dict[str, str]) -> str:
         score = "—"
         if row["ft_home"] is not None:
             score = f"{row['ft_home']}–{row['ft_away']}"
-        pick = "—"
         predicted = "—"
         body = row.get("body") or {}
-        if body.get("engine") in ("poisson", "score_model"):
-            market = body.get("full_time", {}).get("result_1x2") or {}
-            mode = body.get("full_time", {}).get("exact_score_most_likely") or {}
-            if market.get("most_likely"):
-                pick = str(market["most_likely"]).replace("_", " ").title()
-            if mode:
-                predicted = f"{mode.get('home_goals')}–{mode.get('away_goals')}"
+        markets = _prediction_market_confidences(body)
+        score_pick = markets.get("exact_score") or {}
+        if score_pick.get("selection"):
+            predicted = str(score_pick["selection"])
         verdict = _verdict(row["metrics"])
         status = verdict if verdict != "unscored" else (row["engine_status"] or "pending")
         match_id = str(row["match_id"])
@@ -988,11 +1827,11 @@ def _match_table(rows: list[dict[str, Any]], filters: dict[str, str]) -> str:
             f'<span class="club-name away">'
             f'<span class="club-text">{html.escape(away_label)}</span>{away_crest}</span>'
             f"</div>"
+            f'{_market_confidence_strip(body)}'
             f'<div class="match-sub">'
             f'<span class="match-meta">'
             f'<span class="league-chip">{league_mark}{league}</span>'
             f"<span>{_when_short(row['kickoff'])}</span>"
-            f'<span class="pick">1X2 · {html.escape(pick)}</span>'
             f"</span>"
             f"{_badge(status)}"
             f"</div>"
@@ -1071,6 +1910,18 @@ def _filter_form(
             },
         )}</select>
       </label>
+      <label>FT confidence
+        <select name="confidence">{_options(
+            ["all", "45", "55", "65"],
+            filters.get("confidence") or "all",
+            labels={
+                "all": "Any",
+                "45": "≥ 45%",
+                "55": "≥ 55%",
+                "65": "≥ 65%",
+            },
+        )}</select>
+      </label>
       <label>Order
         <select name="order">{_options(
             ["newest", "oldest"],
@@ -1136,20 +1987,24 @@ def _scoreboard(
     home_id = str(match["home_id"])
     away_id = str(match["away_id"])
     code = str(match["competition"] or "PL").upper()
-    home_crest = crest_url_for_team(home_id)
-    away_crest = crest_url_for_team(away_id)
+    # Prefer DB + local cache; never block match detail on crest HTTP (same as match list).
+    home_crest = None
+    away_crest = None
     home_label = _club_label(match, "home")
     away_label = _club_label(match, "away")
-    league_emblem = emblem_url_for_competition(code)
+    league_emblem = None
     if connection is not None:
         crests = team_crest_map(connection, [home_id, away_id])
         displays = team_display_map(connection, [home_id, away_id])
-        emblems = competition_emblem_map(connection, [code])
-        home_crest = crests.get(home_id) or home_crest
-        away_crest = crests.get(away_id) or away_crest
+        emblems = competition_emblem_map(connection, [code], fetch=False)
+        home_crest = crests.get(home_id)
+        away_crest = crests.get(away_id)
         home_label = displays.get(home_id) or home_label
         away_label = displays.get(away_id) or away_label
-        league_emblem = emblems.get(code) or league_emblem
+        league_emblem = emblems.get(code)
+    home_crest = home_crest or crest_url_for_team(home_id, fetch=False)
+    away_crest = away_crest or crest_url_for_team(away_id, fetch=False)
+    league_emblem = league_emblem or emblem_url_for_competition(code, fetch=False)
 
     def club_row(side: str, crest: str | None, name: str, goals: str) -> str:
         return (
@@ -1207,12 +2062,22 @@ def _facts(match: sqlite3.Row, snapshot: sqlite3.Row | None) -> str:
             )
             + f'<section class="cards compact">{match_id_card}</section>'
         )
-    payload = json.loads(snapshot["payload_json"])
-    leakage = "passed" if payload.get("leakage_ok") else "failed"
+    # Prefer slim query columns (leakage_ok / json_extract). Legacy rows with payload_json still work.
+    if "payload_json" in snapshot.keys():
+        payload = json.loads(snapshot["payload_json"] or "{}")
+        coverage = payload.get("coverage") or {}
+        prior_ft = coverage.get("prior_full_time_matches", "—")
+        prior_ht = coverage.get("prior_half_time_matches", "—")
+        leakage_ok = payload.get("leakage_ok")
+    else:
+        prior_ft = snapshot["prior_ft"] if snapshot["prior_ft"] is not None else "—"
+        prior_ht = snapshot["prior_ht"] if snapshot["prior_ht"] is not None else "—"
+        leakage_ok = bool(snapshot["leakage_ok"])
+    leakage = "passed" if leakage_ok else "failed"
     return f"""
     <section class="cards compact">
-      <article><span>Prior matches</span><strong>{payload['coverage']['prior_full_time_matches']}</strong></article>
-      <article><span>Prior HT samples</span><strong>{payload['coverage']['prior_half_time_matches']}</strong></article>
+      <article><span>Prior matches</span><strong>{html.escape(str(prior_ft))}</strong></article>
+      <article><span>Prior HT samples</span><strong>{html.escape(str(prior_ht))}</strong></article>
       <article><span>Leakage</span><strong>{leakage}</strong></article>
       {match_id_card}
     </section>
@@ -1231,6 +2096,11 @@ def _comparison(
             lead="Full-time score is not stored yet, so market comparison stays pending.",
         )
     metrics = _json(evaluation["metrics_json"]) if evaluation else {}
+    try:
+        body = _json(prediction["body_json"]) if prediction is not None else {}
+    except (KeyError, IndexError):
+        body = {}
+    confidences = _prediction_market_confidences(body)
     actual_ft = _outcome(int(result["ft_home"]), int(result["ft_away"]))
     labels = {
         "full_time_1x2": ("Full-time result", actual_ft),
@@ -1249,14 +2119,17 @@ def _comparison(
         ),
     }
     rows = [
-        "<tr><th>Market</th><th>Pick</th><th>Actual</th>"
+        "<tr><th>Market</th><th>Pick</th><th>Confidence</th><th>Actual</th>"
         "<th>Check</th><th>Log loss</th><th>Brier</th></tr>"
     ]
     for key, (label, actual) in labels.items():
         market = (metrics or {}).get(key) or {}
+        conf = (confidences.get(key) or {}).get("confidence")
+        conf_cell = "—" if conf is None else f"{float(conf):.0%}"
         if market.get("status") != "scored":
             rows.append(
-                f"<tr><td>{label}</td><td>—</td><td>{html.escape(str(actual or '—'))}</td>"
+                f"<tr><td>{label}</td><td>—</td><td>{conf_cell}</td>"
+                f"<td>{html.escape(str(actual or '—'))}</td>"
                 f"<td>{_badge('withheld' if market.get('status') == 'withheld' else 'pending')}</td>"
                 "<td>—</td><td>—</td></tr>"
             )
@@ -1272,6 +2145,7 @@ def _comparison(
             "<tr>"
             f"<td>{label}</td>"
             f"<td>{html.escape(str(selection).replace('_', ' '))}</td>"
+            f"<td>{conf_cell}</td>"
             f"<td>{html.escape(str(actual))}</td>"
             f"<td>{_badge('correct' if market.get('correct') else 'incorrect')}</td>"
             f"<td>{log_cell}</td>"
@@ -1301,7 +2175,9 @@ def _engine_panel(
                 f"<p>λ home {body['lambda_home']:.2f} · λ away {body['lambda_away']:.2f} · "
                 f"k={body.get('k', '—')} · priors {body.get('prior_match_count', '—')}</p>"
             ),
-            _prob_row("Home", market["home"])
+            _market_confidence_panel(body),
+            "<h3>Full time 1X2</h3>"
+            + _prob_row("Home", market["home"])
             + _prob_row("Draw", market["draw"])
             + _prob_row("Away", market["away"]),
             _most_likely_score(mode, body["full_time"].get("exact_scores") or []),
@@ -1328,7 +2204,10 @@ def _engine_panel(
             items = "".join(f"<li>{html.escape(item)}</li>" for item in notes)
             lines.append(f"<ul class=\"notes\">{items}</ul>")
     else:
-        lines = [f"<p>{html.escape(str(body.get('analysis') or 'No nested markets.'))}</p>"]
+        lines = [
+            _market_confidence_panel(body),
+            f"<p>{html.escape(str(body.get('analysis') or 'No nested markets.'))}</p>",
+        ]
     return (
         f'<section class="panel"><h2>{html.escape(title)} '
         f'<span class="model">{html.escape(model_id)}</span> {status}</h2>'
@@ -1391,12 +2270,14 @@ def _over_under_cards(over_25: dict[str, Any], over_35: dict[str, Any]) -> str:
         over_w = max(0.0, min(100.0, over * 100))
         under_w = max(0.0, min(100.0, under * 100))
         lean = "Over" if lean_over else "Under"
+        confidence = over if lean_over else under
         return (
             f'<article class="ou-card{" is-over" if lean_over else " is-under"}" '
-            f'aria-label="Over {html.escape(line)}">'
+            f'aria-label="Goals {html.escape(line)} {html.escape(lean)} '
+            f'{confidence:.0%}">'
             f'<div class="ou-top">'
             f'<span class="ou-label">Goals {html.escape(line)}</span>'
-            f'<span class="ou-chip">{html.escape(lean)} lean</span>'
+            f'<span class="ou-chip">{html.escape(lean)} · {confidence:.0%}</span>'
             f"</div>"
             f'<div class="ou-sides">'
             f'<div class="ou-side{" active" if lean_over else ""}">'
@@ -1748,6 +2629,21 @@ def _state(
     )
 
 
+def _confidence_threshold(value: str) -> float | None:
+    """Parse FT confidence filter (`45` / `55` / `65`) into a probability floor."""
+
+    text = (value or "all").strip().casefold()
+    if text in {"", "all", "any"}:
+        return None
+    try:
+        percent = float(text)
+    except ValueError:
+        return None
+    if percent <= 0:
+        return None
+    return percent / 100.0 if percent > 1 else percent
+
+
 def _default_filters() -> dict[str, str]:
     return {
         "engine": "score_model",
@@ -1760,6 +2656,7 @@ def _default_filters() -> dict[str, str]:
         "fixture": "all",
         "status": "all",
         "verdict": "all",
+        "confidence": "all",
         "order": "newest",
         "page": "1",
     }
@@ -1799,6 +2696,31 @@ def server_error_page(*, detail: str = "") -> str:
                 ),
             ]
         ),
+    )
+
+
+def database_busy_page(*, retry_href: str = "/experiments") -> str:
+    """Soft wait page when SQLite returns database is locked (lab-run writers)."""
+
+    return _page(
+        "Database busy",
+        "\n".join(
+            [
+                _masthead("Database busy", _default_filters(), active="experiments"),
+                _state(
+                    kind="loading",
+                    title="Database is busy",
+                    lead=(
+                        "A lab experiment is writing to SQLite (WAL). "
+                        "This page retries automatically — or open Experiments after a moment. "
+                        "If it persists: make dash-restart, then retry with a smaller grid."
+                    ),
+                    action_href=retry_href,
+                    action_label="Retry now",
+                ),
+            ]
+        ),
+        extra_head='<meta http-equiv="refresh" content="3">',
     )
 
 
@@ -1957,6 +2879,7 @@ def _masthead(
         {link(overview_href, "Overview", "overview")}
         {link(match_href, "Matches", "matches")}
         {link("/standings", "Standings", "standings")}
+        {link("/experiments", "Experiments", "experiments")}
         {logout}
       </nav>
       <div class="title-row">{back}<h1>{html.escape(title)}</h1></div>
@@ -1964,7 +2887,7 @@ def _masthead(
     """
 
 
-def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
+def _page(title: str, body: str, filters: dict[str, str] | None = None, *, extra_head: str = "") -> str:
     _ = filters
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1972,6 +2895,7 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
+  {extra_head}
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
@@ -2176,6 +3100,35 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
     .job-cards .job-ok {{ color: var(--accent); }}
     .job-cards .job-failed {{ color: #f87171; }}
     .job-cards p {{ margin: 6px 0 0; color: var(--muted); font-size: 0.85rem; line-height: 1.35; }}
+    .jobs-header {{
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 12px 16px; margin-bottom: 16px;
+    }}
+    .jobs-title-wrap h2 {{ margin: 0; font-size: 1.05rem; }}
+    .jobs-title-wrap p.note {{ margin: 4px 0 0; font-size: 0.85rem; }}
+    .sync-form {{ margin: 0; display: inline-flex; }}
+    .sync-btn {{
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: 44px; padding: 0 16px; border: 0; border-radius: var(--radius-sm);
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      color: #042f24; font: inherit; font-size: 0.9rem; font-weight: 700;
+      letter-spacing: -0.01em; cursor: pointer;
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2);
+      transition: transform 160ms var(--ease), filter 160ms var(--ease);
+    }}
+    .sync-btn:hover {{ filter: brightness(1.05); }}
+    .sync-btn:active {{ transform: scale(0.96); }}
+    .sync-btn:disabled {{
+      opacity: 0.65; cursor: not-allowed; filter: none; transform: none; box-shadow: none;
+    }}
+    .sync-breakdown {{ margin: 16px 0; overflow-x: auto; }}
+    .sync-table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+    .sync-table th, .sync-table td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); }}
+    .sync-table th {{
+      color: var(--muted); font-size: 0.75rem; text-transform: uppercase;
+      font-weight: 600; letter-spacing: 0.04em;
+    }}
+    .sync-table tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
     .predict-panel {{ margin: 16px 0; }}
     .predict-form {{
       display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px;
@@ -2526,6 +3479,14 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
       border-style: solid; border-color: rgba(56, 189, 248, 0.35);
       background: rgba(56, 189, 248, 0.06);
     }}
+    .state-wait {{
+      border-style: solid; border-color: rgba(251, 191, 36, 0.45);
+      background: rgba(251, 191, 36, 0.08);
+    }}
+    .state-good {{
+      border-style: solid; border-color: rgba(52, 211, 153, 0.45);
+      background: rgba(52, 211, 153, 0.08);
+    }}
     .state-loading {{
       display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
       border-style: solid; border-color: rgba(52, 211, 153, 0.35);
@@ -2617,6 +3578,47 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
       text-transform: uppercase; letter-spacing: 0.04em; line-height: 1;
     }}
     .pick {{ color: var(--muted); font-size: inherit; font-weight: 500; }}
+    .market-strip {{
+      display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    }}
+    .market-chip {{
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 6px; border-radius: 4px;
+      border: 1px solid var(--line); background: rgba(11, 18, 32, 0.55);
+      font-size: 0.68rem; line-height: 1.2; color: var(--muted);
+    }}
+    .market-chip-label {{
+      font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+      color: var(--muted);
+    }}
+    .market-chip-pick {{ color: var(--text); font-weight: 650; }}
+    .market-chip .ft-conf, .ft-conf {{
+      margin-left: 2px; padding: 1px 5px; border-radius: 4px;
+      background: rgba(56, 189, 248, 0.12); color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.28); font-size: 0.66rem; font-weight: 700;
+    }}
+    .ft-conf.muted {{
+      background: transparent; color: var(--muted); border-color: transparent;
+    }}
+    .market-conf-grid {{
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px; margin: 0 0 14px;
+    }}
+    .ft-pick, .market-conf-card {{
+      display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin: 0; padding: 8px 12px; border-radius: var(--radius-sm);
+      border: 1px solid var(--line); background: rgba(11, 18, 32, 0.55);
+    }}
+    .ft-pick-label {{
+      color: var(--muted); font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }}
+    .ft-pick-value {{ font-size: 1rem; letter-spacing: -0.02em; }}
+    .ft-pick .ft-conf, .market-conf-card .ft-conf {{
+      padding: 2px 8px; border-radius: 4px;
+      background: rgba(56, 189, 248, 0.14); color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.3); font-size: 0.85rem; font-weight: 700;
+    }}
     .match-sub .league-chip {{ gap: 8px; }}
     .match-sub .emblem {{ padding: 4px; border-radius: 4px; }}
     table.standings {{ table-layout: auto; }}
@@ -2781,6 +3783,194 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
       }}
       .prob .meter {{ order: 1; }}
     }}
+    .pill {{
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 8px; padding: 8px 14px; min-height: 44px; min-width: 44px;
+      border-radius: 999px; cursor: pointer; border: 1px solid var(--line);
+      background: rgba(11, 18, 32, 0.55); font-size: 0.9rem; font-weight: 600;
+      color: var(--muted); transition: background 160ms var(--ease), border-color 160ms var(--ease), color 160ms var(--ease);
+      user-select: none;
+      white-space: nowrap;
+    }}
+    .pill:hover {{ border-color: #35506f; color: var(--text); }}
+    .pill.active,
+    .pill:has(input:checked) {{
+      color: #042f24;
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      border-color: transparent;
+      font-weight: 600;
+    }}
+    .pill.active span,
+    .pill:has(input:checked) span {{
+      color: #042f24;
+    }}
+    .pill:has(input:focus-visible) {{
+      outline: 2px solid var(--focus); outline-offset: 2px;
+    }}
+    .pill input[type="checkbox"] {{
+      width: 0; height: 0; opacity: 0; position: absolute; pointer-events: none;
+    }}
+    .pill .emblem {{
+      width: 24px; height: 24px; padding: 4px; box-sizing: border-box;
+      flex-shrink: 0; display: block; object-fit: contain; margin: 0;
+    }}
+    .btn-danger {{
+      min-height: 44px; padding: 8px 16px; background: transparent;
+      color: var(--bad); border: 1px solid var(--bad); border-radius: var(--radius-sm);
+      font-weight: 600; font-size: 0.85rem; cursor: pointer;
+      transition: background 160ms var(--ease), transform 160ms var(--ease);
+    }}
+    .btn-danger:hover {{ background: rgba(251, 113, 133, 0.15); }}
+    .btn-danger:active {{ transform: scale(0.97); }}
+    .btn-rerun {{
+      min-height: 44px; padding: 8px 16px; border: none;
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      color: #042f24; border-radius: var(--radius-sm);
+      font-weight: 700; font-size: 0.85rem; cursor: pointer;
+      transition: filter 160ms var(--ease), transform 160ms var(--ease);
+    }}
+    .btn-rerun:hover {{ filter: brightness(1.05); }}
+    .btn-rerun:active {{ transform: scale(0.97); }}
+    .btn-rerun:disabled {{
+      opacity: 0.45; cursor: not-allowed; filter: none; transform: none;
+    }}
+    .exp-actions {{
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end;
+    }}
+    .btn-secondary {{
+      min-height: 44px; padding: 8px 16px; background: rgba(255, 255, 255, 0.06);
+      color: var(--text); border: 1px solid var(--line); border-radius: var(--radius-sm);
+      font-weight: 600; font-size: 0.85rem; cursor: pointer;
+      transition: background 160ms var(--ease), border-color 160ms var(--ease);
+    }}
+    .btn-secondary:hover {{
+      background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2);
+    }}
+    dialog.confirm-dialog {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      padding: 0;
+      color: var(--text);
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.65);
+      max-width: 460px;
+      width: calc(100vw - 32px);
+      margin: auto;
+    }}
+    dialog.confirm-dialog::backdrop {{
+      background: rgba(4, 7, 13, 0.78);
+      backdrop-filter: blur(4px);
+    }}
+    .confirm-dialog-content {{
+      padding: 24px;
+    }}
+    .confirm-dialog-header {{
+      display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+    }}
+    .confirm-dialog-icon {{
+      font-size: 1.4rem; line-height: 1;
+    }}
+    .confirm-dialog-header h3 {{
+      margin: 0; font-size: 1.15rem; color: var(--text); font-weight: 600;
+    }}
+    .confirm-dialog-text {{
+      font-size: 0.95rem; margin: 0 0 8px; color: var(--text);
+    }}
+    .confirm-dialog-sub {{
+      font-size: 0.82rem; line-height: 1.5; color: var(--muted); margin: 0 0 20px;
+    }}
+    .confirm-dialog-actions {{
+      display: flex; justify-content: flex-end; align-items: center; gap: 10px;
+      padding-top: 14px; border-top: 1px solid var(--line);
+    }}
+    .experiment-grid {{ display: grid; gap: 16px; margin: 16px 0; }}
+    .experiment-card {{
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: var(--radius-md); padding: 20px 24px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+      transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease);
+    }}
+    .experiment-card:hover {{
+      border-color: rgba(52, 211, 153, 0.35); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+    }}
+    .exp-top-row {{
+      display: flex; flex-wrap: wrap; align-items: center;
+      justify-content: space-between; gap: 12px; margin-bottom: 12px;
+    }}
+    .exp-title-group {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }}
+    .exp-title-group h3 {{ margin: 0; font-size: 1.1rem; color: var(--text); }}
+    .exp-hero {{
+      display: flex; flex-wrap: wrap; gap: 16px 28px; align-items: baseline;
+      margin: 14px 0 12px; padding: 14px 18px; background: rgba(11, 18, 32, 0.5);
+      border: 1px solid var(--line); border-radius: var(--radius-sm);
+    }}
+    .exp-hero .hero-metric {{ display: flex; flex-direction: column; gap: 2px; }}
+    .exp-hero .num {{ font: 600 1.55rem/1.1 "IBM Plex Mono", monospace; letter-spacing: -0.02em; }}
+    .exp-hero .label {{ font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
+    .metric-win {{ color: var(--good); font-weight: 700; }}
+    .scope-badges {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
+    .scope-badge {{
+      display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+      font-size: 0.75rem; font-weight: 600; background: rgba(148, 163, 184, 0.12);
+      border: 1px solid var(--line); color: var(--muted);
+    }}
+    .scope-badge.league {{ color: var(--accent); border-color: rgba(52, 211, 153, 0.3); }}
+    .scope-badge .emblem {{
+      width: 16px; height: 16px; padding: 2px; border-radius: 4px;
+      box-sizing: border-box; flex-shrink: 0; display: inline-block; object-fit: contain; margin: 0;
+    }}
+    .pass-bar-wrap {{ width: 100%; margin-top: 8px; }}
+    .pass-bar {{ height: 6px; border-radius: 999px; background: rgba(52, 211, 153, 0.2); overflow: hidden; position: relative; }}
+    .pass-bar.has-failures {{ background: rgba(251, 113, 133, 0.3); }}
+    .pass-bar .fill {{ display: block; height: 100%; border-radius: 999px; background: var(--good); }}
+    .pass-bar.running {{ background: rgba(251, 191, 36, 0.2); }}
+    .pass-bar.running .fill {{
+      background: var(--wait);
+      animation: bar-pulse 1.8s ease-in-out infinite;
+    }}
+    @keyframes bar-pulse {{
+      0% {{ width: 20%; margin-left: 0%; }}
+      50% {{ width: 50%; margin-left: 35%; }}
+      100% {{ width: 20%; margin-left: 80%; }}
+    }}
+    .exp-card-footer {{
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+    }}
+    .error-box {{
+      background: rgba(251, 113, 133, 0.08); border: 1px solid var(--bad);
+      border-radius: var(--radius-sm); padding: 16px; margin: 16px 0;
+    }}
+    .error-box h3 {{ margin: 0 0 8px; color: var(--bad); font-size: 0.95rem; }}
+    .error-box pre {{
+      margin: 0; font: 0.8rem/1.45 "IBM Plex Mono", monospace; color: var(--text);
+      white-space: pre-wrap; word-break: break-all; max-height: 280px; overflow-y: auto;
+    }}
+    .prompt-export-panel {{
+      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-md);
+      padding: 20px; margin: 24px 0;
+    }}
+    .prompt-header {{
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; margin-bottom: 12px;
+    }}
+    .prompt-header h3 {{ margin: 0; font-size: 1.05rem; color: var(--text); }}
+    .copy-prompt-btn {{
+      min-height: 44px; padding: 8px 18px; font-weight: 600; cursor: pointer;
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      color: #042f24; border: none; border-radius: var(--radius-sm);
+      display: inline-flex; align-items: center; gap: 8px;
+      transition: filter 160ms var(--ease), background 160ms var(--ease);
+    }}
+    .copy-prompt-btn:hover {{ filter: brightness(1.08); }}
+    .copy-prompt-btn.is-copied {{ background: #10b981; color: #ffffff; }}
+    .prompt-export-panel textarea {{
+      width: 100%; min-height: 240px; box-sizing: border-box;
+      font: 0.82rem/1.5 "IBM Plex Mono", monospace; background: var(--bg);
+      color: var(--text); border: 1px solid var(--line); border-radius: var(--radius-sm);
+      padding: 14px; resize: vertical;
+    }}
+    .pills-group {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 12px; }}
     @media (prefers-reduced-motion: reduce) {{
       *, *::before, *::after {{
         animation: none !important;
@@ -2796,9 +3986,14 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
   </main>
   <script>
     document.addEventListener("click", async (event) => {{
-      const button = event.target.closest("[data-copy]");
+      const button = event.target.closest("[data-copy], [data-copy-target]");
       if (!(button instanceof HTMLButtonElement)) return;
-      const value = button.getAttribute("data-copy") || "";
+      let value = button.getAttribute("data-copy") || "";
+      const targetId = button.getAttribute("data-copy-target");
+      if (targetId) {{
+        const el = document.getElementById(targetId);
+        if (el) value = el.value || el.textContent || "";
+      }}
       if (!value) return;
       try {{
         if (navigator.clipboard && window.isSecureContext) {{
@@ -2815,22 +4010,1020 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None) -> str:
           field.remove();
         }}
         button.classList.add("is-copied");
+        const originalText = button.textContent;
         button.setAttribute("aria-label", "Copied");
         button.title = "Copied";
+        if (targetId) {{
+          button.textContent = "Copied to Clipboard!";
+        }}
         window.clearTimeout(button._copyTimer);
         button._copyTimer = window.setTimeout(() => {{
           button.classList.remove("is-copied");
-          button.setAttribute("aria-label", "Copy match id");
+          button.setAttribute("aria-label", "Copy");
           button.title = "Copy";
-        }}, 1400);
+          if (targetId) {{
+            button.textContent = originalText;
+          }}
+        }}, 1800);
       }} catch (_error) {{
         button.title = "Copy failed";
+      }}
+    }});
+    document.addEventListener("click", (event) => {{
+      if (event.target && event.target.tagName === "DIALOG") {{
+        event.target.close();
       }}
     }});
   </script>
 </body>
 </html>
 """
+
+
+# =====================================================================
+# Lab Experiment Dashboard Views
+# =====================================================================
+
+def _experiment_delete_form(experiment_id: str, csrf_token: str | None) -> str:
+    import re
+    from urllib.parse import quote
+
+    csrf = f'<input type="hidden" name="csrf" value="{html.escape(csrf_token)}">' if csrf_token else ""
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", experiment_id)
+    dialog_id = f"del-dialog-{safe_id}"
+    form_id = f"form-del-{safe_id}"
+    del_url = f"/experiments/{quote(experiment_id, safe='')}/delete"
+
+    return (
+        f'<button type="button" class="btn-danger" '
+        f'onclick="const d=document.getElementById(\'{dialog_id}\'); if(d&&d.showModal){{d.showModal();}}else if(confirm(\'Delete experiment {html.escape(experiment_id)}? This cannot be undone.\')){{document.getElementById(\'{form_id}\').submit();}}">'
+        f'Delete</button>'
+        f'<dialog id="{dialog_id}" class="confirm-dialog">'
+        f'  <div class="confirm-dialog-content">'
+        f'    <div class="confirm-dialog-header">'
+        f'      <span class="confirm-dialog-icon">⚠️</span>'
+        f'      <h3>Delete Experiment</h3>'
+        f'    </div>'
+        f'    <p class="confirm-dialog-text">Are you sure you want to delete <code class="mono">{html.escape(experiment_id)}</code>?</p>'
+        f'    <p class="confirm-dialog-sub">All candidate runs, evaluated model benchmarks, and linked predictions for this experiment will be permanently removed. This action cannot be undone.</p>'
+        f'    <div class="confirm-dialog-actions">'
+        f'      <button type="button" class="btn-secondary" onclick="this.closest(\'dialog\').close()">Cancel</button>'
+        f'      <form id="{form_id}" method="post" action="{del_url}" style="display:inline; margin:0;">'
+        f'        {csrf}'
+        f'        <button type="submit" class="btn-danger">Confirm Delete</button>'
+        f'      </form>'
+        f'    </div>'
+        f'  </div>'
+        f'</dialog>'
+    )
+
+
+def _experiment_rerun_form(
+    experiment_id: str,
+    csrf_token: str | None,
+    *,
+    disabled: bool = False,
+) -> str:
+    """Confirm + POST form to wipe outputs and re-queue ``lab-run`` for this id."""
+
+    import re
+    from urllib.parse import quote
+
+    csrf = f'<input type="hidden" name="csrf" value="{html.escape(csrf_token)}">' if csrf_token else ""
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", experiment_id)
+    dialog_id = f"rerun-dialog-{safe_id}"
+    form_id = f"form-rerun-{safe_id}"
+    rerun_url = f"/experiments/{quote(experiment_id, safe='')}/rerun"
+    disabled_attr = " disabled" if disabled else ""
+    title = "Already running" if disabled else "Re-run with the same stored config"
+
+    return (
+        f'<button type="button" class="btn-rerun"{disabled_attr} title="{html.escape(title)}" '
+        f'onclick="const d=document.getElementById(\'{dialog_id}\'); if(d&&d.showModal){{d.showModal();}}else if(confirm(\'Re-run experiment {html.escape(experiment_id)}? Previous runs for this id will be cleared.\')){{document.getElementById(\'{form_id}\').submit();}}">'
+        f'Re-run</button>'
+        f'<dialog id="{dialog_id}" class="confirm-dialog">'
+        f'  <div class="confirm-dialog-content">'
+        f'    <div class="confirm-dialog-header">'
+        f'      <h3>Re-run Experiment</h3>'
+        f'    </div>'
+        f'    <p class="confirm-dialog-text">Re-queue <code class="mono">{html.escape(experiment_id)}</code> with its stored config?</p>'
+        f'    <p class="confirm-dialog-sub">Candidate runs and linked predictions for this experiment will be cleared, then walk-forward will start again in the background. The experiment row and config are kept.</p>'
+        f'    <div class="confirm-dialog-actions">'
+        f'      <button type="button" class="btn-secondary" onclick="this.closest(\'dialog\').close()">Cancel</button>'
+        f'      <form id="{form_id}" method="post" action="{rerun_url}" style="display:inline; margin:0;">'
+        f'        {csrf}'
+        f'        <button type="submit" class="btn-rerun">Confirm Re-run</button>'
+        f'      </form>'
+        f'    </div>'
+        f'  </div>'
+        f'</dialog>'
+    )
+
+
+def _run_experiment_form(
+    filters: dict[str, str],
+    competitions: list[str] | None = None,
+    seasons: list[str] | None = None,
+    csrf_token: str | None = None,
+    connection: sqlite3.Connection | None = None,
+) -> str:
+    """Multi-competition and multi-season experiment launch form."""
+    from laboratory.football_data import COMPETITION_NAMES
+    from laboratory.store import (
+        competition_emblem_map,
+        emblem_url_for_competition,
+    )
+
+    csrf = f'<input type="hidden" name="csrf" value="{html.escape(csrf_token)}">' if csrf_token else ""
+    available_comps = list(competitions) if competitions else list(COMPETITION_NAMES.keys())
+
+    # Preferred league ordering matching Standings and priority
+    league_order = ("PL", "PD", "FL1", "BL1", "SA", "PPL", "DED", "CL", "SPL")
+    available_comps.sort(key=lambda c: (league_order.index(c) if c in league_order else 99, c))
+
+    emblems = competition_emblem_map(connection, available_comps) if connection else {}
+
+    default_comp = filters.get("league", "PL").upper()
+    comp_pills = []
+    for code in available_comps:
+        checked = ' checked' if code == default_comp else ''
+        name = COMPETITION_NAMES.get(code, code)
+        emblem_url = emblems.get(code) or emblem_url_for_competition(code)
+        logo = _logo_img(emblem_url, name, kind="emblem", size=22)
+        comp_pills.append(
+            f'<label class="pill">'
+            f'<input type="checkbox" name="competitions" value="{html.escape(code)}"{checked}>'
+            f'{logo}<span>{html.escape(name)}</span>'
+            f'</label>'
+        )
+
+    if not seasons:
+        from datetime import datetime
+        cur = datetime.now().year
+        available_szns = [str(cur - 2), str(cur - 1), str(cur)]
+    else:
+        available_szns = seasons
+
+    szn_pills = []
+    for s in available_szns:
+        szn_pills.append(
+            f'<label class="pill">'
+            f'<input type="checkbox" name="seasons" value="{html.escape(s)}" checked>'
+            f'<span>{html.escape(s)}</span>'
+            f'</label>'
+        )
+
+    from laboratory.lab_experiment import example_experiment_launch_json
+
+    example_json = example_experiment_launch_json()
+    example_json_attr = html.escape(example_json, quote=True)
+
+    return f"""
+    <section class="panel run-experiment-panel">
+      <h2>Run New Experiment</h2>
+      <p class="note">Configure and launch background walk-forward grid search. Multiple competitions create a coordinated batch. Prefer the JSON box below for a full config paste; when it is non-empty it overrides the form fields.</p>
+      <form class="run-experiment-form" method="post" action="/experiments/run" style="margin-top:16px;">
+        {csrf}
+        <details class="advanced-params" open style="margin: 0 0 18px; padding: 12px 16px; background: rgba(11,18,32,0.5); border: 1px solid var(--line); border-radius: var(--radius-sm);">
+          <summary style="cursor:pointer; font-weight:600; color:var(--text); font-size:0.9rem;">JSON config (optional — overrides form)</summary>
+          <p class="note" style="margin:10px 0 8px;">Paste a full experiment object. Omitted keys use defaults. <code>seasons</code> is required. Invalid JSON or missing fields return an error without starting a run.</p>
+          <div class="json-config-row" style="display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap;">
+            <label style="flex:1 1 280px; min-width:0; display:block;">
+              <textarea name="config_json" class="mono" rows="16" spellcheck="false" placeholder="{example_json_attr}" style="width:100%; min-height:220px; font: 0.82rem/1.45 'IBM Plex Mono', monospace; background: rgba(4,7,13,0.55); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; resize: vertical;"></textarea>
+            </label>
+            <button type="submit" name="launch_source" value="json" style="flex:0 0 auto; min-height:44px; min-width:120px; padding:10px 20px; font-weight:700; cursor:pointer; background:linear-gradient(180deg, var(--accent), var(--accent-2)); color:#042f24; border:none; border-radius:var(--radius-sm);">Run</button>
+          </div>
+        </details>
+        <div style="margin-bottom:14px;">
+          <label style="display:block; font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:6px;">Competitions</label>
+          <div class="league-pills" style="margin:6px 0 14px;">{''.join(comp_pills)}</div>
+        </div>
+
+        <div style="margin-bottom:14px;">
+          <label style="display:block; font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:6px;">Seasons</label>
+          <div class="league-pills" style="margin:6px 0 14px;">{''.join(szn_pills)}</div>
+        </div>
+
+        <div class="filters" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom:14px;">
+          <label>Experiment ID (optional slug)
+            <input name="experiment_id" type="text" placeholder="EXP-CUSTOM-001" pattern="^[A-Za-z0-9_-]+$" title="Alphanumeric, dashes, and underscores only">
+          </label>
+          <label>Primary Metric
+            <select name="primary_metric">
+              <option value="log_loss" selected>Log Loss (lower is better)</option>
+              <option value="brier">Brier Score (lower is better)</option>
+              <option value="full_time_1x2_accuracy">FT 1X2 Accuracy (higher is better)</option>
+              <option value="exact_score_log_loss">Exact Score Log-Loss (lower is better)</option>
+            </select>
+          </label>
+          <label>Min Matches
+            <input name="min_matches" type="number" value="50" min="10">
+            <span class="note">Best config requires at least this many evaluated matches.</span>
+          </label>
+        </div>
+
+        <div class="filters" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom:14px;">
+          <label>Base k (shrinkage)
+            <input name="k" type="number" step="0.5" value="6.0">
+            <span class="note">Used when k Grid Search is empty; otherwise the grid wins.</span>
+          </label>
+          <label>Prior Mean
+            <select name="prior_mean">
+              <option value="last_season" selected>Last Season</option>
+              <option value="one">One (default)</option>
+            </select>
+          </label>
+          <label>Dependence
+            <select name="dependence">
+              <option value="independent" selected>Independent</option>
+              <option value="dixon_coles">Dixon-Coles</option>
+            </select>
+          </label>
+          <label>Half-Time Share
+            <select name="half_time_share_mode">
+              <option value="fixed_0_45" selected>Fixed 0.45</option>
+              <option value="club_shrunk">Club Shrunk</option>
+              <option value="league_only">League Only</option>
+            </select>
+          </label>
+          <label>Ratio Mode
+            <select name="ratio_mode">
+              <option value="one_pass" selected>One Pass</option>
+              <option value="joint">Joint</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="filters" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:14px;">
+          <label>k Grid Search (comma-separated)
+            <input name="grid_k" type="text" placeholder="5.0, 6.0, 7.0">
+          </label>
+          <label>Draw Boost Grid (comma-separated)
+            <input name="grid_draw_boost" type="text" placeholder="1.0, 1.1, 1.2">
+          </label>
+        </div>
+
+        <details class="advanced-params" style="margin: 12px 0 18px; padding: 12px 16px; background: rgba(11,18,32,0.5); border: 1px solid var(--line); border-radius: var(--radius-sm);">
+          <summary style="cursor:pointer; font-weight:600; color:var(--text); font-size:0.9rem;">Advanced Calibration Parameters</summary>
+          <div class="filters" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top:12px;">
+            <label>Draw Boost
+              <input name="draw_boost" type="number" step="0.05" value="1.0">
+            </label>
+            <label>Draw Weights (comma-separated)
+              <input name="draw_weights" type="text" placeholder="1.35, 1.25, 1.05, 0.70">
+            </label>
+            <label>Draw Pick Threshold
+              <input name="draw_pick_threshold" type="number" step="0.01" placeholder="0.28">
+            </label>
+            <label>Draw Pick Margin
+              <input name="draw_pick_margin" type="number" step="0.01" placeholder="0.05">
+            </label>
+            <label>Draw Tightness Scale
+              <input name="draw_tightness_scale" type="number" step="0.1" placeholder="1.0">
+            </label>
+            <label>Draw Tightness Ref
+              <input name="draw_tightness_ref" type="number" step="0.1" value="1.0">
+            </label>
+          </div>
+        </details>
+
+        <button type="submit" style="min-height:44px; padding:10px 24px; font-weight:700; cursor:pointer; background:linear-gradient(180deg, var(--accent), var(--accent-2)); color:#042f24; border:none; border-radius:var(--radius-sm);">
+          Run Experiment
+        </button>
+      </form>
+    </section>
+    """
+
+
+def experiments_list(
+    connection: sqlite3.Connection,
+    query: dict[str, list[str]] | None = None,
+    *,
+    csrf_token: str | None = None,
+    competitions: list[str] | None = None,
+    seasons: list[str] | None = None,
+    lab_db: Path | None = None,
+) -> str:
+    """List all lab experiments with hierarchical outcome cards and pass/fail rates."""
+    from db_paths import resolve_lab_database_path
+    from laboratory.store import connect as lab_connect, emblem_url_for_competition
+
+    filters = _filters(query, connection) if query else _default_filters()
+    target_lab_db = lab_db or resolve_lab_database_path()
+    lab_conn = lab_connect(target_lab_db)
+
+    batch_filter = (query.get("batch") or [""])[0].strip() if query else ""
+
+    try:
+        rows = lab_conn.execute("""
+            SELECT experiment_id, competition, config_json, status, created_at, completed_at,
+                   best_config_json, best_metrics_json, error
+            FROM lab_experiments
+            ORDER BY created_at DESC
+        """).fetchall()
+
+        # Fetch runs summary per experiment
+        runs_summary_rows = lab_conn.execute("""
+            SELECT experiment_id,
+                   COUNT(*) AS total_runs,
+                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS passed_runs,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_runs,
+                   MAX(matches_evaluated) AS max_evaluated
+            FROM lab_experiment_runs
+            GROUP BY experiment_id
+        """).fetchall()
+        runs_map = {row["experiment_id"]: row for row in runs_summary_rows}
+    finally:
+        lab_conn.close()
+
+    body = [
+        _masthead("Lab Experiments", filters, active="experiments"),
+    ]
+
+    # Flash messages for execution/deletion
+    run_status = (query.get("run_status") or [""])[0].strip() if query else (filters.get("run_status") or "").strip()
+    run_detail = (query.get("run_detail") or [""])[0].strip() if query else (filters.get("run_detail") or "").strip()
+    if run_status:
+        kind = "info" if run_status in ("started", "completed", "deleted") else "error"
+        body.append(
+            _state(
+                kind=kind,
+                title=f"Experiment {run_status.title()}",
+                lead=run_detail or f"Status: {run_status}",
+            )
+        )
+
+    if batch_filter:
+        body.append(
+            f'<div class="state state-info" role="status">'
+            f'<strong>Viewing Coordinated Batch: <code>{html.escape(batch_filter)}</code></strong>'
+            f'<p class="state-action"><a class="state-link" href="/experiments">View All Experiments</a></p>'
+            f'</div>'
+        )
+
+    body.append(_run_experiment_form(filters, competitions, seasons, csrf_token, connection=connection))
+
+    filtered_rows = []
+    for row in rows:
+        cfg = json.loads(row["config_json"]) if row["config_json"] else {}
+        if batch_filter and cfg.get("batch_id") != batch_filter:
+            continue
+        filtered_rows.append((row, cfg))
+
+    if not filtered_rows:
+        body.append(
+            _state(
+                kind="empty",
+                title="No experiments found" if batch_filter else "No experiments yet",
+                lead="Configure and launch your first experiment using the form above.",
+                action_href="/experiments" if batch_filter else "/",
+                action_label="Clear batch filter" if batch_filter else "Back to Overview",
+            )
+        )
+    else:
+        cards = []
+        for row, cfg in filtered_rows:
+            exp_id = row["experiment_id"]
+            status = row["status"]
+            summary = runs_map.get(exp_id)
+            total_runs = summary["total_runs"] if summary else 0
+            passed_runs = summary["passed_runs"] if summary else 0
+            failed_runs = summary["failed_runs"] if summary else 0
+            max_n = summary["max_evaluated"] if summary else 0
+
+            # Badges
+            if status == "completed":
+                badge = '<span class="badge good">Completed</span>'
+            elif status == "running":
+                badge = '<span class="badge wait">Running</span>'
+            elif status == "failed":
+                badge = '<span class="badge bad">Failed</span>'
+            else:
+                badge = f'<span class="badge muted">{html.escape(status.title())}</span>'
+
+            # Scope badges
+            selected_comp = row["competition"]
+            selected_szns = cfg.get("seasons", [])
+            comp_name = COMPETITION_NAMES.get(selected_comp, selected_comp)
+            comp_logo = _logo_img(emblem_url_for_competition(selected_comp), comp_name, kind="emblem", size=16)
+            scope_badges = [f'<span class="scope-badge league">{comp_logo}<span>{html.escape(comp_name)}</span></span>']
+            for s in selected_szns:
+                scope_badges.append(f'<span class="scope-badge">{html.escape(str(s))}</span>')
+
+            # Metric extraction (defensive: legacy best_metrics may omit Exact / O/U keys)
+            best_metrics = json.loads(row["best_metrics_json"]) if row["best_metrics_json"] else {}
+            acc = best_metrics.get("full_time_1x2_accuracy")
+            log_loss = best_metrics.get("full_time_1x2_log_loss")
+            brier = best_metrics.get("full_time_1x2_brier")
+            exact_hit, exact_ll = _exact_score_from_metrics(best_metrics)
+            n_matches = best_metrics.get("n_matches") or max_n or 0
+
+            acc_str = f"{acc:.1%}" if isinstance(acc, (int, float)) else "—"
+            ll_str = f"{log_loss:.4f}" if isinstance(log_loss, (int, float)) else "—"
+            brier_str = f"{brier:.4f}" if isinstance(brier, (int, float)) else "—"
+            exact_hit_str = _fmt_pct(exact_hit)
+            exact_ll_str = _fmt_ll(exact_ll)
+
+            # Calculate planned runs from config if total_runs in DB is 0
+            param_grid = cfg.get("param_grid") or {}
+            planned_count = 1
+            for vals in param_grid.values():
+                if isinstance(vals, list) and vals:
+                    planned_count *= len(vals)
+            display_total = total_runs if total_runs > 0 else (planned_count if status == "running" else total_runs)
+
+            # Pass bar percentage & styling
+            pass_pct = (passed_runs / total_runs * 100.0) if total_runs > 0 else 0.0
+            if status == "running":
+                bar_class = "pass-bar running"
+                fill_html = '<span class="fill"></span>'
+            elif failed_runs > 0:
+                bar_class = "pass-bar has-failures"
+                fill_html = f'<span class="fill" style="width:{pass_pct:.1f}%;"></span>'
+            else:
+                bar_class = "pass-bar"
+                fill_html = f'<span class="fill" style="width:{pass_pct:.1f}%;"></span>'
+
+            delete_form = _experiment_delete_form(exp_id, csrf_token)
+
+            cards.append(
+                f'<article class="experiment-card">'
+                f'  <div class="exp-top-row">'
+                f'    <div class="exp-title-group">'
+                f'      <h3><code>{html.escape(exp_id)}</code></h3>'
+                f'      {badge}'
+                f'      <div class="scope-badges">{"".join(scope_badges)}</div>'
+                f'    </div>'
+                f'    <div class="muted" style="font-size:0.8rem;">{_when(row["created_at"])}</div>'
+                f'  </div>'
+                f'  <div class="exp-hero">'
+                f'    <div class="hero-metric">'
+                f'      <span class="num">{passed_runs}/{display_total}</span>'
+                f'      <span class="label">Runs Passed</span>'
+                f'    </div>'
+                f'    <div class="hero-metric">'
+                f'      <span class="num" style="color:var(--good);">{acc_str}</span>'
+                f'      <span class="label">Best FT Accuracy</span>'
+                f'    </div>'
+                f'    <div class="hero-metric">'
+                f'      <span class="num">{ll_str}</span>'
+                f'      <span class="label">Best Log-Loss</span>'
+                f'    </div>'
+                f'    <div class="hero-metric">'
+                f'      <span class="num">{exact_hit_str}</span>'
+                f'      <span class="label">Exact Hit %</span>'
+                f'    </div>'
+                f'    <div class="hero-metric">'
+                f'      <span class="num">{exact_ll_str}</span>'
+                f'      <span class="label">Exact LL</span>'
+                f'    </div>'
+                f'    <div class="hero-metric">'
+                f'      <span class="num">{brier_str}</span>'
+                f'      <span class="label">Best Brier</span>'
+                f'    </div>'
+                f'    <div class="hero-metric">'
+                f'      <span class="num">{n_matches}</span>'
+                f'      <span class="label">Sample Size (n)</span>'
+                f'    </div>'
+                f'  </div>'
+                f'  <div class="pass-bar-wrap">'
+                f'    <div class="{bar_class}">{fill_html}</div>'
+                f'  </div>'
+                f'  <div class="exp-card-footer">'
+                f'    <a href="/experiments/{quote(exp_id, safe="")}" style="font-weight:600; font-size:0.9rem;">View Full Analysis →</a>'
+                f'    {delete_form}'
+                f'  </div>'
+                f'</article>'
+            )
+
+        body.append(f'<section class="experiment-grid">{"".join(cards)}</section>')
+
+    has_running = any(row["status"] == "running" for row, _ in filtered_rows)
+    extra_head = '<meta http-equiv="refresh" content="5">' if has_running else None
+    return _page("Lab Experiments", "\n".join(body), filters, extra_head=extra_head)
+
+
+def _ai_diagnostic_prompt(exp: dict[str, Any], runs: list[dict[str, Any]]) -> str:
+    """Generate structured markdown prompt for AI diagnostics and improvement."""
+    from laboratory.lab_experiment import metric_sort_value, resolve_primary_metric
+
+    cfg = exp.get("config") or {}
+    exp_id = exp["experiment_id"]
+    comp = exp.get("competition", "PL")
+    seasons = cfg.get("seasons", [])
+    primary_metric = cfg.get("primary_metric", "log_loss")
+    metric_key, higher_is_better = resolve_primary_metric(primary_metric)
+    min_matches = int(cfg.get("min_matches") or 0)
+    base_cfg = cfg.get("base_config", {})
+    param_grid = cfg.get("param_grid", {})
+
+    total_runs = len(runs)
+    completed_runs = sum(1 for r in runs if r.get("status") == "completed")
+    failed_runs = sum(1 for r in runs if r.get("status") == "failed")
+    max_eval = max((r.get("matches_evaluated") or 0) for r in runs) if runs else 0
+
+    table_rows = []
+    # Completed first, then by mapped metric key (not the UI label).
+    sorted_runs = sorted(
+        runs,
+        key=lambda r: (
+            0 if r.get("status") == "completed" else 1,
+            (
+                -metric_sort_value(
+                    r.get("metrics") or {},
+                    metric_key,
+                    higher_is_better=higher_is_better,
+                )
+                if higher_is_better
+                else metric_sort_value(
+                    r.get("metrics") or {},
+                    metric_key,
+                    higher_is_better=higher_is_better,
+                )
+            ),
+        ),
+    )
+
+    for rank, r in enumerate(sorted_runs, start=1):
+        mid = r.get("model_id", "—")
+        st = r.get("status", "—")
+        m = r.get("metrics") or {}
+        n = r.get("matches_evaluated") or 0
+        acc = f"{m.get('full_time_1x2_accuracy'):.2%}" if "full_time_1x2_accuracy" in m else "—"
+        ll = f"{m.get('full_time_1x2_log_loss'):.4f}" if "full_time_1x2_log_loss" in m else "—"
+        brier = f"{m.get('full_time_1x2_brier'):.4f}" if "full_time_1x2_brier" in m else "—"
+        exact_hit, exact_ll = _exact_score_from_metrics(m)
+        ht_hit, ht_ll = _market_pair_from_metrics(m, "half_time_1x2")
+        ou25_hit, ou25_ll = _market_pair_from_metrics(m, "over_under_2_5")
+        ou35_hit, ou35_ll = _market_pair_from_metrics(m, "over_under_3_5")
+        exact_hit_s = _fmt_pct(exact_hit)
+        exact_ll_s = _fmt_ll(exact_ll)
+        r_cfg = r.get("config") or {}
+        # highlight changed params
+        diffs = [f"{k}={v}" for k, v in r_cfg.items() if base_cfg.get(k) != v and k != "model_id"]
+        diff_str = ", ".join(diffs) if diffs else "baseline"
+        table_rows.append(
+            f"| {rank} | `{mid}` | {st} | {acc} | {ll} | {brier} "
+            f"| {exact_hit_s} | {exact_ll_s} "
+            f"| {_fmt_pct(ht_hit)} | {_fmt_ll(ht_ll)} "
+            f"| {_fmt_pct(ou25_hit)} | {_fmt_ll(ou25_ll)} "
+            f"| {_fmt_pct(ou35_hit)} | {_fmt_ll(ou35_ll)} "
+            f"| {n} | {diff_str} |"
+        )
+
+    table_md = "\n".join(table_rows) if table_rows else "No evaluated runs recorded."
+
+    return f"""# AI Diagnostic Analysis Request: Experiment {exp_id}
+
+## 1. Experiment Scope & Setup
+- **Experiment ID:** {exp_id}
+- **Competition:** {comp}
+- **Evaluated Seasons:** {', '.join(str(s) for s in seasons)}
+- **Primary Optimization Metric:** {primary_metric} → `{metric_key}` ({'higher' if higher_is_better else 'lower'} is better); min_matches={min_matches}
+- **Sample Size (Evaluated Matches):** {max_eval}
+- **Run Summary:** {completed_runs}/{total_runs} Completed ({failed_runs} Failed)
+
+## 2. Model Configuration
+### Base Configuration
+```json
+{json.dumps(base_cfg, indent=2)}
+```
+
+### Parameter Grid Tested
+```json
+{json.dumps(param_grid, indent=2)}
+```
+
+## 3. Results Leaderboard
+| Rank | Model ID | Status | FT 1X2 Acc | Log-Loss | Brier | Exact Hit % | Exact LL | HT Acc % | HT Log-Loss | O/U 2.5 Acc | O/U 2.5 LL | Goals 3.5 Acc % | Goals 3.5 Log-Loss | Evaluated (n) | Varied Hyperparameters |
+|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|
+{table_md}
+
+## 4. Diagnostic & Improvement Instructions
+Please review this experiment output and provide:
+1. **Strengths & Winning Patterns:** Which hyperparameter variations yielded real metric improvements vs. baseline?
+2. **Weaknesses, Calibration Gaps & Overfitting Risks:** Are differences statistically reliable given n={max_eval}, or do you see signs of noise fitting?
+3. **Parameter Sensitivity Insights:** How do parameters like shrinkage `k`, `draw_boost`, and draw-calibration weights affect log-loss and accuracy?
+4. **Exact Score & Goal Volume:** Evaluate Exact Score calibration (Exact LL on the actual score cell) versus mode hit rate (Exact Hit %), and check for goal-volume bias on O/U 2.5 (Acc vs LL). Call out configs that look sharp on FT 1X2 but poorly calibrated on exact scores or totals.
+5. **Concrete Next-Step Experiments:** Suggest 3 specific, targeted follow-up configurations or grid searches to test next.
+"""
+
+
+def experiment_detail(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+    query: dict[str, list[str]] | None = None,
+    *,
+    csrf_token: str | None = None,
+    lab_db: Path | None = None,
+) -> str | None:
+    """Detailed view for a single experiment: status, KPI strip, traceback, leaderboard, prompt export."""
+    from db_paths import resolve_lab_database_path
+    from laboratory.store import connect as lab_connect, emblem_url_for_competition, get_lab_experiment, get_lab_experiment_runs
+    from urllib.parse import quote
+
+    filters = _filters(query, connection) if query else _default_filters()
+    target_lab_db = lab_db or resolve_lab_database_path()
+    lab_conn = lab_connect(target_lab_db)
+
+    try:
+        exp = get_lab_experiment(lab_conn, experiment_id)
+        if not exp:
+            return None
+        runs = get_lab_experiment_runs(lab_conn, experiment_id)
+    finally:
+        lab_conn.close()
+
+    status = exp["status"]
+    extra_head = '<meta http-equiv="refresh" content="5">' if status == "running" else ""
+
+    from laboratory.lab_experiment import metric_sort_value, resolve_primary_metric
+
+    cfg = exp.get("config") or {}
+    base_cfg = cfg.get("base_config") or {}
+    param_grid = cfg.get("param_grid") or {}
+    primary_metric = cfg.get("primary_metric", "log_loss")
+    metric_key, higher_is_better = resolve_primary_metric(primary_metric)
+    min_matches = int(cfg.get("min_matches") or 0)
+    seasons = cfg.get("seasons", [])
+
+    body = [
+        _masthead(f"Experiment: {html.escape(experiment_id)}", filters, active="experiments", back_href="/experiments"),
+    ]
+
+    # Flash messages
+    run_status = (filters.get("run_status") or "").strip()
+    run_detail = (filters.get("run_detail") or "").strip()
+    if run_status:
+        kind = "info" if run_status in ("started", "completed") else "error"
+        body.append(
+            _state(
+                kind=kind,
+                title=f"Experiment Run {run_status.title()}",
+                lead=run_detail or f"Status: {run_status}",
+            )
+        )
+
+    # Header Panel
+    status_badge = {
+        "completed": "good",
+        "running": "wait",
+        "failed": "bad",
+    }.get(status, "muted")
+
+    comp_name = COMPETITION_NAMES.get(exp["competition"], exp["competition"])
+    comp_logo = _logo_img(emblem_url_for_competition(exp["competition"]), comp_name, kind="emblem", size=16)
+    scope_badges = [f'<span class="scope-badge league">{comp_logo}<span>{html.escape(comp_name)}</span></span>']
+    for s in seasons:
+        scope_badges.append(f'<span class="scope-badge">{html.escape(str(s))}</span>')
+
+    delete_form = _experiment_delete_form(experiment_id, csrf_token)
+    rerun_form = _experiment_rerun_form(
+        experiment_id,
+        csrf_token,
+        disabled=status == "running",
+    )
+
+    total_runs = len(runs)
+    completed_runs = sum(1 for r in runs if r["status"] == "completed")
+    failed_runs = sum(1 for r in runs if r["status"] == "failed")
+    max_eval = max((r.get("matches_evaluated") or 0) for r in runs) if runs else 0
+
+    best_m = exp.get("best_metrics") or {}
+    best_cfg = exp.get("best_config") or {}
+
+    b_acc = best_m.get("full_time_1x2_accuracy")
+    b_ll = best_m.get("full_time_1x2_log_loss")
+    b_brier = best_m.get("full_time_1x2_brier")
+    b_exact_hit, b_exact_ll = _exact_score_from_metrics(best_m)
+    b_ou25_acc, _b_ou25_ll = _market_pair_from_metrics(best_m, "over_under_2_5")
+
+    body.append(
+        f'<section class="panel">'
+        f'  <div class="exp-top-row">'
+        f'    <div>'
+        f'      <h2 style="margin:0 0 4px;"><code>{html.escape(experiment_id)}</code></h2>'
+        f'      <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">'
+        f'        <span class="badge {status_badge}">{html.escape(status.title())}</span>'
+        f'        <div class="scope-badges">{"".join(scope_badges)}</div>'
+        f'      </div>'
+        f'    </div>'
+        f'    <div class="exp-actions">{rerun_form}{delete_form}</div>'
+        f'  </div>'
+        f'  <div class="cards" style="margin-top:16px;">'
+        f'    <article><span>Total Runs</span><strong>{completed_runs}/{total_runs}</strong></article>'
+        f'    <article><span>Evaluated (n)</span><strong>{max_eval}</strong></article>'
+        f'    <article><span>Best FT Acc</span><strong style="color:var(--good);">{f"{b_acc:.1%}" if isinstance(b_acc, (int, float)) else "—"}</strong></article>'
+        f'    <article><span>Best Log-Loss</span><strong>{f"{b_ll:.4f}" if isinstance(b_ll, (int, float)) else "—"}</strong></article>'
+        f'    <article><span>Best Brier</span><strong>{f"{b_brier:.4f}" if isinstance(b_brier, (int, float)) else "—"}</strong></article>'
+        f'    <article><span>Best Exact Hit %</span><strong class="mono">{_fmt_pct(b_exact_hit)}</strong></article>'
+        f'    <article><span>Best Exact LL</span><strong class="mono">{_fmt_ll(b_exact_ll)}</strong></article>'
+        f'    <article><span>Best O/U 2.5 Acc</span><strong class="mono">{_fmt_pct(b_ou25_acc)}</strong></article>'
+        f'  </div>'
+        f'</section>'
+    )
+
+    # Error Box (if failed)
+    if exp.get("error") or status == "failed":
+        err_text = exp.get("error") or "Execution failed without a detailed traceback."
+        body.append(
+            f'<div class="error-box">'
+            f'  <h3>Failure Traceback</h3>'
+            f'  <pre>{html.escape(err_text)}</pre>'
+            f'</div>'
+        )
+
+    # Config Inspector Panel
+    body.append(
+        f'<section class="panel">'
+        f'  <h2>Configuration & Search Grid Inspector</h2>'
+        f'  <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-top:12px;">'
+        f'    <div>'
+        f'      <h3 style="margin-top:0;">Base Configuration</h3>'
+        f'      <pre style="background:var(--bg); padding:12px; border:1px solid var(--line); border-radius:var(--radius-sm); font-size:0.8rem; overflow-x:auto;">'
+        f'{html.escape(json.dumps(base_cfg, indent=2))}'
+        f'      </pre>'
+        f'    </div>'
+        f'    <div>'
+        f'      <h3 style="margin-top:0;">Search Grid</h3>'
+        f'      <pre style="background:var(--bg); padding:12px; border:1px solid var(--line); border-radius:var(--radius-sm); font-size:0.8rem; overflow-x:auto;">'
+        f'{html.escape(json.dumps(param_grid, indent=2))}'
+        f'      </pre>'
+        f'    </div>'
+        f'  </div>'
+        f'</section>'
+    )
+
+    # Leaderboard Table
+    if runs:
+        # Baseline = best completed run on the mapped primary metric (among all n).
+        completed = [r for r in runs if r["status"] == "completed" and r.get("metrics")]
+        completed_sorted = sorted(
+            completed,
+            key=lambda r: metric_sort_value(
+                r.get("metrics") or {},
+                metric_key,
+                higher_is_better=higher_is_better,
+            ),
+            reverse=higher_is_better,
+        )
+        from laboratory.lab_experiment import metric_value
+
+        baseline = completed_sorted[0] if completed_sorted else None
+        baseline_metric_val = (
+            metric_value(baseline.get("metrics") or {}, metric_key) if baseline else None
+        )
+
+        # Column winners among completed runs (Exact + O/U 2.5 highlighted).
+        win_exact_hit = max(
+            (v for v in (_exact_score_from_metrics(r.get("metrics") or {})[0] for r in completed) if v is not None),
+            default=None,
+        )
+        win_exact_ll = min(
+            (v for v in (_exact_score_from_metrics(r.get("metrics") or {})[1] for r in completed) if v is not None),
+            default=None,
+        )
+        win_ou25_acc = max(
+            (
+                v
+                for v in (
+                    _market_pair_from_metrics(r.get("metrics") or {}, "over_under_2_5")[0]
+                    for r in completed
+                )
+                if v is not None
+            ),
+            default=None,
+        )
+        win_ou25_ll = min(
+            (
+                v
+                for v in (
+                    _market_pair_from_metrics(r.get("metrics") or {}, "over_under_2_5")[1]
+                    for r in completed
+                )
+                if v is not None
+            ),
+            default=None,
+        )
+
+        table_rows = []
+        rank = 0
+        sorted_runs = sorted(
+            runs,
+            key=lambda r: (
+                0 if r["status"] == "completed" else 1,
+                (
+                    -metric_sort_value(
+                        r.get("metrics") or {},
+                        metric_key,
+                        higher_is_better=higher_is_better,
+                    )
+                    if higher_is_better
+                    else metric_sort_value(
+                        r.get("metrics") or {},
+                        metric_key,
+                        higher_is_better=higher_is_better,
+                    )
+                ),
+            ),
+        )
+
+        for r in sorted_runs:
+            rank += 1
+            mid = r["model_id"]
+            st = r["status"]
+            m = r.get("metrics") or {}
+            n = r.get("matches_evaluated") or 0
+            err = r.get("error")
+            below_floor = min_matches > 0 and n < min_matches
+
+            acc = f"{m.get('full_time_1x2_accuracy'):.2%}" if "full_time_1x2_accuracy" in m else "—"
+            ll = f"{m.get('full_time_1x2_log_loss'):.4f}" if "full_time_1x2_log_loss" in m else "—"
+            br = f"{m.get('full_time_1x2_brier'):.4f}" if "full_time_1x2_brier" in m else "—"
+            exact_hit, exact_ll = _exact_score_from_metrics(m)
+            ht_hit, ht_ll = _market_pair_from_metrics(m, "half_time_1x2")
+            ou25_hit, ou25_ll = _market_pair_from_metrics(m, "over_under_2_5")
+            ou35_hit, ou35_ll = _market_pair_from_metrics(m, "over_under_3_5")
+
+            # Delta calculation vs baseline on the mapped metric key
+            delta_str = "—"
+            cur_metric = metric_value(m, metric_key)
+            if baseline_metric_val is not None and cur_metric is not None and r is not baseline:
+                diff = float(cur_metric) - float(baseline_metric_val)
+                improved = diff > 0 if higher_is_better else diff < 0
+                cls = "good" if improved else "bad"
+                delta_str = f'<span style="color:var(--{cls}); font-weight:600;">{diff:+.4f}</span>'
+            elif r is baseline:
+                delta_str = '<span class="badge muted">Baseline</span>'
+
+            # Highlight changed params
+            r_cfg = r.get("config") or {}
+            diffs = [f"{k}={v}" for k, v in r_cfg.items() if base_cfg.get(k) != v and k != "model_id"]
+            params_str = f"<code>{html.escape(', '.join(diffs))}</code>" if diffs else '<span class="muted">Default</span>'
+            if below_floor:
+                params_str += f' <span class="badge muted" title="Below min_matches={min_matches}">n&lt;{min_matches}</span>'
+
+            st_badge = '<span class="badge good">Passed</span>' if st == "completed" else f'<span class="badge bad" title="{html.escape(err or "")}">Failed</span>' if st == "failed" else f'<span class="badge wait">{st}</span>'
+
+            exact_hit_s = _fmt_pct(exact_hit)
+            exact_ll_s = _fmt_ll(exact_ll)
+            ou25_hit_s = _fmt_pct(ou25_hit)
+            ou25_ll_s = _fmt_ll(ou25_ll)
+
+            table_rows.append(
+                f'<tr>'
+                f'  <td>{rank}</td>'
+                f'  <td><code>{html.escape(mid)}</code></td>'
+                f'  <td>{st_badge}</td>'
+                f'  <td>{params_str}</td>'
+                f'  <td>{n}</td>'
+                f'  <td style="font-weight:600;">{acc}</td>'
+                f'  <td>{ll}</td>'
+                f'  <td>{br}</td>'
+                f'  <td>{_metric_cell(exact_hit_s, win=exact_hit is not None and win_exact_hit is not None and exact_hit == win_exact_hit)}</td>'
+                f'  <td>{_metric_cell(exact_ll_s, win=exact_ll is not None and win_exact_ll is not None and exact_ll == win_exact_ll)}</td>'
+                f'  <td>{_fmt_pct(ht_hit)}</td>'
+                f'  <td>{_fmt_ll(ht_ll)}</td>'
+                f'  <td>{_metric_cell(ou25_hit_s, win=ou25_hit is not None and win_ou25_acc is not None and ou25_hit == win_ou25_acc)}</td>'
+                f'  <td>{_metric_cell(ou25_ll_s, win=ou25_ll is not None and win_ou25_ll is not None and ou25_ll == win_ou25_ll)}</td>'
+                f'  <td>{_fmt_pct(ou35_hit)}</td>'
+                f'  <td>{_fmt_ll(ou35_ll)}</td>'
+                f'  <td>{delta_str}</td>'
+                f'</tr>'
+            )
+
+        direction = "higher is better" if higher_is_better else "lower is better"
+        floor_note = (
+            f' Best config requires n≥{min_matches}.'
+            if min_matches > 0
+            else ""
+        )
+        body.append(
+            f'<section class="panel">'
+            f'  <h2>Runs Leaderboard (Ranked by {html.escape(metric_key)})</h2>'
+            f'  <p class="note" style="margin-bottom:12px;">'
+            f'UI metric “{html.escape(primary_metric)}” → <code>{html.escape(metric_key)}</code>'
+            f' ({html.escape(direction)}).{html.escape(floor_note)}'
+            f'  </p>'
+            f'  <div class="table-wrap"><table>'
+            f'    <thead><tr>'
+            f'      <th>#</th><th>Model ID</th><th>Status</th><th>Tested Params</th>'
+            f'      <th>n</th><th>FT Acc</th><th>Log-Loss</th><th>Brier</th>'
+            f'      <th>Exact Hit %</th><th>Exact LL</th>'
+            f'      <th>HT Acc %</th><th>HT Log-Loss</th>'
+            f'      <th>O/U 2.5 Acc</th><th>O/U 2.5 LL</th>'
+            f'      <th>Goals 3.5 Acc %</th><th>Goals 3.5 Log-Loss</th>'
+            f'      <th>Δ vs Base</th>'
+            f'    </tr></thead>'
+            f'    <tbody>{"".join(table_rows)}</tbody>'
+            f'  </table></div>'
+            f'</section>'
+        )
+
+        # Visual Comparison Bars
+        if len(completed) >= 2:
+            bars_html = []
+            best_ll = min((r["metrics"].get("full_time_1x2_log_loss") for r in completed if r["metrics"].get("full_time_1x2_log_loss")), default=1.0)
+            for r in completed[:8]:
+                mid = r["model_id"]
+                cur_ll = r["metrics"].get("full_time_1x2_log_loss", 1.0)
+                # Proportional width
+                bar_pct = max(10.0, min(100.0, (best_ll / cur_ll) * 100.0))
+                bars_html.append(
+                    f'<div style="margin-bottom:8px;">'
+                    f'  <div style="display:flex; justify-content:space-between; font-size:0.8rem; margin-bottom:2px;">'
+                    f'    <code>{html.escape(mid)}</code>'
+                    f'    <span class="mono">{cur_ll:.4f}</span>'
+                    f'  </div>'
+                    f'  <div style="height:10px; border-radius:999px; background:var(--line); overflow:hidden;">'
+                    f'    <div style="height:100%; border-radius:999px; background:var(--accent); width:{bar_pct:.1f}%;"></div>'
+                    f'  </div>'
+                    f'</div>'
+                )
+
+            body.append(
+                f'<section class="panel">'
+                f'  <h2>Model Quality Relative Calibration (Log-Loss)</h2>'
+                f'  <p class="note" style="margin-bottom:12px;">Top candidate models compared against the winning log-loss profile.</p>'
+                f'  {"".join(bars_html)}'
+                f'</section>'
+            )
+
+    # AI Diagnostic Prompt Card
+    prompt_content = _ai_diagnostic_prompt(exp, runs)
+    body.append(
+        f'<section class="prompt-export-panel">'
+        f'  <div class="prompt-header">'
+        f'    <h3>Ready-to-Copy AI Diagnostic Prompt</h3>'
+        f'    <button type="button" class="copy-prompt-btn" data-copy-target="ai-prompt-text">'
+        f'      Copy Prompt for AI Analysis'
+        f'    </button>'
+        f'  </div>'
+        f'  <p class="note" style="margin-bottom:12px;">'
+        f'    Pre-populated with this experiment\'s parameters, sample sizes, and evaluated accuracy metrics. Paste into your LLM of choice for instant model critique.'
+        f'  </p>'
+        f'  <textarea id="ai-prompt-text" readonly>{html.escape(prompt_content)}</textarea>'
+        f'</section>'
+    )
+
+    return _page(f"Experiment: {experiment_id}", "\n".join(body), filters, extra_head=extra_head)
+
+
+def _default_filters() -> dict[str, str]:
+    return {
+        "engine": "score_model",
+        "experiment": "BOT-PL-001",
+        "league": "",
+        "season": "",
+        "team": "",
+        "date_from": "",
+        "date_to": "",
+        "fixture": "all",
+        "status": "all",
+        "verdict": "all",
+        "confidence": "all",
+        "order": "newest",
+        "page": "1",
+        "predicted": "",
+        "predict_status": "",
+        "predict_detail": "",
+        "run_status": "",
+        "run_detail": "",
+    }
+
+
+def _filters(
+    query: dict[str, list[str]] | None,
+    _connection: sqlite3.Connection,
+) -> dict[str, str]:
+    source = query or {}
+
+    def one(name: str, default: str = "") -> str:
+        values = source.get(name) or []
+        return values[0].strip() if values else default
+
+    return {
+        "engine": "score_model",
+        "experiment": "BOT-PL-001",
+        "league": one("league").upper(),
+        "season": one("season"),
+        "team": one("team"),
+        "date_from": one("date_from"),
+        "date_to": one("date_to"),
+        "fixture": one("fixture", "all"),
+        "status": one("status", "all"),
+        "verdict": one("verdict", "all"),
+        "confidence": one("confidence", "all"),
+        "order": one("order", "newest"),
+        "page": one("page", "1"),
+        "predicted": one("predicted"),
+        "predict_status": one("predict_status"),
+        "predict_detail": one("predict_detail"),
+        "run_status": one("run_status"),
+        "run_detail": one("run_detail"),
+        "sync_status": one("sync_status"),
+        "sync_detail": one("sync_detail"),
+    }
 
 
 def _query(filters: dict[str, str], **overrides: str) -> str:
@@ -2842,7 +5035,7 @@ def _query(filters: dict[str, str], **overrides: str) -> str:
             continue
         if key in {"predicted", "predict_status", "predict_detail"}:
             continue
-        if key in {"fixture", "status", "verdict"} and value == "all":
+        if key in {"fixture", "status", "verdict", "confidence"} and value == "all":
             continue
         if key == "order" and value == "newest":
             continue

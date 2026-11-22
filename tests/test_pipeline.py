@@ -215,6 +215,9 @@ def test_no_head_to_head_calls_the_endpoint_once(tmp_path) -> None:
 
 
 def _estimate_for(holder: Harness, *, include_half_time: bool):
+    from league_stacks import draw_calibration_kwargs, live_stack_for
+
+    stack = live_stack_for(holder.api.competition)
     return estimate_score(
         competition_finished_payload=holder.api._competition_finished_payload(),
         home_finished_payload=holder.api.forms[1],
@@ -223,6 +226,13 @@ def _estimate_for(holder: Harness, *, include_half_time: bool):
         away_team_id=2,
         include_half_time=include_half_time,
         kickoff="2026-12-12T15:00:00Z",
+        k=float(stack["k"]),
+        prior_mean_mode=str(stack["prior_mean"]),
+        half_time_share_mode=str(stack["half_time_share_mode"]),
+        dependence=str(stack["dependence"]),
+        ratio_mode=str(stack.get("ratio_mode") or "one_pass"),
+        decay_half_life_days=stack.get("decay_half_life_days"),
+        **draw_calibration_kwargs(stack),
     )
 
 

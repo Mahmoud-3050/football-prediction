@@ -399,7 +399,12 @@ def test_dashboard_league_filter_scopes_matches(tmp_path: Path) -> None:
             {"full_time_1x2": {"status": "scored", "correct": True}},
         )
     connection.commit()
-    page = match_list(connection, {"engine": ["score_model"], "league": ["PD"]})
+    page = match_list(connection, {
+        "engine": ["score_model"],
+        "league": ["PD"],
+        "date_from": ["2026-11-01"],
+        "date_to": ["2026-11-30"],
+    })
     assert "Atleti" in page
     assert "Barca" in page
     assert "Arsenal" not in page
@@ -618,7 +623,12 @@ def test_dashboard_shows_non_pl_live_score_model_predictions(tmp_path: Path) -> 
         },
     )
     connection.commit()
-    page = match_list(connection, {"engine": ["score_model"], "season": ["2026"]})
+    page = match_list(connection, {
+        "engine": ["score_model"],
+        "season": ["2026"],
+        "date_from": ["2026-11-01"],
+        "date_to": ["2026-11-30"],
+    })
     assert "Club Atlético de Madrid" in page
     assert "1–2" in page
     assert "Away" in page

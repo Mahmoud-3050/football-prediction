@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -149,6 +150,17 @@ def run_score_model(
     ratio_mode: str = "one_pass",
     dependence: str = "independent",
     half_time_share_mode: str = "club_shrunk",
+    draw_boost: float = 1.0,
+    draw_weights: list[float] | tuple[float, ...] | None = None,
+    draw_pick_threshold: float | None = None,
+    draw_pick_margin: float | None = None,
+    draw_tightness_scale: float | None = None,
+    draw_tightness_ref: float = 1.0,
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
+    nb_alpha: float = 0.0,
+    promoted_attack_prior: float | None = None,
+    promoted_defence_prior: float | None = None,
 ) -> dict[str, int]:
     """Walk-forward using the Telegram bot scorer. No Gemini."""
 
@@ -168,6 +180,8 @@ def run_score_model(
             "half_time_share_mode must be 'club_shrunk', 'league_only', "
             "'fixed_0_45', or 'fixed_0_50'."
         )
+    if draw_boost <= 0:
+        raise ValueError("draw_boost must be positive.")
 
     competition = str(
         competition or BOT_EXPERIMENT_CONFIG.get("competition") or "PL"
@@ -176,7 +190,12 @@ def run_score_model(
     history = [_record(row) for row in rows]
     season_ratio_cache: dict[str, dict[str, dict[str, float]]] = {}
     if prior_mean == "last_season":
-        season_ratio_cache = _last_season_ratio_cache(history, k=k)
+        season_ratio_cache = _last_season_ratio_cache(
+            history,
+            k=k,
+            goal_cap=goal_cap,
+            goal_cap_slope=goal_cap_slope,
+        )
     counts = {
         "competition": competition,
         "experiment_id": experiment_id,
@@ -212,6 +231,8 @@ def run_score_model(
                 season_ratio_cache.get(target.season) or {},
                 home_id=target.home_id,
                 away_id=target.away_id,
+                promoted_attack_prior=promoted_attack_prior,
+                promoted_defence_prior=promoted_defence_prior,
             )
         outcome = price_from_snapshot(
             payload,
@@ -222,6 +243,17 @@ def run_score_model(
             ratio_mode=ratio_mode,
             dependence=dependence,
             half_time_share_mode=half_time_share_mode,
+            draw_boost=draw_boost,
+            draw_weights=draw_weights,
+            draw_pick_threshold=draw_pick_threshold,
+            draw_pick_margin=draw_pick_margin,
+            draw_tightness_scale=draw_tightness_scale,
+            draw_tightness_ref=draw_tightness_ref,
+            goal_cap=goal_cap,
+            goal_cap_slope=goal_cap_slope,
+            nb_alpha=nb_alpha,
+            promoted_attack_prior=promoted_attack_prior,
+            promoted_defence_prior=promoted_defence_prior,
         )
         if outcome.excluded or outcome.body is None:
             record_run(
@@ -266,6 +298,24 @@ def run_score_model(
             extras.append(f"dependence={dependence}")
         if half_time_share_mode != "club_shrunk":
             extras.append(f"half_time_share_mode={half_time_share_mode}")
+        if abs(draw_boost - 1.0) > 1e-9:
+            extras.append(f"draw_boost={draw_boost:g}")
+        if draw_weights:
+            extras.append(f"draw_weights={list(draw_weights)}")
+        if draw_pick_threshold is not None or draw_pick_margin is not None:
+            extras.append(
+                f"draw_pick(thr={draw_pick_threshold},margin={draw_pick_margin})"
+            )
+        if draw_tightness_scale is not None:
+            extras.append(f"draw_tightness_scale={draw_tightness_scale:g}")
+        if goal_cap is not None:
+            extras.append(f"goal_cap={goal_cap:g}@{goal_cap_slope:g}")
+        if nb_alpha > 0:
+            extras.append(f"nb_alpha={nb_alpha:g}")
+        if promoted_attack_prior is not None or promoted_defence_prior is not None:
+            extras.append(
+                f"promoted_prior=({promoted_attack_prior},{promoted_defence_prior})"
+            )
         detail = f"Priced with the Telegram bot score_model (k={k}"
         if extras:
             detail += ", " + ", ".join(extras)
@@ -290,6 +340,18 @@ def run_score_model(
             )
             insert_evaluation(connection, prediction_id, int(row["revision"]), metrics)
     connection.commit()
+    try:
+        from laboratory.store import checkpoint_wal
+
+        checkpoint_wal(connection, mode="TRUNCATE")
+    except sqlite3.OperationalError:
+        # Another reader/writer may block TRUNCATE; PASSIVE still helps shrink pressure.
+        try:
+            from laboratory.store import checkpoint_wal
+
+            checkpoint_wal(connection, mode="PASSIVE")
+        except sqlite3.OperationalError:
+            pass
     return counts
 
 
@@ -331,32 +393,60 @@ def price_one_score_model(
     if row is None:
         return {"ok": False, "status": "missing", "detail": "Match not found in laboratory."}
 
+    from league_stacks import draw_calibration_kwargs, live_stack_for
+
     competition = str(row["competition"] or "PL").upper()
     if competition == "PL":
         experiment_id = BOT_EXPERIMENT_ID
     else:
         experiment_id = f"BOT-{competition}-live"
-    model_id = "bot-score-model-live"
+    stack = live_stack_for(competition)
+    model_id = str(stack.get("model_id") or "bot-score-model-live")
+    k = float(stack["k"])
+    prior_mean = str(stack["prior_mean"])
+    dependence = str(stack["dependence"])
+    half_time_share_mode = str(stack["half_time_share_mode"])
+    ratio_mode = str(stack.get("ratio_mode") or "one_pass")
+    decay = stack.get("decay_half_life_days")
+    draw_kwargs = draw_calibration_kwargs(stack)
+    draw_boost = float(draw_kwargs["draw_boost"])
     ensure_experiment(
         connection,
         {
             "experiment_id": experiment_id,
             "competition": competition,
-            "k": 6,
-            "prior_mean": "last_season",
-            "half_time_share_mode": "fixed_0_45",
+            "k": k,
+            "prior_mean": prior_mean,
+            "dependence": dependence,
+            "half_time_share_mode": half_time_share_mode,
+            "draw_boost": draw_boost,
+            "draw_weights": draw_kwargs.get("draw_weights"),
+            "draw_pick_threshold": draw_kwargs.get("draw_pick_threshold"),
+            "draw_pick_margin": draw_kwargs.get("draw_pick_margin"),
+            "draw_tightness_scale": draw_kwargs.get("draw_tightness_scale"),
             "tail_tolerance": 0.001,
             "engine": SCORE_MODEL_ENGINE,
             "score_model_config_id": model_id,
             "gemini": False,
-            "note": "Dashboard on-demand price (live stack: last_season + fixed_0_45).",
+            "note": (
+                f"Dashboard on-demand price ({competition} live stack: "
+                f"k={k}, {prior_mean}, {dependence}, {half_time_share_mode}, "
+                f"draw_boost={draw_boost:g})."
+            ),
         },
     )
 
     history_rows = list_matches(connection, competition=competition)
     history = [_record(item) for item in history_rows]
     target = _record(row)
-    season_ratio_cache = _last_season_ratio_cache(history, k=6.0)
+    season_ratio_cache: dict[str, dict[str, dict[str, float]]] = {}
+    if prior_mean == "last_season":
+        season_ratio_cache = _last_season_ratio_cache(
+            history,
+            k=k,
+            goal_cap=draw_kwargs.get("goal_cap"),
+            goal_cap_slope=float(draw_kwargs.get("goal_cap_slope") or 0.5),
+        )
     payload = build_snapshot(target, history)
     snapshot_id = save_snapshot(connection, payload, experiment_id=experiment_id)
     if not payload["leakage_ok"]:
@@ -377,17 +467,25 @@ def price_one_score_model(
             "match_id": target.match_id,
         }
 
-    means = prior_means_for_fixture(
-        season_ratio_cache.get(target.season) or {},
-        home_id=target.home_id,
-        away_id=target.away_id,
-    )
+    means = None
+    if prior_mean == "last_season":
+        means = prior_means_for_fixture(
+            season_ratio_cache.get(target.season) or {},
+            home_id=target.home_id,
+            away_id=target.away_id,
+            promoted_attack_prior=draw_kwargs.get("promoted_attack_prior"),
+            promoted_defence_prior=draw_kwargs.get("promoted_defence_prior"),
+        )
     outcome = price_from_snapshot(
         payload,
-        k=6.0,
+        k=k,
         config_id=model_id,
         prior_means=means,
-        half_time_share_mode="fixed_0_45",
+        ratio_mode=ratio_mode,
+        dependence=dependence,
+        half_time_share_mode=half_time_share_mode,
+        decay_half_life_days=float(decay) if decay is not None else None,
+        **draw_kwargs,
     )
     if outcome.excluded or outcome.body is None:
         record_run(
@@ -484,10 +582,229 @@ def price_one_score_model(
     }
 
 
+def bot_live_experiment_id(competition: str) -> str:
+    """Live bot experiment id used by dashboard / sync pricing (no Gemini)."""
+
+    code = str(competition or "PL").upper()
+    if code == "PL":
+        return BOT_EXPERIMENT_ID
+    return f"BOT-{code}-live"
+
+
+def find_score_model_prediction(
+    connection: sqlite3.Connection,
+    *,
+    match_id: str,
+    experiment_id: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT prediction_id, body_json, experiment_id, model_id
+        FROM predictions
+        WHERE match_id = ? AND experiment_id = ? AND engine = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (match_id, experiment_id, SCORE_MODEL_ENGINE),
+    ).fetchone()
+
+
+def evaluate_stored_score_model(
+    connection: sqlite3.Connection,
+    *,
+    prediction_id: str,
+    body_json: str | dict[str, Any],
+    ft_home: int,
+    ft_away: int,
+    ht_home: int | None,
+    ht_away: int | None,
+    revision: int,
+) -> str:
+    """Score an existing prediction against a result revision.
+
+    Returns ``evaluated``, ``already_evaluated``, or ``failed``.
+    """
+
+    evaluation_id = f"{prediction_id}:r{int(revision)}"
+    existing = connection.execute(
+        "SELECT 1 FROM evaluations WHERE evaluation_id = ?",
+        (evaluation_id,),
+    ).fetchone()
+    if existing is not None:
+        return "already_evaluated"
+    try:
+        body = json.loads(body_json) if isinstance(body_json, str) else body_json
+        metrics = evaluate_prediction(
+            body,
+            {
+                "ft_home": int(ft_home),
+                "ft_away": int(ft_away),
+                "ht_home": ht_home,
+                "ht_away": ht_away,
+            },
+        )
+        insert_evaluation(connection, prediction_id, int(revision), metrics)
+    except Exception:
+        return "failed"
+    return "evaluated"
+
+
+def price_or_evaluate_finished_in_window(
+    connection: sqlite3.Connection,
+    *,
+    competitions: tuple[str, ...],
+    date_from: str,
+    date_to: str,
+) -> dict[str, Any]:
+    """For finished matches in ``[date_from, date_to]``: price if missing, else evaluate.
+
+    Insert-only: never re-prices when a score_model prediction already exists for the
+    live bot experiment. Existing predictions are compared to the latest FT result.
+    No Gemini.
+    """
+
+    counts: dict[str, Any] = {
+        "priced": 0,
+        "evaluated": 0,
+        "already_evaluated": 0,
+        "excluded": 0,
+        "failed": 0,
+        "skipped_unfinished": 0,
+        "by_competition": {},
+    }
+    codes = tuple(dict.fromkeys(c.upper() for c in competitions if c))
+    if not codes:
+        return counts
+
+    marks = ",".join("?" for _ in codes)
+    rows = list(
+        connection.execute(
+            f"""
+            SELECT m.match_id, m.competition, m.kickoff,
+                   r.ft_home, r.ft_away, r.ht_home, r.ht_away, r.revision
+            FROM matches m
+            JOIN result_revisions r
+              ON r.match_id = m.match_id
+             AND r.revision = (
+                SELECT MAX(revision) FROM result_revisions WHERE match_id = m.match_id
+             )
+            WHERE m.competition IN ({marks})
+              AND substr(m.kickoff, 1, 10) >= ?
+              AND substr(m.kickoff, 1, 10) <= ?
+              AND r.ft_home IS NOT NULL
+              AND r.ft_away IS NOT NULL
+            ORDER BY m.kickoff, m.match_id
+            """,
+            (*codes, date_from, date_to),
+        )
+    )
+
+    per: dict[str, dict[str, int]] = {
+        code: {
+            "priced": 0,
+            "evaluated": 0,
+            "already_evaluated": 0,
+            "excluded": 0,
+            "failed": 0,
+        }
+        for code in codes
+    }
+
+    for row in rows:
+        competition = str(row["competition"] or "PL").upper()
+        match_id = str(row["match_id"])
+        experiment_id = bot_live_experiment_id(competition)
+        bucket = per.setdefault(
+            competition,
+            {
+                "priced": 0,
+                "evaluated": 0,
+                "already_evaluated": 0,
+                "excluded": 0,
+                "failed": 0,
+            },
+        )
+        existing = find_score_model_prediction(
+            connection,
+            match_id=match_id,
+            experiment_id=experiment_id,
+        )
+        if existing is not None:
+            status = evaluate_stored_score_model(
+                connection,
+                prediction_id=str(existing["prediction_id"]),
+                body_json=str(existing["body_json"]),
+                ft_home=int(row["ft_home"]),
+                ft_away=int(row["ft_away"]),
+                ht_home=row["ht_home"],
+                ht_away=row["ht_away"],
+                revision=int(row["revision"] or 1),
+            )
+            if status == "evaluated":
+                counts["evaluated"] += 1
+                bucket["evaluated"] += 1
+            elif status == "already_evaluated":
+                counts["already_evaluated"] += 1
+                bucket["already_evaluated"] += 1
+            else:
+                counts["failed"] += 1
+                bucket["failed"] += 1
+            continue
+
+        result = price_one_score_model(connection, match_id, replace=False)
+        status = str(result.get("status") or "")
+        if status == "priced":
+            # New prediction (+ auto-eval when FT exists). Count as priced only.
+            counts["priced"] += 1
+            bucket["priced"] += 1
+        elif status == "existing":
+            # Race / alternate path: prediction appeared; compare now.
+            again = find_score_model_prediction(
+                connection,
+                match_id=match_id,
+                experiment_id=experiment_id,
+            )
+            if again is not None:
+                ev = evaluate_stored_score_model(
+                    connection,
+                    prediction_id=str(again["prediction_id"]),
+                    body_json=str(again["body_json"]),
+                    ft_home=int(row["ft_home"]),
+                    ft_away=int(row["ft_away"]),
+                    ht_home=row["ht_home"],
+                    ht_away=row["ht_away"],
+                    revision=int(row["revision"] or 1),
+                )
+                if ev == "evaluated":
+                    counts["evaluated"] += 1
+                    bucket["evaluated"] += 1
+                elif ev == "already_evaluated":
+                    counts["already_evaluated"] += 1
+                    bucket["already_evaluated"] += 1
+                else:
+                    counts["failed"] += 1
+                    bucket["failed"] += 1
+            else:
+                counts["failed"] += 1
+                bucket["failed"] += 1
+        elif status == "excluded":
+            counts["excluded"] += 1
+            bucket["excluded"] += 1
+        else:
+            counts["failed"] += 1
+            bucket["failed"] += 1
+
+    connection.commit()
+    counts["by_competition"] = per
+    return counts
+
+
 def _last_season_ratio_cache(
     history: list[MatchRecord],
     *,
     k: float,
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Map current season -> club venue ratios computed from the previous season only."""
 
@@ -504,7 +821,13 @@ def _last_season_ratio_cache(
             }
         )
     ratios_by_source = {
-        season: club_venue_ratios(matches, k=k) for season, matches in by_season.items()
+        season: club_venue_ratios(
+            matches,
+            k=k,
+            goal_cap=goal_cap,
+            goal_cap_slope=goal_cap_slope,
+        )
+        for season, matches in by_season.items()
     }
     cache: dict[str, dict[str, dict[str, float]]] = {}
     for season in by_season:

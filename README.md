@@ -115,10 +115,11 @@ python -m laboratory import-leagues
 
 Override with `--competition FL1 --competition SA` and/or `--season 2025`.
 
-`price-finished` walk-forward prices **finished** stored matches with the Telegram bot `score_model` (live stack: `k=6`, last-season priors, fixed HT 0.45), one experiment per competition (`BOT-{code}-live`):
+`price-finished` walk-forward prices **finished** stored matches with the Telegram bot `score_model` (default live stack: `k=6`, last-season priors, fixed HT 0.45), one experiment per competition (`BOT-{code}-live`). Saudi Pro League (`SPL`) may use a promoted stack from `data/spl_stack.json`:
 
 ```bash
 python -m laboratory price-finished --exclude-competition PL
+python -m laboratory tune-spl
 ```
 
 `demo` loads four fictional matches and prices them with Poisson only.

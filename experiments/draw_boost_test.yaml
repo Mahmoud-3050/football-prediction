@@ -1,0 +1,14 @@
+experiment_id: "EXP-PL-draw-boost-test"
+competition: "PL"
+seasons: [2024, 2025]
+base_config:
+  k: 6.0
+  prior_mean: "last_season"
+  dependence: "independent"
+  half_time_share_mode: "fixed_0_45"
+  ratio_mode: "one_pass"
+param_grid:
+  draw_boost: [1.0, 1.1, 1.2]
+  k: [5.0, 6.0]
+primary_metric: "log_loss"
+min_matches: 50

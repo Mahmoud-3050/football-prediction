@@ -144,7 +144,13 @@ def test_ensure_standings_uses_db_after_first_store(tmp_path: Path, monkeypatch)
     connection = connect(tmp_path / "football.db")
     calls = {"n": 0}
 
-    def fake_fetch(api_key: str, competition: str, *, season: int | None = None):
+    def fake_fetch(
+        api_key: str,
+        competition: str,
+        *,
+        season: int | None = None,
+        **_kwargs: Any,
+    ):
         calls["n"] += 1
         return _sample_payload()
 
@@ -172,7 +178,7 @@ def test_dashboard_standings_reads_from_db(tmp_path: Path) -> None:
     assert "T14:22:43" not in page
     assert " UTC" not in page
     assert "Cairo" in page
-    assert "crests.football-data.org/57.png" in page
+    assert "/crests/57.png" in page or "crests.football-data.org/57.png" in page
     assert 'class="crest"' in page
     assert 'class="emblem"' in page
     assert "/crests/PL.png" in page or "crests.football-data.org/PL.png" in page

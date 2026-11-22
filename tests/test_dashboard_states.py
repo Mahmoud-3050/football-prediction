@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from laboratory.dashboard import (
+    _apply,
+    _confidence_threshold,
+    _filter_form,
     match_detail,
     match_list,
     not_found_page,
@@ -13,6 +16,175 @@ from laboratory.dashboard import (
     standings,
 )
 from laboratory.store import connect
+
+
+def test_confidence_threshold_parser() -> None:
+    assert _confidence_threshold("all") is None
+    assert _confidence_threshold("65") == 0.65
+    assert _confidence_threshold("0.55") == 0.55
+
+
+def test_market_confidences_cover_ft_ht_score_and_goals() -> None:
+    from laboratory.dashboard import (
+        _ft_1x2_from_body,
+        _match_table,
+        _prediction_market_confidences,
+    )
+
+    body = {
+        "engine": "score_model",
+        "full_time": {
+            "result_1x2": {
+                "home": 0.62,
+                "draw": 0.22,
+                "away": 0.16,
+                "most_likely": "home",
+            },
+            "exact_score_most_likely": {"home_goals": 1, "away_goals": 0},
+            "exact_scores": [
+                {"home_goals": 1, "away_goals": 0, "probability": 0.18},
+                {"home_goals": 2, "away_goals": 0, "probability": 0.12},
+            ],
+            "over_under_2_5": {"over": 0.44, "under": 0.56, "most_likely": "under"},
+            "over_under_3_5": {"over": 0.28, "under": 0.72, "most_likely": "under"},
+        },
+        "half_time": {
+            "withheld": False,
+            "result_1x2": {
+                "home": 0.41,
+                "draw": 0.38,
+                "away": 0.21,
+                "most_likely": "home",
+            },
+        },
+    }
+    selection, probability = _ft_1x2_from_body(body)
+    assert selection == "Home"
+    assert probability == 0.62
+    markets = _prediction_market_confidences(body)
+    assert markets["full_time_1x2"]["selection"] == "Home"
+    assert markets["full_time_1x2"]["confidence"] == 0.62
+    assert markets["half_time_1x2"]["selection"] == "Home"
+    assert markets["half_time_1x2"]["confidence"] == 0.41
+    assert markets["exact_score"]["selection"] == "1–0"
+    assert markets["exact_score"]["confidence"] == 0.18
+    assert markets["over_under_2_5"]["selection"] == "Under"
+    assert markets["over_under_2_5"]["confidence"] == 0.56
+    assert markets["over_under_3_5"]["selection"] == "Under"
+    assert markets["over_under_3_5"]["confidence"] == 0.72
+
+    html_page = _match_table(
+        [
+            {
+                "match_id": "m1",
+                "competition": "SPL",
+                "season": "2026",
+                "home_name": "Al Hilal",
+                "away_name": "Al Nassr",
+                "kickoff": "2026-11-02T15:00:00Z",
+                "ft_home": 1,
+                "ft_away": 0,
+                "engine_status": "completed",
+                "metrics": {
+                    "full_time_1x2": {
+                        "status": "scored",
+                        "selection": "home",
+                        "actual": "home",
+                        "correct": True,
+                    }
+                },
+                "body": body,
+            }
+        ],
+        {
+            "league": "",
+            "season": "",
+            "team": "",
+            "date_from": "",
+            "date_to": "",
+            "fixture": "all",
+            "status": "all",
+            "verdict": "all",
+            "confidence": "all",
+            "order": "newest",
+        },
+    )
+    assert "market-strip" in html_page
+    assert "FT 1X2" in html_page
+    assert "HT" in html_page
+    assert "Goals 2.5" in html_page
+    assert "Goals 3.5" in html_page
+    assert "62%" in html_page
+    assert "56%" in html_page
+    assert "72%" in html_page
+
+
+def test_confidence_filter_keeps_high_prob_picks_only() -> None:
+    rows = [
+        {
+            "competition": "PL",
+            "season": "2026",
+            "home_name": "A",
+            "away_name": "B",
+            "kickoff": "2026-11-01T15:00:00Z",
+            "match_id": "1",
+            "ft_home": 1,
+            "ft_away": 0,
+            "engine_status": "completed",
+            "metrics": {
+                "full_time_1x2": {
+                    "status": "scored",
+                    "selection": "home",
+                    "actual": "home",
+                    "correct": True,
+                }
+            },
+            "body": {
+                "engine": "score_model",
+                "full_time": {"result_1x2": {"home": 0.7, "draw": 0.2, "away": 0.1}},
+            },
+        },
+        {
+            "competition": "PL",
+            "season": "2026",
+            "home_name": "C",
+            "away_name": "D",
+            "kickoff": "2026-11-02T15:00:00Z",
+            "match_id": "2",
+            "ft_home": 0,
+            "ft_away": 1,
+            "engine_status": "completed",
+            "metrics": {
+                "full_time_1x2": {
+                    "status": "scored",
+                    "selection": "away",
+                    "actual": "away",
+                    "correct": True,
+                }
+            },
+            "body": {
+                "engine": "score_model",
+                "full_time": {"result_1x2": {"home": 0.3, "draw": 0.3, "away": 0.4}},
+            },
+        },
+    ]
+    filters = {
+        "league": "",
+        "season": "",
+        "team": "",
+        "date_from": "",
+        "date_to": "",
+        "fixture": "all",
+        "status": "all",
+        "verdict": "all",
+        "confidence": "65",
+        "order": "newest",
+    }
+    kept = _apply(rows, filters)
+    assert [row["match_id"] for row in kept] == ["1"]
+    form = _filter_form("/", filters, ["PL"], ["2026"], ["A"], submit="Show")
+    assert 'name="confidence"' in form
+    assert "≥ 65%" in form
 
 
 def test_overview_empty_database(tmp_path: Path) -> None:

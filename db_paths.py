@@ -9,6 +9,17 @@ from pathlib import Path
 DEFAULT_DATABASE_PATH = "data/football.db"
 
 
+def resolve_lab_database_path(
+    environ: dict[str, str] | None = None,
+) -> Path:
+    """Return the laboratory-specific database path (defaulting to data/lab.db)."""
+    source = environ if environ is not None else os.environ
+    lab = (source.get("LAB_DATABASE_PATH") or "").strip()
+    if lab:
+        return Path(lab)
+    return Path("data/lab.db")
+
+
 def resolve_database_path(
     environ: dict[str, str] | None = None,
     *,

@@ -426,6 +426,9 @@ class Pipeline:
         limitations = list(decision.limitations)
         estimate = None
         if decision.eligible:
+            from league_stacks import draw_calibration_kwargs, live_stack_for
+
+            stack = live_stack_for(competition.code)
             estimate = estimate_score(
                 competition_finished_payload=competition_finished,
                 home_finished_payload=home_form,
@@ -434,8 +437,13 @@ class Pipeline:
                 away_team_id=away.id,
                 include_half_time=include_half_time,
                 kickoff=fixture.utc_date,
-                prior_mean_mode="last_season",
-                half_time_share_mode="fixed_0_45",
+                k=float(stack["k"]),
+                prior_mean_mode=str(stack["prior_mean"]),
+                half_time_share_mode=str(stack["half_time_share_mode"]),
+                dependence=str(stack["dependence"]),
+                ratio_mode=str(stack.get("ratio_mode") or "one_pass"),
+                decay_half_life_days=stack.get("decay_half_life_days"),
+                **draw_calibration_kwargs(stack),
             )
             derived["score_model"] = estimate.public()
             for note in estimate.limitations:

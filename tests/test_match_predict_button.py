@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from http.cookiejar import CookieJar
@@ -15,6 +16,7 @@ from laboratory.auth import DashboardAuth
 from laboratory.dashboard import match_detail
 from laboratory.job import price_one_score_model
 from laboratory.store import append_result, connect, upsert_match
+from league_stacks import DEFAULT_LIVE_STACK, save_live_stack
 
 
 def _seed_priced_history(connection, *, competition: str = "PL") -> str:
@@ -99,6 +101,78 @@ def test_price_one_score_model_stores_prediction_and_evaluation(tmp_path: Path) 
         (row["prediction_id"],),
     ).fetchone()
     assert evaluation is not None
+
+
+def test_rerun_prediction_applies_promoted_pl_stack(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Re-run (replace=True) must pick up live stack knobs, not a stale default body."""
+
+    monkeypatch.chdir(tmp_path)
+    connection = connect(tmp_path / "lab.db")
+    match_id = _seed_priced_history(connection)
+
+    save_live_stack("PL", DEFAULT_LIVE_STACK)
+    first = price_one_score_model(connection, match_id, replace=True)
+    assert first["ok"] is True and first["status"] == "priced"
+    row = connection.execute(
+        """
+        SELECT model_id, body_json FROM predictions
+        WHERE match_id = ? AND experiment_id = ? AND engine = 'score_model'
+        """,
+        (match_id, BOT_EXPERIMENT_ID),
+    ).fetchone()
+    assert row is not None
+    body = json.loads(row["body_json"])
+    assert row["model_id"] == "bot-score-model-live"
+    assert body["k"] == 6.0
+    assert body["config_id"] == "bot-score-model-live"
+
+    save_live_stack(
+        "PL",
+        {
+            "k": 12.0,
+            "prior_mean": "last_season",
+            "dependence": "independent",
+            "half_time_share_mode": "club_shrunk",
+            "ratio_mode": "one_pass",
+            "model_id": "bot-score-model-pl-v2",
+            "decay_half_life_days": 150.0,
+            "draw_boost": 1.06,
+            "goal_cap": 4.0,
+            "goal_cap_slope": 0.5,
+            "nb_alpha": 0.0,
+            "promoted_attack_prior": 0.80,
+            "promoted_defence_prior": 1.25,
+            "selected_experiment_id": "EXP-PL-FINAL-HOLD-21",
+            "code_version": "score_model_v1",
+        },
+    )
+    second = price_one_score_model(connection, match_id, replace=True)
+    assert second["ok"] is True and second["status"] == "priced"
+
+    rows = connection.execute(
+        """
+        SELECT model_id, body_json FROM predictions
+        WHERE match_id = ? AND experiment_id = ? AND engine = 'score_model'
+        """,
+        (match_id, BOT_EXPERIMENT_ID),
+    ).fetchall()
+    assert len(rows) == 1
+    body = json.loads(rows[0]["body_json"])
+    assert rows[0]["model_id"] == "bot-score-model-pl-v2"
+    assert body["config_id"] == "bot-score-model-pl-v2"
+    assert body["k"] == 12.0
+    assumptions = " ".join(body.get("assumptions") or [])
+    assumptions += " " + " ".join((body.get("bot_public") or {}).get("assumptions") or [])
+    assert "soft cap=4" in assumptions
+    assert "Promoted-team prior fallback" in assumptions
+    assert "half-life 150" in assumptions
+    assert "Draw scorelines are boosted by ×1.06" in assumptions
+    page = match_detail(connection, match_id, csrf_token="test-csrf")
+    assert page is not None
+    assert "Re-run prediction" in page
+    assert "bot-score-model-pl-v2" in page
 
 
 def test_match_detail_shows_predict_button(tmp_path: Path) -> None:

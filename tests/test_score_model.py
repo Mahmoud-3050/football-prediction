@@ -639,3 +639,241 @@ def _games(
             )
         )
     return {"matches": matches, "lastUpdated": "2026-03-01T12:00:00Z"}
+
+
+def test_uniform_draw_boost_is_noop_at_one() -> None:
+    from score_model import _boost_draw_scorelines, estimate_from_lambdas
+
+    base = estimate_from_lambdas(1.4, 1.3, draw_boost=1.0)
+    boosted = _boost_draw_scorelines(base.matrix, 1.0)
+    assert boosted is base.matrix or boosted == base.matrix
+
+
+def test_weighted_draw_boost_prefers_low_score_draws() -> None:
+    from score_model import estimate_from_lambdas
+
+    plain = estimate_from_lambdas(1.3, 1.2, draw_boost=1.0)
+    weighted = estimate_from_lambdas(
+        1.3,
+        1.2,
+        draw_boost=1.0,
+        draw_weights=[1.5, 1.3, 1.0, 0.5, 0.25],
+    )
+    assert weighted.probability(0, 0) > plain.probability(0, 0)
+    assert weighted.probability(1, 1) > plain.probability(1, 1)
+    # High-score draws should not gain (and usually shrink after renormalize).
+    assert weighted.probability(4, 4) <= plain.probability(4, 4) + 1e-12
+    assert abs(sum(sum(row) for row in weighted.matrix) - 1.0) < 1e-9
+    assert weighted.probabilities["draw"] > plain.probabilities["draw"]
+
+
+def test_draw_weights_fallback_uses_draw_boost_beyond_length() -> None:
+    from score_model import _boost_draw_scorelines
+
+    matrix = (
+        (0.2, 0.1, 0.05),
+        (0.1, 0.2, 0.05),
+        (0.05, 0.05, 0.2),
+    )
+    boosted = _boost_draw_scorelines(matrix, 1.5, draw_weights=[2.0])
+    # i=0 uses 1.5*2.0; i>=1 falls back to 1.5 alone before renormalize.
+    raw00 = 0.2 * 1.5 * 2.0
+    raw11 = 0.2 * 1.5
+    raw22 = 0.2 * 1.5
+    total = (
+        raw00
+        + 0.1
+        + 0.05
+        + 0.1
+        + raw11
+        + 0.05
+        + 0.05
+        + 0.05
+        + raw22
+    )
+    assert abs(boosted[0][0] - raw00 / total) < 1e-12
+    assert abs(boosted[1][1] - raw11 / total) < 1e-12
+    assert abs(boosted[2][2] - raw22 / total) < 1e-12
+
+
+def test_tightness_decays_draw_boost_on_lopsided_lambdas() -> None:
+    from score_model import estimate_from_lambdas
+
+    even = estimate_from_lambdas(
+        1.4,
+        1.35,
+        draw_boost=1.5,
+        draw_tightness_scale=1.0,
+    )
+    lopsided = estimate_from_lambdas(
+        2.4,
+        0.6,
+        draw_boost=1.5,
+        draw_tightness_scale=1.0,
+    )
+    assert even.effective_draw_boost > lopsided.effective_draw_boost
+    assert lopsided.effective_draw_boost < 1.5
+
+
+def test_select_1x2_outcome_decouples_draw_picks() -> None:
+    from score_model import select_1x2_outcome
+
+    assert select_1x2_outcome(0.40, 0.30, 0.30) == "home"
+    assert (
+        select_1x2_outcome(
+            0.40,
+            0.30,
+            0.30,
+            draw_pick_threshold=0.28,
+            draw_pick_margin=0.12,
+        )
+        == "draw"
+    )
+    assert (
+        select_1x2_outcome(
+            0.55,
+            0.30,
+            0.15,
+            draw_pick_threshold=0.28,
+            draw_pick_margin=0.05,
+        )
+        == "home"
+    )
+
+
+def test_estimate_applies_draw_pick_rule_to_markets() -> None:
+    from score_model import estimate_from_lambdas
+
+    plain = estimate_from_lambdas(1.25, 1.2, draw_boost=1.0)
+    # Force a tight probability board via mild boost, then promote draw via pick rule.
+    ruled = estimate_from_lambdas(
+        1.25,
+        1.2,
+        draw_boost=1.0,
+        draw_pick_threshold=0.0,
+        draw_pick_margin=1.0,
+    )
+    assert ruled.markets.result_1x2 == "Draw"
+    assert ruled.probabilities == plain.probabilities
+
+
+def test_soft_blowout_goal_capping_and_default_identity() -> None:
+    from score_model import club_venue_ratios, estimate_score
+
+    matches = [
+        {
+            "id": 1,
+            "utcDate": "2025-08-10T15:00:00Z",
+            "status": "FINISHED",
+            "homeTeam": {"id": 1},
+            "awayTeam": {"id": 2},
+            "score": {"fullTime": {"home": 7, "away": 0}},
+        },
+        {
+            "id": 2,
+            "utcDate": "2025-08-17T15:00:00Z",
+            "status": "FINISHED",
+            "homeTeam": {"id": 2},
+            "awayTeam": {"id": 1},
+            "score": {"fullTime": {"home": 1, "away": 1}},
+        },
+    ]
+    base = estimate_score(
+        competition_finished_payload={"matches": matches},
+        home_finished_payload={"matches": matches},
+        away_finished_payload={"matches": matches},
+        home_team_id=1,
+        away_team_id=2,
+        include_half_time=False,
+        kickoff="2025-08-24T15:00:00Z",
+    )
+    explicit_none = estimate_score(
+        competition_finished_payload={"matches": matches},
+        home_finished_payload={"matches": matches},
+        away_finished_payload={"matches": matches},
+        home_team_id=1,
+        away_team_id=2,
+        include_half_time=False,
+        kickoff="2025-08-24T15:00:00Z",
+        goal_cap=None,
+    )
+    assert base.matrix == explicit_none.matrix
+
+    capped = estimate_score(
+        competition_finished_payload={"matches": matches},
+        home_finished_payload={"matches": matches},
+        away_finished_payload={"matches": matches},
+        home_team_id=1,
+        away_team_id=2,
+        include_half_time=False,
+        kickoff="2025-08-24T15:00:00Z",
+        goal_cap=3.0,
+        goal_cap_slope=0.5,
+    )
+    assert capped.lambda_home < base.lambda_home
+    assert matches[0]["score"]["fullTime"]["home"] == 7  # raw payload untouched
+
+    ratios_raw = club_venue_ratios(
+        [{"home_id": "1", "away_id": "2", "ft_home": 7, "ft_away": 0}]
+    )
+    ratios_cap = club_venue_ratios(
+        [{"home_id": "1", "away_id": "2", "ft_home": 7, "ft_away": 0}],
+        goal_cap=3.0,
+        goal_cap_slope=0.5,
+    )
+    assert ratios_raw == club_venue_ratios(
+        [{"home_id": "1", "away_id": "2", "ft_home": 7, "ft_away": 0}],
+        goal_cap=None,
+    )
+    assert ratios_cap["1"]["attack_home"] == ratios_raw["1"]["attack_home"]  # 1-match league avg scales
+
+
+def test_negative_binomial_overdispersion_and_default_identity() -> None:
+    from score_model import estimate_from_lambdas
+
+    poisson = estimate_from_lambdas(1.6, 1.2, nb_alpha=0.0)
+    default = estimate_from_lambdas(1.6, 1.2)
+    assert poisson.matrix == default.matrix
+
+    nb = estimate_from_lambdas(1.6, 1.2, nb_alpha=0.10)
+    assert abs(sum(sum(row) for row in nb.matrix) - 1.0) < 1e-9
+    # Overdispersion shifts mass into 0-0 and tails relative to Poisson.
+    assert nb.probability(0, 0) > poisson.probability(0, 0)
+    # Marginal mean ~ lambda_home and variance > lambda_home
+    home_marginal = [sum(row) for row in nb.matrix]
+    mean_h = sum(g * p for g, p in enumerate(home_marginal))
+    var_h = sum(((g - mean_h) ** 2) * p for g, p in enumerate(home_marginal))
+    assert abs(mean_h - 1.6) < 0.02
+    assert var_h > 1.6 + 0.10 * (1.6**2) - 0.15
+
+
+def test_promoted_team_prior_fallback() -> None:
+    from score_model import prior_means_for_fixture
+
+    club_ratios = {
+        "established": {
+            "attack_home": 1.2,
+            "defence_home": 0.9,
+            "attack_away": 1.1,
+            "defence_away": 0.95,
+        }
+    }
+    default = prior_means_for_fixture(
+        club_ratios, home_id="promoted", away_id="established"
+    )
+    assert default["attack_home"] == 1.0
+    assert default["defence_home"] == 1.0
+    assert default["attack_away"] == 1.1
+    assert default["defence_away"] == 0.95
+
+    custom = prior_means_for_fixture(
+        club_ratios,
+        home_id="promoted",
+        away_id="established",
+        promoted_attack_prior=0.85,
+        promoted_defence_prior=1.15,
+    )
+    assert custom["attack_home"] == 0.85
+    assert custom["defence_home"] == 1.15
+    assert custom["attack_away"] == 1.1
+    assert custom["defence_away"] == 0.95

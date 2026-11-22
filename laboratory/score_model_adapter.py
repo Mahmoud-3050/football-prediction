@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import zlib
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from laboratory import SCORE_MODEL_CONFIG_ID
-from score_model import K, MINIMUM_HALF_TIME_SAMPLES, ScoreEstimate, estimate_score
+from score_model import (
+    K,
+    MINIMUM_HALF_TIME_SAMPLES,
+    ScoreEstimate,
+    estimate_score,
+    select_1x2_outcome,
+)
 
 MINIMUM_SCORED_MATCHES = 3
 SCORE_MODEL_ENGINE = "score_model"
@@ -34,6 +40,17 @@ def price_from_snapshot(
     ratio_mode: str = "one_pass",
     dependence: str = "independent",
     half_time_share_mode: str = "club_shrunk",
+    draw_boost: float = 1.0,
+    draw_weights: Sequence[float] | None = None,
+    draw_pick_threshold: float | None = None,
+    draw_pick_margin: float | None = None,
+    draw_tightness_scale: float | None = None,
+    draw_tightness_ref: float = 1.0,
+    goal_cap: float | None = None,
+    goal_cap_slope: float = 0.5,
+    nb_alpha: float = 0.0,
+    promoted_attack_prior: float | None = None,
+    promoted_defence_prior: float | None = None,
 ) -> ScoreModelOutcome:
     """Price one pre-kickoff snapshot with the bot scorer."""
 
@@ -92,6 +109,17 @@ def price_from_snapshot(
         ratio_mode=ratio_mode,
         dependence=dependence,
         half_time_share_mode=half_time_share_mode,
+        draw_boost=draw_boost,
+        draw_weights=draw_weights,
+        draw_pick_threshold=draw_pick_threshold,
+        draw_pick_margin=draw_pick_margin,
+        draw_tightness_scale=draw_tightness_scale,
+        draw_tightness_ref=draw_tightness_ref,
+        goal_cap=goal_cap,
+        goal_cap_slope=goal_cap_slope,
+        nb_alpha=nb_alpha,
+        promoted_attack_prior=promoted_attack_prior,
+        promoted_defence_prior=promoted_defence_prior,
     )
     return ScoreModelOutcome(
         excluded=False,
@@ -112,7 +140,13 @@ def to_evaluable_body(
 ) -> dict[str, Any]:
     """Nested market body compatible with evaluate_prediction (poisson-shaped)."""
 
-    full_time = _distribution_block(estimate.matrix, estimate.lambda_home, estimate.lambda_away)
+    full_time = _distribution_block(
+        estimate.matrix,
+        estimate.lambda_home,
+        estimate.lambda_away,
+        draw_pick_threshold=estimate.draw_pick_threshold,
+        draw_pick_margin=estimate.draw_pick_margin,
+    )
     full_time["max_goals"] = estimate.max_goals
     if include_half_time and estimate.half_time_share_home is not None and estimate.half_time_share_away is not None:
         half_matrix = _half_matrix(estimate)
@@ -213,6 +247,7 @@ def _half_matrix(estimate: ScoreEstimate) -> tuple[tuple[float, ...], ...]:
         include_half_time=False,
         tail_tolerance=estimate.tail_tolerance,
         k=estimate.k,
+        nb_alpha=estimate.nb_alpha,
     )
     return half.matrix
 
@@ -221,6 +256,9 @@ def _distribution_block(
     matrix: tuple[tuple[float, ...], ...],
     lambda_home: float,
     lambda_away: float,
+    *,
+    draw_pick_threshold: float | None = None,
+    draw_pick_margin: float | None = None,
 ) -> dict[str, Any]:
     cells: list[dict[str, float | int]] = []
     ranked: list[tuple[float, int, int]] = []
@@ -258,7 +296,13 @@ def _distribution_block(
             "home": home,
             "draw": draw,
             "away": away,
-            "most_likely": _argmax_three(home, draw, away),
+            "most_likely": select_1x2_outcome(
+                home,
+                draw,
+                away,
+                draw_pick_threshold=draw_pick_threshold,
+                draw_pick_margin=draw_pick_margin,
+            ),
         },
         "over_under_2_5": {
             "over": over_25,
@@ -271,11 +315,3 @@ def _distribution_block(
             "most_likely": "over" if over_35 > 0.5 else "under",
         },
     }
-
-
-def _argmax_three(home: float, draw: float, away: float) -> str:
-    if home >= draw and home >= away:
-        return "home"
-    if draw >= away:
-        return "draw"
-    return "away"
