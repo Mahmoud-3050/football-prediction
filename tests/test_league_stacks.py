@@ -72,12 +72,14 @@ _PROMOTED_LIVE = {
         "model_id": "bot-score-model-ded-v3",
     },
     "CL": {
-        "k": 12.0,
-        "draw_boost": 1.0,
+        "k": 8.0,
+        "draw_boost": 0.85,
         "goal_cap": None,
-        "promoted_attack_prior": None,
-        "promoted_defence_prior": None,
-        "model_id": "bot-score-model-cl-v2",
+        "promoted_attack_prior": 0.85,
+        "promoted_defence_prior": 1.15,
+        "dependence": "dixon_coles",
+        "nb_alpha": 0.1,
+        "model_id": "bot-score-model-cl-v3",
     },
 }
 
@@ -97,10 +99,10 @@ def test_promoted_live_stacks_resolve_exact_knobs() -> None:
         for key, value in expected.items():
             assert stack[key] == value, (code, key, stack[key], value)
         assert stack["prior_mean"] == "last_season"
-        assert stack["dependence"] == "independent"
+        assert stack["dependence"] == expected.get("dependence", "independent")
         assert stack["half_time_share_mode"] == "club_shrunk"
         assert stack["decay_half_life_days"] == 150.0
-        assert stack["nb_alpha"] == 0.0
+        assert stack["nb_alpha"] == expected.get("nb_alpha", 0.0)
         assert stack["code_version"] == "score_model_v1"
 
 

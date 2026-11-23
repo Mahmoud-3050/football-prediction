@@ -12,8 +12,8 @@ from typing import Any
 from laboratory.football_data import COMPETITION_NAMES
 
 STANDINGS_URL = "https://api.football-data.org/v4/competitions/{competition}/standings"
-# Cups do not expose a single TOTAL table on this endpoint.
-STANDINGS_COMPETITIONS = ("PL", "PD", "FL1", "BL1", "SA", "PPL", "DED", "SPL")
+# Leagues and European league stage (CL 36-team single table)
+STANDINGS_COMPETITIONS = ("PL", "PD", "FL1", "BL1", "SA", "PPL", "DED", "SPL", "CL")
 
 
 def fetch_standings(

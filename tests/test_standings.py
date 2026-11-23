@@ -191,3 +191,22 @@ def test_dashboard_standings_reads_from_db(tmp_path: Path) -> None:
     ).fetchone()
     assert league is not None
     assert "PL.png" in league["emblem_url"] or "/crests/PL.png" in league["emblem_url"]
+
+
+def test_dashboard_cl_standings_zones_and_legend(tmp_path: Path) -> None:
+    from laboratory.dashboard import _standings_zone
+    # 36 teams in CL league phase
+    # 1-8: direct R16
+    assert _standings_zone(1, 36, "CL") == "zone-europe"
+    assert _standings_zone(8, 36, "CL") == "zone-europe"
+    # 9-24: playoff
+    assert _standings_zone(9, 36, "CL") == "zone-playoff"
+    assert _standings_zone(24, 36, "CL") == "zone-playoff"
+    # 25-36: drop
+    assert _standings_zone(25, 36, "CL") == "zone-drop"
+    assert _standings_zone(36, 36, "CL") == "zone-drop"
+
+    # Domestic leagues remain untouched
+    assert _standings_zone(4, 20, "PL") == "zone-europe"
+    assert _standings_zone(5, 20, "PL") == ""
+    assert _standings_zone(18, 20, "PL") == "zone-drop"

@@ -1,0 +1,21 @@
+experiment_id: "EXP-CL-OPT-02"
+competition: "CL"
+seasons: [2024, 2025, 2026]
+tuning_seasons: [2024, 2025]
+holdout_seasons: [2026]
+base_config:
+  prior_mean: "last_season"
+  half_time_share_mode: "club_shrunk"
+  ratio_mode: "one_pass"
+  decay_half_life_days: 150.0
+  goal_cap: null
+  goal_cap_slope: 0.5
+param_grid:
+  k: [8.0]
+  draw_boost: [0.85]
+  nb_alpha: [0.1]
+  dependence: ["independent", "dixon_coles"]
+  promoted_attack_prior: [0.85]
+  promoted_defence_prior: [1.15]
+primary_metric: "log_loss"
+min_matches: 100

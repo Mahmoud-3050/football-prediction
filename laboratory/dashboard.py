@@ -2490,7 +2490,7 @@ def standings(
     total = len(rows)
     for row in rows:
         position = int(row["position"])
-        zone = _standings_zone(position, total)
+        zone = _standings_zone(position, total, competition)
         gd = row["goal_difference"]
         gd_text = "—" if gd is None else (f"+{gd}" if int(gd) > 0 else str(gd))
         gd_class = ""
@@ -2539,15 +2539,33 @@ def standings(
         ),
         (
             '<p class="legend note">'
-            '<span class="swatch europe"></span> European places · '
-            '<span class="swatch drop"></span> Relegation zone'
-            "</p>"
+            + (
+                '<span class="swatch europe"></span> Round of 16 (Top 8) · '
+                '<span class="swatch playoff"></span> Playoff phase (9–24) · '
+                '<span class="swatch drop"></span> Eliminated (25–36)'
+                if competition == "CL"
+                else (
+                    '<span class="swatch europe"></span> European places · '
+                    '<span class="swatch drop"></span> Relegation zone'
+                )
+            )
+            + "</p>"
         ),
     ]
     return _page("Standings", "\n".join(body), filters)
 
 
-def _standings_zone(position: int, total: int) -> str:
+def _standings_zone(position: int, total: int, competition: str = "") -> str:
+    if competition == "CL":
+        # UEFA Champions League 36-team league phase:
+        # 1-8: Direct Round of 16 qualification (zone-europe)
+        # 9-24: Playoff round qualification (zone-playoff)
+        # 25-36: Eliminated (zone-drop)
+        if position <= 8:
+            return "zone-europe"
+        if position <= 24:
+            return "zone-playoff"
+        return "zone-drop"
     if position <= 4:
         return "zone-europe"
     if total >= 18 and position > total - 3:
@@ -3666,17 +3684,21 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None, *, extra
     table.standings .pos-num {{
       display: inline-flex; min-width: 1.5rem; justify-content: flex-end; font-weight: 700;
     }}
-    table.standings tr:nth-child(even):not(.zone-europe):not(.zone-drop) td {{
+    table.standings tr:nth-child(even):not(.zone-europe):not(.zone-playoff):not(.zone-drop) td {{
       background: rgba(255, 255, 255, 0.02);
     }}
     table.standings tr.zone-europe td {{
       background: rgba(52, 211, 153, 0.14);
+    }}
+    table.standings tr.zone-playoff td {{
+      background: rgba(96, 165, 250, 0.14);
     }}
     table.standings tr.zone-drop td {{
       background: rgba(251, 113, 133, 0.14);
     }}
     table.standings tr:hover td {{ background: rgba(52, 211, 153, 0.08); }}
     table.standings tr.zone-europe:hover td {{ background: rgba(52, 211, 153, 0.2); }}
+    table.standings tr.zone-playoff:hover td {{ background: rgba(96, 165, 250, 0.2); }}
     table.standings tr.zone-drop:hover td {{ background: rgba(251, 113, 133, 0.2); }}
     .form-row {{ display: inline-flex; gap: 4px; }}
     .form-pill {{
@@ -3692,6 +3714,7 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None, *, extra
       vertical-align: -1px;
     }}
     .swatch.europe {{ background: #34d399; }}
+    .swatch.playoff {{ background: #60a5fa; }}
     .swatch.drop {{ background: #fb7185; }}
     @media (max-width: 960px) {{
       .match-list {{ grid-template-columns: 1fr; }}

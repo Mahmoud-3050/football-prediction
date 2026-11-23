@@ -187,7 +187,7 @@ Providers (read-only network):
 | `laboratory/poisson_engine.py` | Lab-only Poisson | `price_match`, `_distribution` | Separate from bot path |
 | `laboratory/evaluate.py` | Metrics | `evaluate_prediction` | Does not mutate probs |
 | `laboratory/football_data.py` | Season import | `fetch_season`, `import_bodies`, `COMPETITION_NAMES` | Prefer LFA for SPL |
-| `laboratory/standings.py` | Standings import | `import_all_standings`, `STANDINGS_COMPETITIONS` | |
+| `laboratory/standings.py` | Standings import | `import_all_standings`, `STANDINGS_COMPETITIONS` (`PL`, `PD`, `FL1`, `BL1`, `SA`, `PPL`, `DED`, `SPL`, `CL`) | |
 | `laboratory/dashboard.py` | HTML UI | `overview`, `match_list`, `match_detail`, `experiments_list`, `experiment_detail`, JSON launch textarea, Exact/O/U leaderboard + AI prompt, Re-run | Auth via `auth.py`; no React |
 | `laboratory/auth.py` | Dashboard login | session cookie, CSRF | Password required off-loopback |
 | `laboratory/gemini_schema.py` | Validate Gemini JSON (lab) | schema checks | |
@@ -306,7 +306,7 @@ Run-level aggregates (`lab_runner._aggregate_metrics` → `lab_experiment_runs.m
 
 #### Promoted live stacks (verified 2026-11-22)
 
-Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_season`, `dependence=independent`, `half_time_share_mode=club_shrunk`, `ratio_mode=one_pass`, `decay_half_life_days=150`, `goal_cap_slope=0.5`, `nb_alpha=0.0`, `code_version=score_model_v1`.
+Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_season`, `half_time_share_mode=club_shrunk`, `ratio_mode=one_pass`, `decay_half_life_days=150`, `goal_cap_slope=0.5`, `code_version=score_model_v1`. (`CL` uses `dependence=dixon_coles`, `nb_alpha=0.1`; other Euro leagues default to `dependence=independent`, `nb_alpha=0.0`).
 
 | Code | File | Experiment | k | draw_boost | goal_cap | promoted atk/def | model_id |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -317,7 +317,7 @@ Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_seas
 | FL1 | `configs/live/fl1_stack.json` | `EXP-EURO-DOMESTIC-01-FL1` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-fl1-v2` |
 | PPL | `configs/live/ppl_stack.json` | `EXP-EURO-DOMESTIC-01-PPL` | 8 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-ppl-v2` |
 | DED | `configs/live/ded_stack.json` | `EXP-EURO-DOMESTIC-01-DED` | 8 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-ded-v2` |
-| CL | `configs/live/cl_stack.json` | `EXP-CL-OPT-01` | 12 | 1.0 | null | null / null | `bot-score-model-cl-v2` |
+| CL | `configs/live/cl_stack.json` | `EXP-CL-OPT-02` | 8 | 0.85 | null | 0.85 / 1.15 | `bot-score-model-cl-v3` |
 | SPL | `data/spl_stack.json` (legacy; no `configs/live/spl_stack.json`) | `BOT-SPL-chal-db1p0-pick` | (file) | 1.0 + pick thr 0.28 / margin 0.05 | null | null | `bot-score-model-live` + `dependence=dixon_coles` |
 
 Unknown competition codes → `DEFAULT_LIVE_STACK`. **Do not** overwrite PL/SPL when promoting other leagues.
