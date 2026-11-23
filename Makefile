@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 PORT   ?= 8765
 HOST   ?= 127.0.0.1
 
-.PHONY: help install test bot jobs dash dash-restart dash-kill start kill restart
+.PHONY: help install test bot jobs dash dash-restart dash-kill start kill restart backup
 
 help:
 	@echo "Targets:"
@@ -15,6 +15,7 @@ help:
 	@echo "  make dash-restart  Restart dashboard only"
 	@echo "  make dash-kill     Stop process on :$(PORT)"
 	@echo "  make start         Bot + jobs + dashboard (./start.sh)"
+	@echo "  make backup        Backup football.db and lab.db to backups/"
 	@echo "  make kill          Alias for dash-kill"
 	@echo "  make restart       Alias for dash-restart"
 
@@ -46,3 +47,6 @@ dash-restart restart: dash-kill
 
 start:
 	./start.sh
+
+backup:
+	./scripts/backup_db.sh
