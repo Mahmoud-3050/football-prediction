@@ -198,12 +198,14 @@ class ExperimentRepository:
     ) -> None:
         if not items:
             return
+        from laboratory.store import _slim_snapshot_json
+
         rows = [
             (
                 f"{exp_id}:{payload['payload_hash']}",
                 exp_id,
                 payload["match_id"],
-                json.dumps(payload, sort_keys=True),
+                _slim_snapshot_json(payload),
                 1 if payload["leakage_ok"] else 0,
             )
             for exp_id, payload in items

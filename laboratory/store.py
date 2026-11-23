@@ -1001,6 +1001,13 @@ def append_result(connection: sqlite3.Connection, match_id: str, result: dict[st
     return revision
 
 
+def _slim_snapshot_json(payload: dict[str, Any]) -> str:
+    """Serialize snapshot metadata without the redundant prior_matches array."""
+    slim = dict(payload)
+    slim.pop("prior_matches", None)
+    return json.dumps(slim, sort_keys=True)
+
+
 def save_snapshot(
     connection: sqlite3.Connection,
     payload: dict[str, Any],
@@ -1018,7 +1025,7 @@ def save_snapshot(
             snapshot_id,
             experiment_id,
             payload["match_id"],
-            json.dumps(payload, sort_keys=True),
+            _slim_snapshot_json(payload),
             1 if payload["leakage_ok"] else 0,
         ),
     )

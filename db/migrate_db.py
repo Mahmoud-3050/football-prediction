@@ -138,7 +138,70 @@ def _sync_sequences(connection: sqlite3.Connection, tables: tuple[str, ...]) -> 
             )
 
 
+def compact_database(path: Path) -> dict[str, Any]:
+    """Strip redundant snapshot prior_matches payloads, checkpoint WAL, and VACUUM."""
+    target = Path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"Database not found: {target}")
+
+    before_bytes = target.stat().st_size
+    conn = sqlite3.connect(target, check_same_thread=False, timeout=60.0)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 60000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    try:
+        has_snapshots = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshots'"
+        ).fetchone()
+        slimmed = 0
+        if has_snapshots is not None:
+            cursor = conn.execute(
+                """
+                UPDATE snapshots
+                SET payload_json = json_remove(payload_json, '$.prior_matches')
+                WHERE json_type(payload_json, '$.prior_matches') IS NOT NULL
+                """
+            )
+            slimmed = int(cursor.rowcount or 0)
+            conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.commit()
+        conn.isolation_level = None
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA optimize")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
+        integrity = str(integrity_row[0]) if integrity_row else "unknown"
+    finally:
+        conn.close()
+
+    after_bytes = target.stat().st_size
+    return {
+        "path": str(target),
+        "before_bytes": before_bytes,
+        "after_bytes": after_bytes,
+        "saved_bytes": max(0, before_bytes - after_bytes),
+        "snapshots_slimmed": slimmed,
+        "integrity": integrity,
+    }
+
+
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Shared database merge and compaction.")
+    parser.add_argument(
+        "--compact",
+        nargs="+",
+        type=Path,
+        help="Compact one or more SQLite DBs (slim snapshots + VACUUM).",
+    )
+    args = parser.parse_args()
+    if args.compact:
+        for db_path in args.compact:
+            res = compact_database(db_path)
+            print(res)
+        return
     summary = merge_into_shared()
     print(summary)
     print(f"Shared database ready at {summary['destination']}")
