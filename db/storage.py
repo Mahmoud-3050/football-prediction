@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from models import AnalysisSnapshot, ProducedPrediction
+from core.models import AnalysisSnapshot, ProducedPrediction
 
 BOT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS prediction_run (
@@ -72,7 +72,7 @@ class Storage:
         self._conn.execute("PRAGMA synchronous = NORMAL")
         self._conn.execute("PRAGMA wal_autocheckpoint = 1000")
         # Bot + laboratory tables live in the same file.
-        from database import ensure_shared_schemas
+        from db.database import ensure_shared_schemas
 
         ensure_shared_schemas(self._conn)
 

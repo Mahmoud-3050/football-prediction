@@ -1,5 +1,5 @@
 from conftest import ARSENAL, CHELSEA, MAN_CITY, SPURS, make_match
-from score_model import K, TAIL_TOLERANCE, estimate_from_lambdas, estimate_score, inspect_grid
+from modeling.score_model import K, TAIL_TOLERANCE, estimate_from_lambdas, estimate_score, inspect_grid
 
 
 def test_grid_sums_to_one_under_independent_poisson() -> None:
@@ -642,7 +642,7 @@ def _games(
 
 
 def test_uniform_draw_boost_is_noop_at_one() -> None:
-    from score_model import _boost_draw_scorelines, estimate_from_lambdas
+    from modeling.score_model import _boost_draw_scorelines, estimate_from_lambdas
 
     base = estimate_from_lambdas(1.4, 1.3, draw_boost=1.0)
     boosted = _boost_draw_scorelines(base.matrix, 1.0)
@@ -650,7 +650,7 @@ def test_uniform_draw_boost_is_noop_at_one() -> None:
 
 
 def test_weighted_draw_boost_prefers_low_score_draws() -> None:
-    from score_model import estimate_from_lambdas
+    from modeling.score_model import estimate_from_lambdas
 
     plain = estimate_from_lambdas(1.3, 1.2, draw_boost=1.0)
     weighted = estimate_from_lambdas(
@@ -668,7 +668,7 @@ def test_weighted_draw_boost_prefers_low_score_draws() -> None:
 
 
 def test_draw_weights_fallback_uses_draw_boost_beyond_length() -> None:
-    from score_model import _boost_draw_scorelines
+    from modeling.score_model import _boost_draw_scorelines
 
     matrix = (
         (0.2, 0.1, 0.05),
@@ -697,7 +697,7 @@ def test_draw_weights_fallback_uses_draw_boost_beyond_length() -> None:
 
 
 def test_tightness_decays_draw_boost_on_lopsided_lambdas() -> None:
-    from score_model import estimate_from_lambdas
+    from modeling.score_model import estimate_from_lambdas
 
     even = estimate_from_lambdas(
         1.4,
@@ -716,7 +716,7 @@ def test_tightness_decays_draw_boost_on_lopsided_lambdas() -> None:
 
 
 def test_select_1x2_outcome_decouples_draw_picks() -> None:
-    from score_model import select_1x2_outcome
+    from modeling.score_model import select_1x2_outcome
 
     assert select_1x2_outcome(0.40, 0.30, 0.30) == "home"
     assert (
@@ -742,7 +742,7 @@ def test_select_1x2_outcome_decouples_draw_picks() -> None:
 
 
 def test_estimate_applies_draw_pick_rule_to_markets() -> None:
-    from score_model import estimate_from_lambdas
+    from modeling.score_model import estimate_from_lambdas
 
     plain = estimate_from_lambdas(1.25, 1.2, draw_boost=1.0)
     # Force a tight probability board via mild boost, then promote draw via pick rule.
@@ -758,7 +758,7 @@ def test_estimate_applies_draw_pick_rule_to_markets() -> None:
 
 
 def test_soft_blowout_goal_capping_and_default_identity() -> None:
-    from score_model import club_venue_ratios, estimate_score
+    from modeling.score_model import club_venue_ratios, estimate_score
 
     matches = [
         {
@@ -829,7 +829,7 @@ def test_soft_blowout_goal_capping_and_default_identity() -> None:
 
 
 def test_negative_binomial_overdispersion_and_default_identity() -> None:
-    from score_model import estimate_from_lambdas
+    from modeling.score_model import estimate_from_lambdas
 
     poisson = estimate_from_lambdas(1.6, 1.2, nb_alpha=0.0)
     default = estimate_from_lambdas(1.6, 1.2)
@@ -848,7 +848,7 @@ def test_negative_binomial_overdispersion_and_default_identity() -> None:
 
 
 def test_promoted_team_prior_fallback() -> None:
-    from score_model import prior_means_for_fixture
+    from modeling.score_model import prior_means_for_fixture
 
     club_ratios = {
         "established": {

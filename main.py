@@ -8,16 +8,16 @@ from __future__ import annotations
 
 import logging
 
-from bot import build_application
-from config import ConfigError, load_config
-from data_fetcher import DataFetcher
-from pipeline import Pipeline
-from predictor import Predictor
-from storage import Storage
+from live.bot import build_application
+from core.config import ConfigError, load_config
+from providers.data_fetcher import DataFetcher
+from live.pipeline import Pipeline
+from live.predictor import Predictor
+from db.storage import Storage
 
 
 def build_pipeline(config: object) -> Pipeline:
-    from config import Config
+    from core.config import Config
 
     if not isinstance(config, Config):
         raise TypeError("config must be a Config instance.")

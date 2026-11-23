@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
-from models import Markets
+from core.models import Markets
 
 K = 6.0
 TAIL_TOLERANCE = 0.001
@@ -296,6 +296,8 @@ def estimate_from_lambdas(
     target_kickoff: str | None = None,
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
+    standings_full_games: float = 19.0,
+    neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Price a full-time grid, and a half-time grid when that market is eligible."""
 
@@ -454,6 +456,8 @@ def estimate_score(
     last_kickoff_by_team: dict[int, str] | None = None,
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
+    standings_full_games: float = 19.0,
+    neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Expected goals from shrunk multiplicative rates, then modal scores and markets."""
 
@@ -597,7 +601,7 @@ def estimate_score(
                 ppg = st["points"] / st["games"] if st["games"] else 0.0
                 ppg_ratio = ppg / avg_ppg
                 ppg_ratio = max(0.65, min(1.45, ppg_ratio))
-                w = standings_blend * min(1.0, st["games"] / 19.0)
+                w = standings_blend * min(1.0, st["games"] / max(1.0, standings_full_games))
                 base_att = means.get(att_key, 1.0)
                 base_def = means.get(def_key, 1.0)
                 means[att_key] = (1.0 - w) * base_att + w * (ppg_ratio ** 0.35)
@@ -733,6 +737,11 @@ def estimate_score(
     else:
         lambda_home = league_home * attack_home * defence_away
         lambda_away = league_away * attack_away * defence_home
+
+    if neutral_venue and league_home > 0 and league_away > 0:
+        neutral_avg = 0.5 * (league_home + league_away)
+        lambda_home = lambda_home * (neutral_avg / league_home)
+        lambda_away = lambda_away * (neutral_avg / league_away)
 
     # Fixture congestion / rest-days adjustment (optional).
     if short_rest_days is not None and target_kickoff is not None:
@@ -1054,93 +1063,54 @@ def _joint_venue_strengths(
     goal_cap: float | None = None,
     goal_cap_slope: float = 0.5,
 ) -> tuple[dict[int, dict[str, float]], dict[int, dict[str, float]]]:
-    """Return per-club venue strengths and effective sample sizes."""
+    """Return per-club venue strengths and effective sample sizes via vectorized np.bincount."""
+    import numpy as np
+    from modeling.shrinkage import compute_joint_venue_strengths_vec
 
-    clubs = {match.home_id for match in priors} | {match.away_id for match in priors}
-    attack_home = {club: 1.0 for club in clubs}
-    defence_away = {club: 1.0 for club in clubs}
-    attack_away = {club: 1.0 for club in clubs}
-    defence_home = {club: 1.0 for club in clubs}
-    counts = {
-        club: {
-            "attack_home": 0.0,
-            "defence_away": 0.0,
-            "attack_away": 0.0,
-            "defence_home": 0.0,
-        }
-        for club in clubs
-    }
-    for match, weight in zip(priors, weights):
-        counts[match.home_id]["attack_home"] += weight
-        counts[match.home_id]["defence_home"] += weight
-        counts[match.away_id]["attack_away"] += weight
-        counts[match.away_id]["defence_away"] += weight
+    if not priors:
+        return {}, {}
 
-    league_home = max(league_home, 1e-9)
-    league_away = max(league_away, 1e-9)
+    club_list = sorted({m.home_id for m in priors} | {m.away_id for m in priors})
+    club_to_idx = {cid: idx for idx, cid in enumerate(club_list)}
+    n_teams = len(club_list)
 
-    for _ in range(max(1, iterations)):
-        attack_home = _update_strength(
-            clubs,
-            numerator=lambda club: sum(
-                weight * _soft_cap_goals(match.ft_home, goal_cap, goal_cap_slope)
-                for match, weight in zip(priors, weights)
-                if match.home_id == club
-            ),
-            denominator=lambda club: sum(
-                weight * league_home * defence_away[match.away_id]
-                for match, weight in zip(priors, weights)
-                if match.home_id == club
-            ),
-        )
-        defence_away = _update_strength(
-            clubs,
-            numerator=lambda club: sum(
-                weight * _soft_cap_goals(match.ft_home, goal_cap, goal_cap_slope)
-                for match, weight in zip(priors, weights)
-                if match.away_id == club
-            ),
-            denominator=lambda club: sum(
-                weight * league_home * attack_home[match.home_id]
-                for match, weight in zip(priors, weights)
-                if match.away_id == club
-            ),
-        )
-        attack_away = _update_strength(
-            clubs,
-            numerator=lambda club: sum(
-                weight * _soft_cap_goals(match.ft_away, goal_cap, goal_cap_slope)
-                for match, weight in zip(priors, weights)
-                if match.away_id == club
-            ),
-            denominator=lambda club: sum(
-                weight * league_away * defence_home[match.home_id]
-                for match, weight in zip(priors, weights)
-                if match.away_id == club
-            ),
-        )
-        defence_home = _update_strength(
-            clubs,
-            numerator=lambda club: sum(
-                weight * _soft_cap_goals(match.ft_away, goal_cap, goal_cap_slope)
-                for match, weight in zip(priors, weights)
-                if match.home_id == club
-            ),
-            denominator=lambda club: sum(
-                weight * league_away * attack_away[match.away_id]
-                for match, weight in zip(priors, weights)
-                if match.home_id == club
-            ),
-        )
+    home_idx = np.fromiter((club_to_idx[m.home_id] for m in priors), dtype=np.int32, count=len(priors))
+    away_idx = np.fromiter((club_to_idx[m.away_id] for m in priors), dtype=np.int32, count=len(priors))
+    ft_home = np.fromiter((m.ft_home for m in priors), dtype=np.int16, count=len(priors))
+    ft_away = np.fromiter((m.ft_away for m in priors), dtype=np.int16, count=len(priors))
+    w_arr = np.asarray(weights, dtype=np.float64)
+
+    att_h, def_a, att_a, def_h, n_ah, n_da, n_aa, n_dh = compute_joint_venue_strengths_vec(
+        home_idx,
+        away_idx,
+        ft_home,
+        ft_away,
+        w_arr,
+        n_teams=n_teams,
+        league_home=league_home,
+        league_away=league_away,
+        iterations=iterations,
+        goal_cap=goal_cap,
+        goal_cap_slope=goal_cap_slope,
+    )
 
     raw = {
         club: {
-            "attack_home": attack_home[club],
-            "defence_away": defence_away[club],
-            "attack_away": attack_away[club],
-            "defence_home": defence_home[club],
+            "attack_home": float(att_h[idx]),
+            "defence_away": float(def_a[idx]),
+            "attack_away": float(att_a[idx]),
+            "defence_home": float(def_h[idx]),
         }
-        for club in clubs
+        for club, idx in club_to_idx.items()
+    }
+    counts = {
+        club: {
+            "attack_home": float(n_ah[idx]),
+            "defence_away": float(n_da[idx]),
+            "attack_away": float(n_aa[idx]),
+            "defence_home": float(n_dh[idx]),
+        }
+        for club, idx in club_to_idx.items()
     }
     return raw, counts
 
@@ -1490,63 +1460,16 @@ def _fit_dixon_coles_rho(
     k: float,
     tail_tolerance: float,
 ) -> float | None:
-    """Estimate ρ on earlier matches only. Returns None when the sample is too thin."""
-
+    """Estimate ρ on earlier matches only using vectorized 4-cell closed-form NumPy evaluation."""
     _ = tail_tolerance
-    prepared: list[tuple[float, float, int, int, tuple[tuple[float, ...], ...]]] = []
-    max_goals = 10
-    for index, match in enumerate(priors):
-        earlier = priors[:index]
-        if len(earlier) < 6:
-            continue
-        lambdas = _one_pass_lambdas(
-            earlier,
-            home_team_id=match.home_id,
-            away_team_id=match.away_id,
-            k=k,
-        )
-        if lambdas is None:
-            continue
-        lambda_home, lambda_away = lambdas
-        indep = tuple(
-            tuple(
-                _poisson(home_goals, lambda_home) * _poisson(away_goals, lambda_away)
-                for away_goals in range(max_goals + 1)
-            )
-            for home_goals in range(max_goals + 1)
-        )
-        prepared.append((lambda_home, lambda_away, match.ft_home, match.ft_away, indep))
-    if len(prepared) < MIN_RHO_TRAINING_MATCHES:
+    if len(priors) <= 6:
         return None
 
-    best_rho = 0.0
-    best_ll = float("-inf")
-    for rho in RHO_GRID:
-        if not _rho_is_feasible(prepared, rho):
-            continue
-        total = 0.0
-        valid = True
-        for lambda_home, lambda_away, home_goals, away_goals, indep in prepared:
-            probability = _probability_from_indep(
-                indep,
-                home_goals,
-                away_goals,
-                lambda_home,
-                lambda_away,
-                rho,
-            )
-            if probability <= 0:
-                valid = False
-                break
-            total += math.log(probability)
-        if not valid:
-            continue
-        if total > best_ll:
-            best_ll = total
-            best_rho = rho
-    if best_ll == float("-inf"):
-        return None
-    return best_rho
+    from domain.features import encode_matches
+    from modeling.dixon_coles import fit_dixon_coles_rho_vec
+
+    dataset = encode_matches(priors)
+    return fit_dixon_coles_rho_vec(dataset, k=k, rho_grid=RHO_GRID)
 
 
 def _probability_from_indep(

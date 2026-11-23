@@ -2,13 +2,19 @@
 
 import json
 import math
+import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
+
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from laboratory.store import connect
 from laboratory.snapshot import MatchRecord, build_snapshot
 from laboratory.score_model_adapter import price_from_snapshot
-from score_model_enhanced import (
+from modeling.enhanced import (
     estimate_score_ensemble,
     estimate_score_special,
     EnsembleConfig,

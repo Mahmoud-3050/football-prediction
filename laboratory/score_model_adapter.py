@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from laboratory import SCORE_MODEL_CONFIG_ID
-from score_model import (
+from modeling.score_model import (
     K,
     MINIMUM_HALF_TIME_SAMPLES,
     ScoreEstimate,
@@ -59,6 +59,9 @@ def price_from_snapshot(
     last_kickoff_by_team: dict | None = None,
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
+    standings_full_games: float = 19.0,
+    neutral_venue: bool = False,
+    min_scored_matches: int | None = None,
 ) -> ScoreModelOutcome:
     """Price one pre-kickoff snapshot with the bot scorer."""
 
@@ -69,11 +72,12 @@ def price_from_snapshot(
     priors = list(payload.get("prior_matches") or [])
     home_n = _club_prior_count(priors, home_id)
     away_n = _club_prior_count(priors, away_id)
-    if home_n < MINIMUM_SCORED_MATCHES or away_n < MINIMUM_SCORED_MATCHES:
+    min_req = MINIMUM_SCORED_MATCHES if min_scored_matches is None else int(min_scored_matches)
+    if home_n < min_req or away_n < min_req:
         return ScoreModelOutcome(
             excluded=True,
             reason=(
-                f"Bot abstain: need at least {MINIMUM_SCORED_MATCHES} prior finished matches "
+                f"Bot abstain: need at least {min_req} prior finished matches "
                 f"per club (home={home_n}, away={away_n})."
             ),
             body=None,
@@ -136,6 +140,8 @@ def price_from_snapshot(
         last_kickoff_by_team=last_kickoff_by_team,
         standings_blend=standings_blend,
         standings_min_games=standings_min_games,
+        standings_full_games=standings_full_games,
+        neutral_venue=neutral_venue,
     )
     return ScoreModelOutcome(
         excluded=False,
@@ -255,7 +261,7 @@ def _club_half_time_samples(priors: list[dict[str, Any]], club_id: str) -> int:
 
 
 def _half_matrix(estimate: ScoreEstimate) -> tuple[tuple[float, ...], ...]:
-    from score_model import estimate_from_lambdas
+    from modeling.score_model import estimate_from_lambdas
 
     half = estimate_from_lambdas(
         estimate.lambda_home * float(estimate.half_time_share_home or 0.0),

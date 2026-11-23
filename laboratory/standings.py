@@ -25,7 +25,7 @@ def fetch_standings(
 ) -> dict[str, Any]:
     code = competition.upper()
     label = COMPETITION_NAMES.get(code, code)
-    from api_ninjas import NINJAS_BASE, is_ninjas_competition, ninjas_league, standings_to_fd
+    from providers.api_ninjas import NINJAS_BASE, is_ninjas_competition, ninjas_league, standings_to_fd
 
     if is_ninjas_competition(code):
         key = (ninjas_api_key or "").strip()

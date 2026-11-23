@@ -25,7 +25,7 @@ from http.cookiejar import CookieJar
 
 import pytest
 
-from db_paths import DEFAULT_DATABASE_PATH
+from db.db_paths import DEFAULT_DATABASE_PATH
 from laboratory.__main__ import build_dashboard_server, seed_demo
 from laboratory.auth import DashboardAuth
 from laboratory.dashboard import overview

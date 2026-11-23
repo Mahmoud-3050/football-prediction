@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from live_football_api import (
+from providers.live_football_api import (
     is_live_football_competition,
     lfa_league_id,
     season_label,

@@ -7,11 +7,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
-from models import Markets
+from core.models import Markets
 
 # Import base model functions
 from laboratory import LOG_LOSS_FLOOR
-from score_model import (
+from modeling.score_model import (
     K,
     TAIL_TOLERANCE,
     MAX_GRID_GOALS,
@@ -25,6 +25,7 @@ from score_model import (
     DIXON_COLES_NOTE,
     RatioDetail,
     ScoreEstimate,
+    estimate_score,
     _PriorMatch,
     _prior_matches,
     _merged_priors,

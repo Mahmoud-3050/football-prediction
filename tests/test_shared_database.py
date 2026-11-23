@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from laboratory.store import connect, ensure_experiment, upsert_match
-from migrate_db import merge_into_shared
-from storage import Storage
+from db.migrate_db import merge_into_shared
+from db.storage import Storage
 
 
 def test_storage_creates_laboratory_tables(tmp_path: Path) -> None:

@@ -21,11 +21,11 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config import Config
-from data_fetcher import format_match_list, fixtures_from_payload
-from models import Fixture, PipelineResult, ProviderError
-from pipeline import Pipeline
-from timeutil import format_kickoff_cairo, format_kickoff_short_cairo
+from core.config import Config
+from providers.data_fetcher import format_match_list, fixtures_from_payload
+from core.models import Fixture, PipelineResult, ProviderError
+from live.pipeline import Pipeline
+from core.timeutil import format_kickoff_cairo, format_kickoff_short_cairo
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ def build_application(config: Config, pipeline: Pipeline) -> Application:
 async def _start_pre_round_job(application: Application) -> None:
     """Legacy background loop. Prefer the standalone `python -m jobs` worker."""
 
-    from pre_round import pre_round_loop
+    from live.pre_round import pre_round_loop
 
     pipeline: Pipeline = application.bot_data["pipeline"]
     interval = float(application.bot_data.get("pre_round_interval_seconds") or 3600)
@@ -243,7 +243,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
-    from timeutil import cairo_today
+    from core.timeutil import cairo_today
 
     day = cairo_today()
     await _reply_match_list(

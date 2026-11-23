@@ -1,14 +1,14 @@
 ---
 description: Rules for score_model math, Poisson/Dixon-Coles, draw calibration, eligibility abstinence, and per-league stack isolation.
 trigger: glob
-globs: "**/score_model*.py, **/league_stacks.py, **/eligibility.py, **/configs/**/*.json, **/data/spl_stack.json, **/tests/test_score_model.py, **/tests/test_league_stacks.py"
+globs: "**/modeling/**/*.py, **/domain/**/*.py, **/live/eligibility.py, **/configs/**/*.json, **/data/spl_stack.json, **/tests/test_score_model.py, **/tests/test_league_stacks.py, **/tests/test_golden_master.py, **/tests/test_modeling_and_gradients.py"
 ---
 
 # Math, Draw Calibration & League Stacks Rules
 
 ## 1. Pure Math & Validation Boundaries
-- **`score_model.py`:** Pure math on payloads (`estimate_score`, `estimate_from_lambdas`, `select_1x2_outcome`, `_boost_draw_scorelines`). **FORBIDDEN:** Gemini, Telegram, network, or DB access.
-- **`eligibility.py`:** Gate checks only (`MINIMUM_SCORED_MATCHES=3`, `FORM_WINDOW=5`). **FORBIDDEN:** filling missing stats/standings with zeros; gaps stay empty and trigger abstain.
+- **`modeling/score_model.py` & `modeling/*` / `domain/*`:** Pure math & vectorized NumPy feature/model logic (`estimate_score`, `estimate_from_lambdas`, `select_1x2_outcome`, `_boost_draw_scorelines`, `BaseScoreModel`, `ShrinkageOnePassModel`, `ShrinkageJointModel`, `JointDixonColesMLEModel`). **FORBIDDEN:** Gemini, Telegram, network, or `sqlite3` / DB access.
+- **`live/eligibility.py`:** Gate checks only (`MINIMUM_SCORED_MATCHES=3`, `FORM_WINDOW=5`). **FORBIDDEN:** filling missing stats/standings with zeros; gaps stay empty and trigger abstain.
 - **Formulas & Constants:** Shrinkage `r_shrunk = (n·r + k·prior) / (n + k)` (`K=6`), `TAIL_TOLERANCE=0.001`, `MAX_GRID_GOALS=25`, `MINIMUM_HALF_TIME_SAMPLES=3`, `MIN_RHO_TRAINING_MATCHES=30`. Home advantage comes from league home vs. away averages, not an extra constant.
 
 ## 2. Draw Calibration vs. Pick Rules (CRITICAL)

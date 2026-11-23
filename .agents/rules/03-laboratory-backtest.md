@@ -14,7 +14,8 @@ globs: "**/laboratory/**/*.py, !**/laboratory/dashboard.py, !**/laboratory/auth.
 
 ## 2. Leakage Prevention & Walk-Forward Integrity (CRITICAL)
 - **Snapshot Leakage:** Target match FT/HT score and target `match_id` are **FORBIDDEN** in snapshot payloads/priors. `laboratory/snapshot.leakage_status` must fail if `ft_home`/`score` appear on snapshot root or any prior has `kickoff >= cutoff`.
-- **Strict Prior Window:** Priors = **same competition AND same season AND strictly earlier kickoff** (`build_snapshot`). Never add future or cross-league matches.
+- **Strict Prior Window:** Priors = **same competition AND same season AND strictly earlier kickoff** (`build_snapshot`). Never add future or cross-league matches into `snapshot["prior_matches"]`.
+- **CL-Only Prior Exception:** For `CL` only, `laboratory/cl_features.py` may compute pre-cutoff (`kickoff < target.kickoff`) Persistent Multi-Season CL + Elo and Domestic Prior `prior_means` without modifying `snapshot["prior_matches"]`.
 - **Last-Season Ratio:** When `prior_mean="last_season"`, use the separate cache path in `job.py`; never leak current-match data into that fit.
 - **Finished-Only Batch:** `run_score_model` / `run_poisson` skip unfinished matches.
 

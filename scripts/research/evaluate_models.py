@@ -2,14 +2,19 @@
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
+
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from laboratory.store import connect
 from laboratory.snapshot import MatchRecord, build_snapshot, priors_from_snapshot
 from laboratory.poisson_engine import FinishedMatch
 from laboratory.job import price_one_score_model
-from score_model_enhanced import (
+from modeling.enhanced import (
     estimate_score_ensemble,
     estimate_score_special,
     EnsembleConfig,
@@ -143,7 +148,7 @@ def run_baseline_evaluation(db_path: Path, season: str = "2026", competition: st
             competition=row["competition"],
         ))
 
-    from score_model import estimate_score
+    from modeling.score_model import estimate_score
     from laboratory.score_model_adapter import team_int_id
 
     exact_hits = 0
@@ -306,7 +311,7 @@ def run_enhanced_evaluation(
             competition=row["competition"],
         ))
 
-    from score_model_enhanced import (
+    from modeling.enhanced import (
         estimate_score_ensemble,
         estimate_score_special,
         EnsembleConfig,

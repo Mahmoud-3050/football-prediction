@@ -3,15 +3,15 @@ import json
 
 import pytest
 
-from models import AnalysisSnapshot, ModelError
-from predictor import (
+from core.models import AnalysisSnapshot, ModelError
+from live.predictor import (
     Predictor,
     build_prompt,
     build_schema,
     derive_markets,
     is_transient_model_error,
 )
-from score_model import ScoreEstimate, estimate_from_lambdas
+from modeling.score_model import ScoreEstimate, estimate_from_lambdas
 
 
 def test_markets_match_the_score(markets_table) -> None:

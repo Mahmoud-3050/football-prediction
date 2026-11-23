@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from models import ProviderError
+from core.models import ProviderError
 
 LFA_BASE = "https://live-football-api.com/api/v1"
 # Internal code → Live Football league id.

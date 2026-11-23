@@ -2,9 +2,9 @@ import asyncio
 import json
 
 from conftest import CHELSEA, SPURS, Harness, form_payload, standings_for, valid_model_json
-from bot import render_report
-from score_model import estimate_score
-from storage import loads
+from live.bot import render_report
+from modeling.score_model import estimate_score
+from db.storage import loads
 
 
 def test_completed_prediction_derives_markets_and_stores_the_trace(tmp_path) -> None:
@@ -215,7 +215,7 @@ def test_no_head_to_head_calls_the_endpoint_once(tmp_path) -> None:
 
 
 def _estimate_for(holder: Harness, *, include_half_time: bool):
-    from league_stacks import draw_calibration_kwargs, live_stack_for
+    from modeling.league_stacks import draw_calibration_kwargs, live_stack_for
 
     stack = live_stack_for(holder.api.competition)
     return estimate_score(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from api_ninjas import (
+from providers.api_ninjas import (
     NinjasClient,
     NinjasIdMap,
     is_ninjas_competition,
@@ -12,7 +12,7 @@ from api_ninjas import (
     stable_int_id,
     standings_to_fd,
 )
-from data_fetcher import FREE_COMPETITIONS, resolve_competition
+from providers.data_fetcher import FREE_COMPETITIONS, resolve_competition
 
 
 def test_spl_is_ninjas_competition() -> None:

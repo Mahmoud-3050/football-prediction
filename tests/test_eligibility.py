@@ -1,7 +1,7 @@
 from conftest import ARSENAL, CHELSEA, SPURS, form_payload, make_match, standings_for
-from data_fetcher import parse_fixture
-from eligibility import evaluate
-from models import Competition, Team
+from providers.data_fetcher import parse_fixture
+from live.eligibility import evaluate
+from core.models import Competition, Team
 
 
 def _team(raw: dict) -> Team:

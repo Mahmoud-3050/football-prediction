@@ -12,13 +12,13 @@ from conftest import (
     Harness,
     make_match,
 )
-from data_fetcher import (
+from providers.data_fetcher import (
     classify_fixtures,
     resolve_competition,
     resolve_team,
     unknown_competition_reason,
 )
-from models import Team
+from core.models import Team
 
 
 def _team(raw: dict) -> Team:

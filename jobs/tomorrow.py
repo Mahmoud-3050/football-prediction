@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timedelta, timezone
 
-from data_fetcher import fixture_is_predictable, fixtures_from_payload
+from providers.data_fetcher import fixture_is_predictable, fixtures_from_payload
 from jobs import JOB_COMPETITIONS
-from models import Fixture, PipelineResult, ProviderError
-from pipeline import Pipeline
-from timeutil import CAIRO_TZ, cairo_today
+from core.models import Fixture, PipelineResult, ProviderError
+from live.pipeline import Pipeline
+from core.timeutil import CAIRO_TZ, cairo_today
 
 logger = logging.getLogger(__name__)
 SOURCE = "tomorrow-job"

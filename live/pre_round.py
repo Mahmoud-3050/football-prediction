@@ -10,15 +10,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
-from data_fetcher import (
+from providers.data_fetcher import (
     PROSPECTIVE_LEAD_DAYS,
     TODAY_MATCH_COMPETITIONS,
     fixture_in_prospective_window,
     fixtures_from_payload,
 )
-from models import Fixture, PipelineResult, ProviderError
-from pipeline import Pipeline
-from timeutil import CAIRO_TZ
+from core.models import Fixture, PipelineResult, ProviderError
+from live.pipeline import Pipeline
+from core.timeutil import CAIRO_TZ
 
 logger = logging.getLogger(__name__)
 

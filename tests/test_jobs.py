@@ -9,7 +9,7 @@ from jobs.standings_job import competitions_needing_standings_refresh
 from jobs.tomorrow import cairo_tomorrow, select_tomorrow_fixtures
 from laboratory.standings import parse_standings, replace_standings
 from laboratory.store import connect
-from models import Fixture
+from core.models import Fixture
 
 
 def _fixture(

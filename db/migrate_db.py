@@ -7,8 +7,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from db_paths import DEFAULT_DATABASE_PATH
-from database import ensure_shared_schemas
+from db.db_paths import DEFAULT_DATABASE_PATH
+from db.database import ensure_shared_schemas
 
 LEGACY_BOT = Path("data/predictions.db")
 LEGACY_LAB = Path("data/laboratory.db")

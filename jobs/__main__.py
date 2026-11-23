@@ -15,7 +15,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from config import ConfigError, load_config
+from core.config import ConfigError, load_config
 from jobs.standings_job import run_standings_once
 from jobs.tomorrow import run_tomorrow_once
 from laboratory.store import connect, record_job_run

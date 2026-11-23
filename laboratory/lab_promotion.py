@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from league_stacks import DEFAULT_LIVE_STACK, _merge_stack
+from modeling.league_stacks import DEFAULT_LIVE_STACK, _merge_stack
 from laboratory.store import connect, create_lab_experiment, get_lab_experiment
 
 # Scoring + annotation keys that must survive promote / rollback validation.

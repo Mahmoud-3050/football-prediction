@@ -10,7 +10,7 @@ from typing import Mapping
 
 from dotenv import load_dotenv
 
-from db_paths import DEFAULT_DATABASE_PATH, resolve_database_path
+from db.db_paths import DEFAULT_DATABASE_PATH, resolve_database_path
 
 REQUIRED_KEYS = ("BOT_TOKEN", "FOOTBALL_API_KEY", "GEMINI_API_KEY")
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"

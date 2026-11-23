@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from models import ProviderError
+from core.models import ProviderError
 
 logger = logging.getLogger(__name__)
 

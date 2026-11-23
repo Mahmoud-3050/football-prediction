@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from dotenv import load_dotenv
 
-from db_paths import DEFAULT_DATABASE_PATH, resolve_database_path, resolve_lab_database_path
+from db.db_paths import DEFAULT_DATABASE_PATH, resolve_database_path, resolve_lab_database_path
 from laboratory import BOT_BACKTEST_SEASONS, ExperimentConfig, run_experiment, promote_best_config, rollback_promotion
 from laboratory.auth import (
     cookie_value,
@@ -69,7 +69,7 @@ from laboratory.store import (
     list_lab_experiments,
     upsert_match,
 )
-from migrate_db import merge_into_shared
+from db.migrate_db import merge_into_shared
 
 DEFAULT_DATABASE = Path(DEFAULT_DATABASE_PATH)
 HISTORY_IMPORT_SEASONS = (2024, 2025, 2026)
@@ -201,8 +201,11 @@ def build_dashboard_server(
                     page = overview(connection, query, csrf_token=credentials.csrf_token())
                     status = 200
                 elif parsed.path == "/matches":
-                    page = match_list(connection, query)
+                    page = match_list(connection, query, csrf_token=credentials.csrf_token())
                     status = 200
+                elif parsed.path == "/matches/predict-filtered":
+                    page = not_found_page(resource="Page")
+                    status = 404
                 elif parsed.path.startswith("/matches/"):
                     match_id = parsed.path.removeprefix("/matches/")
                     if match_id.endswith("/predict"):
@@ -276,6 +279,9 @@ def build_dashboard_server(
             parsed = urlparse(self.path)
             if parsed.path == "/login":
                 self._post_login()
+                return
+            if parsed.path == "/matches/predict-filtered":
+                self._post_predict_filtered()
                 return
             if parsed.path.startswith("/matches/") and parsed.path.endswith("/predict"):
                 self._post_predict(parsed.path)
@@ -369,6 +375,71 @@ def build_dashboard_server(
             if retained:
                 query = f"{retained}&{query}"
             self._redirect(f"/matches/{quote(target_id, safe='')}?{query}")
+
+        def _post_predict_filtered(self) -> None:
+            if credentials.enabled and not self._authenticated():
+                self._redirect(f"/login?next={quote('/matches', safe='/?&=')}")
+                return
+            form = parse_form(read_request_body(self))
+            filter_keys = (
+                "engine",
+                "league",
+                "season",
+                "team",
+                "date_from",
+                "date_to",
+                "fixture",
+                "status",
+                "verdict",
+                "confidence",
+                "order",
+            )
+            retained_params = {k: form[k] for k in filter_keys if form.get(k)}
+            if credentials.enabled and not secrets.compare_digest(
+                form.get("csrf") or "", credentials.csrf_token()
+            ):
+                params = {
+                    **retained_params,
+                    "bulk_predict_status": "failed",
+                    "bulk_predict_detail": "Session expired. Try again.",
+                }
+                self._redirect(f"/matches?{urlencode(params)}")
+                return
+
+            from laboratory.dashboard import list_filtered_unfinished_match_ids
+            from laboratory.job import price_one_score_model
+            from laboratory.store import checkpoint_wal
+
+            form_query = {k: [v] for k, v in retained_params.items()}
+            all_match_ids = list_filtered_unfinished_match_ids(connection, form_query)
+            match_ids = all_match_ids[:100]
+            priced = 0
+            excluded = 0
+            failed = 0
+            for mid in match_ids:
+                try:
+                    res = price_one_score_model(connection, mid, replace=True)
+                    st = res.get("status")
+                    if st == "priced":
+                        priced += 1
+                    elif st == "excluded":
+                        excluded += 1
+                    else:
+                        failed += 1
+                except Exception:  # noqa: BLE001
+                    failed += 1
+            if priced > 0:
+                checkpoint_wal(connection, mode="TRUNCATE")
+            detail = (
+                f"Priced {priced} of {len(match_ids)} unfinished filtered match(es) "
+                f"({excluded} excluded, {failed} failed)."
+            )
+            params = {
+                **retained_params,
+                "bulk_predict_status": "ok" if failed == 0 else "failed",
+                "bulk_predict_detail": detail,
+            }
+            self._redirect(f"/matches?{urlencode(params)}")
 
         def _post_run_experiment(self) -> None:
             if credentials.enabled and not self._authenticated():
@@ -1027,7 +1098,7 @@ def _print_spl_score_row(score: dict[str, Any]) -> None:
 def _spl_challenger_grid() -> list[dict[str, Any]]:
     """Baseline + upgraded draw-calibration candidates for SPL walk-forward compare."""
 
-    from league_stacks import DEFAULT_LIVE_STACK
+    from modeling.league_stacks import DEFAULT_LIVE_STACK
 
     # Emphasize common low-scoring draws; de-emphasize 3-3 / 4-4+.
     low_score_weights = [1.35, 1.25, 1.05, 0.70, 0.45, 0.30]
@@ -1127,7 +1198,7 @@ def _run_score_model_from_stack(
     experiment_id: str,
     stack: dict[str, Any],
 ) -> dict[str, Any]:
-    from league_stacks import draw_calibration_kwargs
+    from modeling.league_stacks import draw_calibration_kwargs
 
     return run_score_model(
         connection,
@@ -1156,7 +1227,7 @@ def _tune_spl(
 ) -> dict[str, Any]:
     """Walk-forward SPL challenger grid; optionally promote winner to spl_stack.json."""
 
-    from league_stacks import save_spl_stack
+    from modeling.league_stacks import save_spl_stack
     from laboratory.score_model_adapter import SCORE_MODEL_ENGINE
 
     grid = _spl_challenger_grid()
@@ -1625,7 +1696,7 @@ def main() -> None:
         if not competitions:
             raise SystemExit("No competitions left to price after filters.")
         summary: list[dict[str, Any]] = []
-        from league_stacks import draw_calibration_kwargs, live_stack_for
+        from modeling.league_stacks import draw_calibration_kwargs, live_stack_for
 
         for code in competitions:
             experiment_id = f"BOT-{code}-live"

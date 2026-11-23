@@ -7,7 +7,7 @@ import sqlite3
 from datetime import date
 from typing import Any
 
-from data_fetcher import FINISHED_STATUSES, fixtures_from_payload
+from providers.data_fetcher import FINISHED_STATUSES, fixtures_from_payload
 from jobs import JOB_COMPETITIONS
 from laboratory.standings import (
     STANDINGS_COMPETITIONS,
@@ -15,9 +15,9 @@ from laboratory.standings import (
     latest_season,
     list_standings_rows,
 )
-from models import ProviderError
-from pipeline import Pipeline
-from timeutil import cairo_today
+from core.models import ProviderError
+from live.pipeline import Pipeline
+from core.timeutil import cairo_today
 
 logger = logging.getLogger(__name__)
 

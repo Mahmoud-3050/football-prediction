@@ -35,11 +35,11 @@ COMPETITION_NAMES = {
 
 def dataset_version(competition: str) -> str:
     code = competition.upper()
-    from live_football_api import is_live_football_competition
+    from providers.live_football_api import is_live_football_competition
 
     if is_live_football_competition(code):
         return f"live-football-{code.lower()}"
-    from api_ninjas import is_ninjas_competition
+    from providers.api_ninjas import is_ninjas_competition
 
     if is_ninjas_competition(code):
         return f"api-ninjas-{code.lower()}"
@@ -57,18 +57,18 @@ def fetch_season(
 ) -> dict[str, Any]:
     code = competition.upper()
     label = COMPETITION_NAMES.get(code, code)
-    from api_ninjas import (
+    from providers.api_ninjas import (
         NinjasIdMap,
         fetch_season_matches,
         is_ninjas_competition,
         season_to_fd as ninjas_season_to_fd,
     )
-    from live_football_api import (
+    from providers.live_football_api import (
         fetch_league_fixtures,
         is_live_football_competition,
         season_to_fd as lfa_season_to_fd,
     )
-    from models import ProviderError
+    from core.models import ProviderError
 
     # Prefer Live Football API for SPL history (multi-season archive).
     if is_live_football_competition(code):
@@ -149,8 +149,8 @@ def fetch_matches_window(
 
     code = competition.upper()
     label = COMPETITION_NAMES.get(code, code)
-    from api_ninjas import is_ninjas_competition
-    from live_football_api import is_live_football_competition
+    from providers.api_ninjas import is_ninjas_competition
+    from providers.live_football_api import is_live_football_competition
 
     if is_live_football_competition(code) or is_ninjas_competition(code):
         body = fetch_season(
@@ -314,8 +314,8 @@ def import_bodies(
     )
 
     code = competition.upper()
-    from api_ninjas import is_ninjas_competition
-    from live_football_api import is_live_football_competition
+    from providers.api_ninjas import is_ninjas_competition
+    from providers.live_football_api import is_live_football_competition
 
     if is_live_football_competition(code):
         result_source = LIVE_FOOTBALL_SOURCE

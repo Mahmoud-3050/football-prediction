@@ -7,13 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from conftest import ARSENAL, CHELSEA, Harness, make_match
-from data_fetcher import fixture_in_prospective_window, parse_fixture
-from pre_round import (
+from providers.data_fetcher import fixture_in_prospective_window, parse_fixture
+from live.pre_round import (
     cairo_days_covering,
     run_pre_round_once,
     select_prospective_fixtures,
 )
-from storage import Storage
+from db.storage import Storage
 
 
 def test_selects_only_fixtures_inside_the_lead_window() -> None:

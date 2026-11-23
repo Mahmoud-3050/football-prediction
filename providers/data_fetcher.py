@@ -23,7 +23,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 
-from models import (
+from core.models import (
     Competition,
     Fixture,
     FixtureResolution,
@@ -31,7 +31,7 @@ from models import (
     Team,
     TeamResolution,
 )
-from timeutil import (
+from core.timeutil import (
     api_date_window_for_cairo_day,
     cairo_today,
     falls_on_cairo_day,
@@ -685,7 +685,7 @@ class DataFetcher:
         rate_limiter: RateLimiter | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
-        from api_ninjas import NinjasClient, NinjasIdMap
+        from providers.api_ninjas import NinjasClient, NinjasIdMap
 
         self.api_key = api_key
         self.ninjas_api_key = (ninjas_api_key or "").strip()
@@ -793,7 +793,7 @@ class DataFetcher:
     ) -> dict[str, Any]:
         """Fixtures that may fall on one Africa/Cairo calendar day."""
 
-        from api_ninjas import is_ninjas_competition
+        from providers.api_ninjas import is_ninjas_competition
 
         date_from, date_to = api_date_window_for_cairo_day(day)
         codes = competitions or TODAY_MATCH_COMPETITIONS
@@ -833,7 +833,7 @@ class DataFetcher:
         return await self._get(f"/v4/matches/{match_id}")
 
     def _uses_ninjas(self, competition_code: str) -> bool:
-        from api_ninjas import is_ninjas_competition
+        from providers.api_ninjas import is_ninjas_competition
 
         return is_ninjas_competition(competition_code)
 

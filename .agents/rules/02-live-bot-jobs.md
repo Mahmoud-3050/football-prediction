@@ -1,16 +1,16 @@
 ---
 description: Rules for Telegram bot handlers, live Pipeline, Gemini prose predictor, Cairo background jobs, and Football-Data/Ninjas/LFA providers.
 trigger: glob
-globs: "**/main.py, **/bot.py, **/pipeline.py, **/predictor.py, **/models.py, **/data_fetcher.py, **/api_ninjas.py, **/live_football_api.py, **/timeutil.py, **/pre_round.py, **/jobs/**/*.py"
+globs: "**/main.py, **/live/**/*.py, **/providers/**/*.py, **/core/**/*.py, **/jobs/**/*.py"
 ---
 
 # Live Bot, Pipeline, Jobs & Providers Rules
 
 ## 1. Execution & Isolation Boundaries
-- **`models.py`:** Pure dataclasses/errors (`Fixture`, `PipelineResult`, `Markets`, `StageError`, `ProviderError`, `ModelError`). **FORBIDDEN:** Telegram, HTTP, Gemini, or SQLite imports.
-- **`predictor.py`:** Gemini returns **tactical prose reasoning JSON only**. **FORBIDDEN:** Gemini computing, choosing, or overriding λ, scorelines, or markets.
-- **Async Boundary:** Bot, `pipeline.py`, and `jobs/` are `async`. Never block the event loop with synchronous network calls or long DB locks.
-- **`pre_round.py`:** Legacy (active only if `PRE_ROUND_ENABLED=1`). All new scheduled behavior belongs in `python -m jobs` (`jobs/__main__.py`, `jobs/tomorrow.py`, `jobs/standings_job.py`).
+- **`core/models.py`:** Pure dataclasses/errors (`Fixture`, `PipelineResult`, `Markets`, `StageError`, `ProviderError`, `ModelError`). **FORBIDDEN:** Telegram, HTTP, Gemini, or SQLite imports.
+- **`live/predictor.py`:** Gemini returns **tactical prose reasoning JSON only**. **FORBIDDEN:** Gemini computing, choosing, or overriding λ, scorelines, or markets.
+- **Async Boundary:** `live/bot.py`, `live/pipeline.py`, and `jobs/` are `async`. Never block the event loop with synchronous network calls or long DB locks.
+- **`live/pre_round.py`:** Legacy (active only if `PRE_ROUND_ENABLED=1`). All new scheduled behavior belongs in `python -m jobs` (`jobs/__main__.py`, `jobs/tomorrow.py`, `jobs/standings_job.py`).
 
 ## 2. Fixture & Time Rules
 - **Predictability:** **FORBIDDEN** predicting `FINISHED`, `IN_PLAY`, or postponed fixtures as upcoming (`data_fetcher.fixture_is_predictable`).

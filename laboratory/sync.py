@@ -31,7 +31,7 @@ from laboratory.store import (
     checkpoint_wal,
     ensure_experiment,
 )
-from timeutil import cairo_today
+from core.timeutil import cairo_today
 
 logger = logging.getLogger(__name__)
 

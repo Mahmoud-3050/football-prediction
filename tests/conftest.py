@@ -9,10 +9,10 @@ from typing import Any
 import httpx
 import pytest
 
-from data_fetcher import DataFetcher
-from pipeline import Pipeline
-from predictor import Predictor
-from storage import Storage
+from providers.data_fetcher import DataFetcher
+from live.pipeline import Pipeline
+from live.predictor import Predictor
+from db.storage import Storage
 
 ARSENAL = {"id": 1, "name": "Arsenal FC", "shortName": "Arsenal", "tla": "ARS"}
 CHELSEA = {"id": 2, "name": "Chelsea FC", "shortName": "Chelsea", "tla": "CHE"}

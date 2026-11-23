@@ -441,12 +441,57 @@ def _job_summary_line(name: str, summary: dict[str, Any], *, ok: bool) -> str:
 
 
 def _short_cairo(value: str) -> str:
-    from timeutil import format_clock_cairo
+    from core.timeutil import format_clock_cairo
 
     return format_clock_cairo(value) or (value.strip() or "—")
 
 
-def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
+def list_filtered_unfinished_match_ids(
+    connection: sqlite3.Connection,
+    query: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """Return all unfinished (``ft_home IS NULL``) match IDs matching ``query`` filters."""
+
+    filters = _filters(query, connection)
+    if not filters["date_from"] and not filters["date_to"]:
+        filters["date_from"], filters["date_to"] = _default_match_date_range()
+    if filters.get("fixture") == "finished":
+        return []
+    unfinished_filters = {**filters, "fixture": "scheduled"}
+    engine = unfinished_filters.get("engine") or "score_model"
+    experiment_id = unfinished_filters.get("experiment") or BOT_EXPERIMENT_ID
+    rows = _load(
+        connection,
+        engine,
+        experiment_id,
+        filters=unfinished_filters,
+        include_body=_needs_body_postfilter(unfinished_filters),
+    )
+    if _needs_metrics_postfilter(unfinished_filters):
+        rows = _apply(rows, unfinished_filters)
+    return [str(r["match_id"]) for r in rows if r.get("ft_home") is None]
+
+
+def _bulk_predict_notice(query: dict[str, str]) -> str:
+    status = query.get("bulk_predict_status") or ""
+    if not status:
+        return ""
+    detail = query.get("bulk_predict_detail") or ""
+    if status == "ok":
+        return _state(kind="info", title="Bulk prediction complete", lead=detail)
+    return _state(
+        kind="error",
+        title="Bulk prediction failed",
+        lead=detail or "Could not predict filtered matches.",
+    )
+
+
+def match_list(
+    connection: sqlite3.Connection,
+    query: dict[str, list[str]] | None = None,
+    *,
+    csrf_token: str | None = None,
+) -> str:
     filters = _filters(query, connection)
     if not filters["date_from"] and not filters["date_to"]:
         filters["date_from"], filters["date_to"] = _default_match_date_range()
@@ -457,6 +502,70 @@ def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | Non
     total, window = _load_match_page(connection, filters)
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(_page_number(filters), pages)
+    unfinished_ids = (
+        list_filtered_unfinished_match_ids(connection, query)
+        if has_any and total > 0
+        else []
+    )
+    unfinished_count = len(unfinished_ids)
+    notice = _bulk_predict_notice(filters)
+
+    bulk_form = ""
+    if unfinished_count > 0:
+        csrf_input = (
+            f'<input type="hidden" name="csrf" value="{html.escape(csrf_token)}">'
+            if csrf_token
+            else ""
+        )
+        hidden_filters = "".join(
+            f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(filters[k])}">'
+            for k in (
+                "engine",
+                "league",
+                "season",
+                "team",
+                "date_from",
+                "date_to",
+                "fixture",
+                "status",
+                "verdict",
+                "confidence",
+                "order",
+            )
+            if filters.get(k)
+        )
+        cap_limit = 100
+        capped_count = min(unfinished_count, cap_limit)
+        confirm_title = "Confirm bulk prediction"
+        confirm_msg = (
+            f"Run or re-run predictions for {capped_count} unfinished "
+            f"filtered match{'es' if capped_count != 1 else ''}? "
+            "Finished matches will be skipped."
+            + (
+                f" (Capped at {cap_limit} of {unfinished_count} matching fixtures.)"
+                if unfinished_count > cap_limit
+                else ""
+            )
+        )
+        bulk_form = (
+            f'<button type="button" class="btn-bulk-predict" '
+            f'onclick="document.getElementById(\'bulk-predict-dialog\').showModal()">'
+            f"Predict unfinished ({unfinished_count})</button>"
+            f'<dialog id="bulk-predict-dialog" class="confirm-dialog" '
+            f'aria-labelledby="bulk-predict-title" aria-describedby="bulk-predict-desc">'
+            f'<div class="confirm-dialog-card">'
+            f'<h2 id="bulk-predict-title">{html.escape(confirm_title)}</h2>'
+            f'<p id="bulk-predict-desc" class="note">{html.escape(confirm_msg)}</p>'
+            f'<form class="bulk-predict-form" method="post" action="/matches/predict-filtered">'
+            f"{csrf_input}{hidden_filters}"
+            f'<div class="confirm-dialog-actions">'
+            f'<button type="button" class="btn-dialog-cancel" '
+            f'onclick="document.getElementById(\'bulk-predict-dialog\').close()">Cancel</button>'
+            f'<button type="submit" class="btn-dialog-confirm">'
+            f"Confirm ({capped_count})</button>"
+            f"</div></form></div></dialog>"
+        )
+
     if not has_any:
         listing = _state(
             kind="empty",
@@ -483,14 +592,16 @@ def match_list(connection: sqlite3.Connection, query: dict[str, list[str]] | Non
     else:
         listing = _match_table(window, filters)
         toolbar = (
-            f'<div class="toolbar"><p class="note">Showing '
+            f'<div class="toolbar" style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;">'
+            f'<p class="note">Showing '
             f"<strong>{len(window)}</strong> of <strong>{total}</strong>"
-            f" · page {page} of {pages}</p></div>"
+            f" · page {page} of {pages}</p>{bulk_form}</div>"
         )
         pager = _pager("/matches", filters, page, pages)
     body = [
         _masthead("Matches", filters, active="matches"),
         _filter_form("/matches", filters, leagues, seasons, teams, submit="Show matches"),
+        notice,
         toolbar,
         listing,
         pager,
@@ -606,6 +717,28 @@ def match_detail(
     query_text = _query(filters, page="")
     if query_text:
         back = f"/matches?{query_text}"
+    cl_stage = ""
+    cl_prior_note = ""
+    if str(match.get("competition") or "") == "CL":
+        rp_id = match.get("raw_payload_id")
+        if rp_id:
+            rp_row = connection.execute(
+                "SELECT body_json FROM raw_payloads WHERE payload_id = ?", (rp_id,)
+            ).fetchone()
+            if rp_row:
+                try:
+                    rp_body = json.loads(rp_row["body_json"])
+                    for m_item in rp_body.get("matches") or []:
+                        if str(m_item.get("id")) == canonical_id and m_item.get("stage"):
+                            cl_stage = str(m_item["stage"]).replace("_", " ").title()
+                            break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        from modeling.league_stacks import live_stack_for
+
+        cl_st = live_stack_for("CL")
+        if cl_st.get("persistent_priors") or float(cl_st.get("domestic_prior_weight") or 0.0) > 0.0:
+            cl_prior_note = "Prior: Persistent CL + Elo + Domestic"
     parts = [
         _masthead(
             f"{_club_label(match, 'home')} vs {_club_label(match, 'away')}",
@@ -614,6 +747,13 @@ def match_detail(
             back_href=back,
         ),
         _scoreboard(match, result, connection),
+        (
+            f'<p class="note" style="margin:8px 0 0;">'
+            + (" · ".join(x for x in (cl_stage, cl_prior_note) if x))
+            + "</p>"
+            if (cl_stage or cl_prior_note)
+            else ""
+        ),
         _predict_flash(filters),
         _predict_panel(
             match_id=canonical_id,
@@ -778,7 +918,7 @@ def _predict_panel(
 def _default_match_date_range(*, today: date | None = None) -> tuple[str, str]:
     """Matches page default window: 7 Cairo days ago through Cairo today."""
 
-    from timeutil import cairo_today
+    from core.timeutil import cairo_today
 
     end = today or cairo_today()
     start = end - timedelta(days=7)
@@ -3160,6 +3300,46 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None, *, extra
     }}
     .predict-form button:hover {{ filter: brightness(1.05); }}
     .predict-form button:active {{ transform: scale(0.96); }}
+    .bulk-predict-form {{ display: inline-flex; align-items: center; }}
+    .btn-bulk-predict {{
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: 44px; padding: 0 16px; border: 1px solid var(--accent);
+      border-radius: var(--radius-sm); background: rgba(52, 211, 153, 0.14);
+      color: var(--accent); font: inherit; font-weight: 700; cursor: pointer;
+      transition: transform 160ms var(--ease), background 160ms var(--ease);
+    }}
+    .btn-bulk-predict:hover {{ background: rgba(52, 211, 153, 0.24); }}
+    .btn-bulk-predict:active {{ transform: scale(0.96); }}
+    dialog.confirm-dialog {{
+      margin: auto; padding: 0; border: 1px solid var(--line);
+      border-radius: var(--radius-lg); background: var(--panel); color: var(--text);
+      max-width: min(440px, calc(100vw - 32px)); box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+    }}
+    dialog.confirm-dialog::backdrop {{
+      background: rgba(11, 18, 32, 0.72); backdrop-filter: blur(4px);
+    }}
+    .confirm-dialog-card {{ padding: 24px; display: grid; gap: 12px; }}
+    .confirm-dialog-card h2 {{ margin: 0; font-size: 1.15rem; }}
+    .confirm-dialog-card .note {{ margin: 0; line-height: 1.5; }}
+    .confirm-dialog-actions {{
+      display: flex; justify-content: flex-end; gap: 12px; margin-top: 8px; flex-wrap: wrap;
+    }}
+    .btn-dialog-cancel, .btn-dialog-confirm {{
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: 44px; padding: 0 16px; border-radius: var(--radius-sm);
+      font: inherit; font-weight: 600; cursor: pointer;
+      transition: transform 160ms var(--ease), background 160ms var(--ease), filter 160ms var(--ease);
+    }}
+    .btn-dialog-cancel {{
+      border: 1px solid var(--line); background: transparent; color: var(--muted);
+    }}
+    .btn-dialog-cancel:hover {{ background: rgba(255, 255, 255, 0.05); color: var(--text); }}
+    .btn-dialog-confirm {{
+      border: 0; background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      color: #042f24; font-weight: 700;
+    }}
+    .btn-dialog-confirm:hover {{ filter: brightness(1.05); }}
+    .btn-dialog-cancel:active, .btn-dialog-confirm:active {{ transform: scale(0.96); }}
     .charts-panel {{ margin: 32px 0 24px; }}
     .chart-grid {{
       display: grid; grid-template-columns: 1fr;
@@ -4328,7 +4508,7 @@ def experiments_list(
     lab_db: Path | None = None,
 ) -> str:
     """List all lab experiments with hierarchical outcome cards and pass/fail rates."""
-    from db_paths import resolve_lab_database_path
+    from db.db_paths import resolve_lab_database_path
     from laboratory.store import connect as lab_connect, emblem_url_for_competition
 
     filters = _filters(query, connection) if query else _default_filters()
@@ -4641,7 +4821,7 @@ def experiment_detail(
     lab_db: Path | None = None,
 ) -> str | None:
     """Detailed view for a single experiment: status, KPI strip, traceback, leaderboard, prompt export."""
-    from db_paths import resolve_lab_database_path
+    from db.db_paths import resolve_lab_database_path
     from laboratory.store import connect as lab_connect, emblem_url_for_competition, get_lab_experiment, get_lab_experiment_runs
     from urllib.parse import quote
 
@@ -5076,14 +5256,14 @@ def _page_number(filters: dict[str, str]) -> int:
 
 
 def _when(value: str) -> str:
-    from timeutil import format_datetime_cairo
+    from core.timeutil import format_datetime_cairo
 
     formatted = format_datetime_cairo(value)
     return html.escape(formatted if formatted is not None else value)
 
 
 def _when_short(value: str) -> str:
-    from timeutil import format_datetime_short_cairo
+    from core.timeutil import format_datetime_short_cairo
 
     formatted = format_datetime_short_cairo(value)
     return html.escape(formatted if formatted is not None else value)

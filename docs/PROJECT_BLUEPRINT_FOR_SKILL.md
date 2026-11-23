@@ -117,14 +117,15 @@ Providers (read-only network):
 
 | Boundary | Rule |
 | --- | --- |
-| `models.py` | Pure dataclasses/errors; **no** Telegram, HTTP, Gemini, SQLite. |
-| `score_model.py` | Pure math on payloads; **no** Gemini; no Telegram. |
-| `eligibility.py` | Validation only; gaps stay empty (never fill zeros). |
-| `pipeline.py` | Orchestrates live predict; may write bot `Storage` tables. |
-| `laboratory/*` | Must not start the Telegram bot; lab pricing must not call Gemini (`score_model_adapter` / `poisson_engine`). |
-| `predictor.py` | Gemini JSON reasoning only; scores/markets already computed. |
-| Shared DB | Bot tables (`prediction_*`) and lab tables coexist; names do not overlap (`database.ensure_shared_schemas`). |
-| Live vs lab configs | Prefer `configs/live/{league}_stack.json` via `league_stacks`; SPL may still read `data/spl_stack.json`. Lab promotions write atomically (`os.replace`). |
+| `core/models.py` | Pure dataclasses/errors; **no** Telegram, HTTP, Gemini, SQLite. |
+| `domain/*` | Pure immutable value objects (`ModelConfig`, `ScoringConstants`, `EncodedDataset`) & zero-copy NumPy feature engineering; **no** SQLite. |
+| `modeling/*` | Pure math & vectorized NumPy/SciPy strategies (`score_model.py`, `base.py`, `shrinkage.py`, `dixon_coles.py`, `distributions.py`); **no** Gemini, Telegram, or SQLite. |
+| `live/eligibility.py` | Validation only; gaps stay empty (never fill zeros). |
+| `live/pipeline.py` | Orchestrates live predict; may write bot `Storage` tables. |
+| `laboratory/*` | Must not start the Telegram bot; lab pricing must not call Gemini (`score_model_adapter` / `poisson_engine`). SQL isolated in `laboratory/repositories.py` & `laboratory/store.py`. |
+| `live/predictor.py` | Gemini JSON reasoning only; scores/markets already computed. |
+| Shared DB | Bot tables (`prediction_*`) and lab tables coexist; names do not overlap (`db.database.ensure_shared_schemas`). |
+| Live vs lab configs | Prefer `configs/live/{league}_stack.json` via `modeling.league_stacks`; SPL may still read `data/spl_stack.json`. Lab promotions write atomically (`os.replace`). |
 
 ### Live vs laboratory execution
 
@@ -144,36 +145,42 @@ Providers (read-only network):
 
 | Path | Responsibility | Key API | I/O |
 | --- | --- | --- | --- |
-| `main.py` | Telegram long-poll | `build_pipeline(config)`, `main()` | Reads env; opens `Storage`; runs polling |
-| `bot.py` | Commands `/start`, `/today`, `/matches`, `/predict`, callbacks `p:` | `build_application`, `parse_*` | Uses `Pipeline`; Cairo times |
+| `main.py` | Telegram long-poll | `build_pipeline(config)`, `main()` | Reads env; opens `db.storage.Storage`; runs polling |
+| `live/bot.py` | Commands `/start`, `/today`, `/matches`, `/predict`, callbacks `p:` | `build_application`, `parse_*` | Uses `live.pipeline.Pipeline`; Cairo times |
 | `jobs/__main__.py` | Background loop | `jobs_loop`, `main` | Tomorrow + standings; `record_job_run` |
-| `jobs/tomorrow.py` | Price Cairo-tomorrow fixtures | `run_tomorrow_once` | Via `Pipeline` |
+| `jobs/tomorrow.py` | Price Cairo-tomorrow fixtures | `run_tomorrow_once` | Via `live.pipeline.Pipeline` |
 | `jobs/standings_job.py` | Refresh standings after local rounds | `run_standings_once` | Lab standings tables |
 | `laboratory/__main__.py` | Lab CLI + HTTP dashboard | `main`, `serve`, `_tune_spl`, … | Shared DB; Football-Data / LFA / Ninjas |
 | `start.sh` / `Makefile` | Local process orchestration | `make bot\|jobs\|dash\|test\|start` | Logs under `data/logs/` |
 
-### Core domain
+### Core, Live, Providers, DB, Domain & Modeling
 
 | Path | Responsibility | Key functions / classes | Inputs → Outputs |
 | --- | --- | --- | --- |
-| `pipeline.py` | One-match live analysis | `Pipeline.execute`, `_analyze` | home/away/comp → `PipelineResult`; may abstain |
-| `score_model.py` | Multiplicative Poisson (+ optional NB) + DC + draw + lab calibration knobs | `estimate_score`, `estimate_from_lambdas`, `select_1x2_outcome`, `_boost_draw_scorelines`, `_soft_cap_goals`, `_nb_pmf`, `prior_means_for_fixture`, `ScoreEstimate` | Finished payloads + ids → grid, markets, λ |
-| `score_model_enhanced.py` | Experimental ensembles / bivariate / copula | `estimate_score_ensemble`, `estimate_score_special` | Research; not default live path |
-| `predictor.py` | Gemini reasoning | `Predictor`, prompt builders | Snapshot + estimate → tactical text JSON |
-| `eligibility.py` | Gate checks | `evaluate`, `MINIMUM_SCORED_MATCHES=3`, `FORM_WINDOW=5` | Payloads → `Evaluation` |
-| `data_fetcher.py` | Football-Data (+ Ninjas routing) | `DataFetcher`, `resolve_competition`, `fixture_is_predictable`, `LIVE_MATCH_COMPETITIONS` | API → fixtures/teams/standings caches |
-| `api_ninjas.py` | SPL live provider | Ninjas client helpers | Key → fixtures/standings |
-| `live_football_api.py` | SPL multi-season archive | `LFA_LEAGUE_IDS["SPL"]=8454`, season fetch | Key → season bodies |
-| `league_stacks.py` | Per-league live knobs | `live_stack_for`, `draw_calibration_kwargs`, `save_live_stack`, `save_spl_stack` | code → stack dict |
-| `models.py` | Shared shapes | `Fixture`, `PipelineResult`, `Markets`, `StageError`, … | Pure data |
-| `config.py` | Env → `Config` | `load_config`, `normalize_gemini_model` | Requires BOT/FOOTBALL/GEMINI keys |
-| `db_paths.py` | Shared DB path | `resolve_database_path`, `DEFAULT_DATABASE_PATH` | env → `Path` |
-| `database.py` | Dual schema bootstrap | `ensure_shared_schemas` | connection → bot+lab DDL |
-| `storage.py` | Bot SQLite traces | `Storage`, `BOT_SCHEMA` | run/snapshot/version CRUD |
-| `timeutil.py` | Cairo formatting | kickoff helpers | UTC ISO → Cairo display |
-| `pre_round.py` | Legacy in-bot pre-round | Used only if `PRE_ROUND_ENABLED=1` | Prefer `python -m jobs` |
-| `migrate_db.py` | Merge old DBs | CLI merge into shared file | legacy → `football.db` |
-| `evaluate_models.py` / `evaluate_models_v2.py` | Ad-hoc evaluation scripts | season evaluation helpers | Research utilities |
+| `core/config.py` | Env → `Config` | `load_config`, `normalize_gemini_model` | Requires BOT/FOOTBALL/GEMINI keys |
+| `core/models.py` | Shared shapes | `Fixture`, `PipelineResult`, `Markets`, `StageError`, … | Pure data |
+| `core/timeutil.py` | Cairo formatting | kickoff helpers | UTC ISO → Cairo display |
+| `db/db_paths.py` | Shared DB path | `resolve_database_path`, `resolve_lab_database_path`, `DEFAULT_DATABASE_PATH` | env → `Path` |
+| `db/database.py` | Dual schema bootstrap | `ensure_shared_schemas` | connection → bot+lab DDL |
+| `db/storage.py` | Bot SQLite traces | `Storage`, `BOT_SCHEMA` | run/snapshot/version CRUD |
+| `db/migrate_db.py` | Merge old DBs | `merge_into_shared` | legacy → `football.db` |
+| `domain/entities.py` | Domain value objects & constants | `ScoringConstants`, `ModelConfig`, `EncodedDataset`, `FittedModelState` | Zero-copy `slice_view` |
+| `domain/features.py` | Vectorized feature engineering | `encode_matches`, `compute_time_decay_weights`, `soft_cap_goals_vec`, `compute_standings_blend_means` | Records → contiguous NumPy arrays |
+| `modeling/base.py` | Strategy interface | `BaseScoreModel` (`fit`, `predict_lambdas`) | Dataset + config → rates |
+| `modeling/shrinkage.py` | Vectorized shrinkage models | `ShrinkageOnePassModel`, `ShrinkageJointModel`, `compute_joint_venue_strengths_vec` | `np.bincount` $O(M)$ |
+| `modeling/dixon_coles.py` | DC ρ & analytical-gradient MLE | `fit_dixon_coles_rho_vec`, `JointDixonColesMLEModel`, `dixon_coles_joint_nll_and_grad` | 4-cell closed form; `L-BFGS-B` (`jac=True`) |
+| `modeling/distributions.py` | Vectorized score matrices | `build_score_matrix_vec`, `market_1x2_from_matrix` | λ → normalized `(G+1, G+1)` grid |
+| `modeling/score_model.py` | Facade & multiplicative Poisson (+ NB) + DC + draw knobs | `estimate_score`, `estimate_from_lambdas`, `select_1x2_outcome`, `_boost_draw_scorelines`, `ScoreEstimate` | Finished payloads + ids → grid, markets, λ |
+| `modeling/league_stacks.py` | Per-league live knobs | `live_stack_for`, `draw_calibration_kwargs`, `save_live_stack`, `save_spl_stack` | code → stack dict |
+| `modeling/enhanced.py` | Experimental ensembles / bivariate / copula | `estimate_score_ensemble`, `estimate_score_special` | Research; not default live path |
+| `live/pipeline.py` | One-match live analysis | `Pipeline.execute`, `_analyze` | home/away/comp → `PipelineResult`; may abstain |
+| `live/predictor.py` | Gemini reasoning | `Predictor`, prompt builders | Snapshot + estimate → tactical text JSON |
+| `live/eligibility.py` | Gate checks | `evaluate`, `MINIMUM_SCORED_MATCHES=3`, `FORM_WINDOW=5` | Payloads → `Evaluation` |
+| `live/pre_round.py` | Legacy in-bot pre-round | Used only if `PRE_ROUND_ENABLED=1` | Prefer `python -m jobs` |
+| `providers/data_fetcher.py` | Football-Data (+ Ninjas routing) | `DataFetcher`, `resolve_competition`, `fixture_is_predictable`, `LIVE_MATCH_COMPETITIONS` | API → fixtures/teams/standings caches |
+| `providers/api_ninjas.py` | SPL live provider | Ninjas client helpers | Key → fixtures/standings |
+| `providers/live_football_api.py` | SPL multi-season archive | `LFA_LEAGUE_IDS["SPL"]=8454`, season fetch | Key → season bodies |
+| `scripts/research/evaluate_models*.py` | Ad-hoc evaluation scripts | season evaluation helpers | Research utilities |
 
 ### Laboratory
 
@@ -181,6 +188,8 @@ Providers (read-only network):
 | --- | --- | --- | --- |
 | `laboratory/__init__.py` | Constants + lazy lab API | `EXPERIMENT_ID`, `BOT_EXPERIMENT_ID`, `SCORE_MODEL_CONFIG_ID`, `PROSPECTIVE_LEAD_DAYS=1` | Lazy exports for experiment modules |
 | `laboratory/store.py` | Lab schema + CRUD | `connect`, `checkpoint_wal`, `insert_prediction`, `ensure_experiment`, crest cache | `timeout=60`, WAL, busy_timeout 60s |
+| `laboratory/repositories.py` | Bulk SQL repositories & transactions | `MatchRepository`, `ExperimentRepository`, `connect_managed`, `transaction` | Zero N+1 queries; `executemany` bulk I/O |
+| `laboratory/metrics.py` | Streaming metric accumulators | `StreamingMetricsAccumulator`, `log_loss` | Computes Log-Loss/Brier without storing matrices |
 | `laboratory/snapshot.py` | Pre-kickoff payload | `MatchRecord`, `build_snapshot`, `leakage_status` | Same season + kickoff &lt; target |
 | `laboratory/job.py` | Walk-forward engines | `run_poisson`, `run_score_model`, `price_one_score_model` | Finished-only for batch; on-demand can replace |
 | `laboratory/score_model_adapter.py` | Bot scorer ↔ lab body | `price_from_snapshot`, `to_evaluable_body`, `SCORE_MODEL_ENGINE="score_model"` | Abstain if &lt;3 priors/club |
@@ -192,7 +201,7 @@ Providers (read-only network):
 | `laboratory/auth.py` | Dashboard login | session cookie, CSRF | Password required off-loopback |
 | `laboratory/gemini_schema.py` | Validate Gemini JSON (lab) | schema checks | |
 | `laboratory/lab_experiment.py` | Experiment config + JSON launch | `ExperimentConfig`, `parse_experiment_launch_json`, `merge_configs`, `resolve_primary_metric`, `make_model_id` | Explicit `None` in overrides wins; SHA-256 model ids |
-| `laboratory/lab_runner.py` | Parallel grid runs | `run_experiment`, `_merge_configs`, `_aggregate_metrics` | Workers; nested Exact/O/U aggregates |
+| `laboratory/lab_runner.py` | Parallel grid runs | `run_experiment`, `shared_encoded_dataset`, `_aggregate_metrics` | `SharedMemory`/memmap, `OMP/MKL/OPENBLAS=1`, `persist_predictions` toggle |
 | `laboratory/lab_analysis.py` | Compare / calibration | `compare_to_baseline`, bootstrap CIs | |
 | `laboratory/lab_promotion.py` | Promote/rollback live stacks | `promote_best_config`, `PromotionGuardrails` | Atomic write + rollback files |
 | `laboratory/team_display.py` | Display names | helpers for UI | |
@@ -216,7 +225,7 @@ Providers (read-only network):
 
 ### Shared SQLite: `data/football.db`
 
-**Connection settings** (`laboratory/store.connect` and `storage.Storage`):
+**Connection settings** (`laboratory/store.connect`, `laboratory/repositories.connect_managed`, and `db/storage.Storage`):
 
 - `sqlite3.connect(..., check_same_thread=False, timeout=60.0)`
 - `PRAGMA foreign_keys=ON`
@@ -228,7 +237,7 @@ Providers (read-only network):
 
 Verified tables (live DB):
 
-#### Bot tables (`storage.BOT_SCHEMA`)
+#### Bot tables (`db.storage.BOT_SCHEMA`)
 
 - **`prediction_run`**: `id PK`, `chat_id`, `user_id`, `raw_home/away/competition`, `created_at`, `status IN (completed,partial,abstained,failed)`, `stage`, `reason`
 - **`prediction_snapshot`**: `id PK`, `run_id FK`, `captured_at`, `competition_code`, `match_id`, team ids, `kickoff`, `payload`, `freshness`, `validation_checks`
@@ -317,7 +326,7 @@ Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_seas
 | FL1 | `configs/live/fl1_stack.json` | `EXP-EURO-DOMESTIC-01-FL1` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-fl1-v2` |
 | PPL | `configs/live/ppl_stack.json` | `EXP-EURO-DOMESTIC-01-PPL` | 8 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-ppl-v2` |
 | DED | `configs/live/ded_stack.json` | `EXP-EURO-DOMESTIC-01-DED` | 8 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-ded-v2` |
-| CL | `configs/live/cl_stack.json` | `EXP-CL-OPT-02` | 8 | 0.85 | null | 0.85 / 1.15 | `bot-score-model-cl-v3` |
+| CL | `configs/live/cl_stack.json` | `EXP-CL-OPT-02` | 8 | 0.85 | null | 0.85 / 1.15 | `bot-score-model-cl-v4` (`persistent_priors`, `elo_blend=0.5`, `domestic_prior_weight=0.4`) |
 | SPL | `data/spl_stack.json` (legacy; no `configs/live/spl_stack.json`) | `BOT-SPL-chal-db1p0-pick` | (file) | 1.0 + pick thr 0.28 / margin 0.05 | null | null | `bot-score-model-live` + `dependence=dixon_coles` |
 
 Unknown competition codes → `DEFAULT_LIVE_STACK`. **Do not** overwrite PL/SPL when promoting other leagues.

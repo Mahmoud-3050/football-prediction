@@ -6,8 +6,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from bot import NEED_START_TEXT, build_application, start, today
-from config import load_config
+from live.bot import NEED_START_TEXT, build_application, start, today
+from core.config import load_config
 
 
 def _with_event_loop(callback):

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from data_fetcher import (
+from providers.data_fetcher import (
     TODAY_MATCH_COMPETITIONS,
     UPCOMING_STATUSES,
     DataFetcher,
@@ -26,8 +26,8 @@ from data_fetcher import (
     teams_from_payload,
     unknown_competition_reason,
 )
-from eligibility import FREE_TIER_DELAY_WARNING, evaluate
-from models import (
+from live.eligibility import FREE_TIER_DELAY_WARNING, evaluate
+from core.models import (
     AnalysisSnapshot,
     CheckResult,
     Competition,
@@ -38,9 +38,9 @@ from models import (
     ProviderError,
     Team,
 )
-from predictor import Predictor
-from score_model import estimate_score
-from storage import Storage, utc_now
+from live.predictor import Predictor
+from modeling.score_model import estimate_score
+from db.storage import Storage, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -426,9 +426,28 @@ class Pipeline:
         limitations = list(decision.limitations)
         estimate = None
         if decision.eligible:
-            from league_stacks import draw_calibration_kwargs, live_stack_for
+            from modeling.league_stacks import draw_calibration_kwargs, live_stack_for
 
             stack = live_stack_for(competition.code)
+            cl_prior_means = None
+            if competition.code == "CL" and (
+                stack.get("persistent_priors")
+                or float(stack.get("elo_blend") or 0.0) > 0.0
+                or float(stack.get("domestic_prior_weight") or 0.0) > 0.0
+            ):
+                from laboratory.cl_features import resolve_cl_live_prior_means
+
+                cl_prior_means = resolve_cl_live_prior_means(
+                    home_id=home.id,
+                    away_id=away.id,
+                    kickoff=fixture.utc_date,
+                    k=float(stack["k"]),
+                    persistent_priors=bool(stack.get("persistent_priors")),
+                    elo_blend=float(stack.get("elo_blend") or 0.0),
+                    domestic_prior_weight=float(stack.get("domestic_prior_weight") or 0.0),
+                    default_atk=float(stack.get("promoted_attack_prior") or 0.85),
+                    default_def=float(stack.get("promoted_defence_prior") or 1.15),
+                )
             estimate = estimate_score(
                 competition_finished_payload=competition_finished,
                 home_finished_payload=home_form,
@@ -439,6 +458,7 @@ class Pipeline:
                 kickoff=fixture.utc_date,
                 k=float(stack["k"]),
                 prior_mean_mode=str(stack["prior_mean"]),
+                prior_means=cl_prior_means,
                 half_time_share_mode=str(stack["half_time_share_mode"]),
                 dependence=str(stack["dependence"]),
                 ratio_mode=str(stack.get("ratio_mode") or "one_pass"),

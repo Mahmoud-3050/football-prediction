@@ -12,7 +12,7 @@ def ensure_shared_schemas(connection: sqlite3.Connection) -> None:
     """
 
     from laboratory.store import ensure_laboratory_schema
-    from storage import BOT_SCHEMA
+    from db.storage import BOT_SCHEMA
 
     connection.executescript(BOT_SCHEMA)
     ensure_laboratory_schema(connection)

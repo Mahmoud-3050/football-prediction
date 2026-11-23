@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from data_fetcher import LIVE_MATCH_COMPETITIONS
+from providers.data_fetcher import LIVE_MATCH_COMPETITIONS
 
 # Same leagues as /today and /predict so jobs never price a gated-out fixture.
 JOB_COMPETITIONS: tuple[str, ...] = LIVE_MATCH_COMPETITIONS

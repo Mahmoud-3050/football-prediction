@@ -1,4 +1,4 @@
-from bot import ParseFailure, ParsedCommand, ParsedMatchId, parse_predict_command
+from live.bot import ParseFailure, ParsedCommand, ParsedMatchId, parse_predict_command
 
 
 def test_command_with_spaces_and_competition() -> None:

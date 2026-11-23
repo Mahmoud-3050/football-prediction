@@ -13,14 +13,14 @@ import re
 from collections.abc import Sequence
 from typing import Any, Awaitable, Callable
 
-from models import (
+from core.models import (
     AnalysisSnapshot,
     Markets,
     ModelError,
     ProducedPrediction,
     ScorePrediction,
 )
-from score_model import ScoreEstimate, ranked_exact_scores
+from modeling.score_model import ScoreEstimate, ranked_exact_scores
 
 logger = logging.getLogger(__name__)
 

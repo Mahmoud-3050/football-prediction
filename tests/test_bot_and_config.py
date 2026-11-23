@@ -5,11 +5,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from bot import build_application, predict, render_report
-from config import Config, ConfigError, load_config, normalize_gemini_model
+from live.bot import build_application, predict, render_report
+from core.config import Config, ConfigError, load_config, normalize_gemini_model
 from conftest import Harness
-from data_fetcher import DataFetcher, RateLimiter
-from models import Markets, PipelineResult
+from providers.data_fetcher import DataFetcher, RateLimiter
+from core.models import Markets, PipelineResult
 
 
 def test_missing_keys_fail_without_a_provider_call() -> None:
@@ -223,7 +223,7 @@ def test_predict_rejects_a_bad_command_before_the_provider(tmp_path) -> None:
     async def run():
         holder = Harness(tmp_path)
         # Build the pipeline by executing nothing: open it through a rejected command.
-        from bot import predict as predict_command
+        from live.bot import predict as predict_command
 
         message = SimpleNamespace(
             text="/predict Arsenal vs Chelsea",
@@ -289,12 +289,13 @@ def test_requirements_and_sources_stay_on_demand() -> None:
     assert "python-telegram-bot" in requirements
     assert "httpx" in requirements
     banned = ("JobQueue", "run_daily", "run_repeating", "google.generativeai")
-    for path in root.glob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        for word in banned:
-            assert word not in text, f"{path.name} contains {word}"
-    assert "get_todays_matches" in (root / "data_fetcher.py").read_text(encoding="utf-8")
-    bot_text = (root / "bot.py").read_text(encoding="utf-8")
+    for folder in (root, root / "live", root / "providers", root / "core"):
+        for path in folder.glob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for word in banned:
+                assert word not in text, f"{path.name} contains {word}"
+    assert "get_todays_matches" in (root / "providers" / "data_fetcher.py").read_text(encoding="utf-8")
+    bot_text = (root / "live" / "bot.py").read_text(encoding="utf-8")
     assert 'CommandHandler("today"' in bot_text
     assert 'CommandHandler("matches"' in bot_text
     assert "CallbackQueryHandler" in bot_text
@@ -347,10 +348,10 @@ def test_team_cache_is_written_only_when_a_request_reads_it(tmp_path) -> None:
 async def _open(holder: Harness):
     import httpx
 
-    from data_fetcher import DataFetcher
-    from pipeline import Pipeline
-    from predictor import Predictor
-    from storage import Storage
+    from providers.data_fetcher import DataFetcher
+    from live.pipeline import Pipeline
+    from live.predictor import Predictor
+    from db.storage import Storage
 
     holder._client_cm = httpx.AsyncClient(
         transport=httpx.MockTransport(holder.api.handler),

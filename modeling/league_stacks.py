@@ -37,6 +37,9 @@ DEFAULT_LIVE_STACK: dict[str, Any] = {
     "rest_defence_factor": 1.05,
     "standings_blend": 0.0,
     "standings_min_games": 6,
+    "persistent_priors": False,
+    "elo_blend": 0.0,
+    "domestic_prior_weight": 0.0,
     "code_version": "score_model_v1",
 }
 
@@ -65,6 +68,9 @@ _STACK_KEYS = (
     "rest_defence_factor",
     "standings_blend",
     "standings_min_games",
+    "persistent_priors",
+    "elo_blend",
+    "domestic_prior_weight",
     "code_version",
     "selected_experiment_id",
 )
@@ -96,7 +102,7 @@ def live_stack_for(
     path = _live_config_path(code)
     if not path.is_file() and code == "SPL":
         # Legacy fallback for SPL
-        from db_paths import resolve_database_path
+        from db.db_paths import resolve_database_path
         legacy_root = (database_path or resolve_database_path()).parent
         path = legacy_root / "spl_stack.json"
 
@@ -231,10 +237,12 @@ def _merge_stack(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[st
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number
-        elif key == "nb_alpha":
+        elif key in {"nb_alpha", "elo_blend", "domestic_prior_weight"}:
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number
+        elif key == "persistent_priors":
+            merged[key] = bool(value)
         elif key in {"promoted_attack_prior", "promoted_defence_prior", "venue_k"}:
             if value is None or value == "":
                 merged[key] = None
@@ -302,7 +310,7 @@ def _optional_positive_float(value: Any) -> float | None:
 # Back-compat: SPL still reads from data/spl_stack.json
 def spl_stack_path(*, database_path: Path | None = None) -> Path:
     """JSON beside the shared database (``data/spl_stack.json`` by default)."""
-    from db_paths import resolve_database_path
+    from db.db_paths import resolve_database_path
     root = (database_path or resolve_database_path()).parent
     return root / "spl_stack.json"
 

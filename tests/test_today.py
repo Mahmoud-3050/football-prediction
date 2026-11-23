@@ -1,12 +1,12 @@
 from datetime import date
 
-from bot import (
+from live.bot import (
     ParseFailure,
     ParsedDay,
     build_predict_button_pages,
     parse_day_argument,
 )
-from data_fetcher import (
+from providers.data_fetcher import (
     LIVE_MATCH_COMPETITIONS,
     TODAY_MATCH_COMPETITIONS,
     format_match_list,
@@ -15,7 +15,7 @@ from data_fetcher import (
     parse_fixture,
 )
 from jobs import JOB_COMPETITIONS
-from timeutil import format_kickoff_cairo, format_kickoff_short_cairo
+from core.timeutil import format_kickoff_cairo, format_kickoff_short_cairo
 
 
 def test_live_competitions_match_today_and_jobs() -> None:
@@ -111,7 +111,7 @@ def test_kickoffs_are_shown_in_cairo_time() -> None:
     # 15:00 UTC -> 17:00 Cairo (Africa/Cairo is UTC+2 outside DST quirks handled by zoneinfo)
     assert format_kickoff_short_cairo("2026-11-08T15:00:00Z") == "17:00 Cairo"
     assert format_kickoff_cairo("2026-11-08T15:00:00Z") == "2026-11-08 17:00 Cairo"
-    from timeutil import (
+    from core.timeutil import (
         format_clock_cairo,
         format_datetime_cairo,
         format_datetime_short_cairo,
@@ -123,7 +123,7 @@ def test_kickoffs_are_shown_in_cairo_time() -> None:
 
 
 def test_api_date_window_widens_exclusive_date_to() -> None:
-    from timeutil import api_date_window_for_cairo_day
+    from core.timeutil import api_date_window_for_cairo_day
 
     # Cairo day 8 Nov spans 7 Nov 22:00 UTC .. 8 Nov 22:00 UTC.
     # API dateTo is exclusive, so the request must end on 9 Nov.

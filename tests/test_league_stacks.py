@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from league_stacks import (
+from modeling.league_stacks import (
     DEFAULT_LIVE_STACK,
     draw_calibration_kwargs,
     live_stack_for,
@@ -79,7 +79,10 @@ _PROMOTED_LIVE = {
         "promoted_defence_prior": 1.15,
         "dependence": "dixon_coles",
         "nb_alpha": 0.1,
-        "model_id": "bot-score-model-cl-v3",
+        "persistent_priors": True,
+        "elo_blend": 0.5,
+        "domestic_prior_weight": 0.4,
+        "model_id": "bot-score-model-cl-v4",
     },
 }
 

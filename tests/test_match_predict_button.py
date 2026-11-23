@@ -16,7 +16,7 @@ from laboratory.auth import DashboardAuth
 from laboratory.dashboard import match_detail
 from laboratory.job import price_one_score_model
 from laboratory.store import append_result, connect, upsert_match
-from league_stacks import DEFAULT_LIVE_STACK, save_live_stack
+from modeling.league_stacks import DEFAULT_LIVE_STACK, save_live_stack
 
 
 def _seed_priced_history(connection, *, competition: str = "PL") -> str:
@@ -254,3 +254,65 @@ def test_post_predict_stores_and_redirects(tmp_path: Path) -> None:
         assert "Re-run prediction" in html or "Bot score model" in html
     finally:
         server.shutdown()
+
+
+def test_bulk_predict_filtered_unfinished_only_and_confirmation_dialog(tmp_path: Path) -> None:
+    from laboratory.dashboard import list_filtered_unfinished_match_ids, match_list
+    from laboratory.job import price_one_score_model
+    from laboratory.store import connect, upsert_match, append_result_if_changed
+
+    db = tmp_path / "football.db"
+    conn = connect(db)
+    _seed_priced_history(conn, competition="PL")
+    # Add two unfinished matches in PL season 2025 (one already predicted, one new)
+    for mid, hid, hname, aid, aname, ko in (
+        ("99001", "57", "Arsenal", "61", "Chelsea", "2026-11-28T15:00:00Z"),
+        ("99002", "64", "Liverpool", "61", "Chelsea", "2026-11-29T15:00:00Z"),
+    ):
+        upsert_match(
+            conn,
+            {
+                "match_id": mid,
+                "dataset_version": "test",
+                "competition": "PL",
+                "season": "2026",
+                "kickoff": ko,
+                "home_id": hid,
+                "home_name": hname,
+                "away_id": aid,
+                "away_name": aname,
+            },
+        )
+    conn.commit()
+
+    # Pre-predict 99001 so we verify already-predicted unfinished matches ARE included
+    first = price_one_score_model(conn, "99001", replace=True)
+    assert first["ok"] is True
+
+    query = {
+        "league": ["PL"],
+        "date_from": ["2024-01-01"],
+        "date_to": ["2026-12-31"],
+        "fixture": ["all"],
+    }
+    unfinished_ids = list_filtered_unfinished_match_ids(conn, query)
+    assert set(unfinished_ids) == {"99001", "99002"}
+
+    # Finished filter must yield 0 unfinished matches
+    finished_only = list_filtered_unfinished_match_ids(conn, {**query, "fixture": ["finished"]})
+    assert finished_only == []
+
+    # Render match_list and verify in-page <dialog> confirmation + CSRF + action
+    html = match_list(conn, query, csrf_token="tok-123")
+    assert 'action="/matches/predict-filtered"' in html
+    assert 'name="csrf" value="tok-123"' in html
+    assert '<dialog id="bulk-predict-dialog"' in html
+    assert "showModal()" in html
+    assert "return confirm(" not in html
+    assert "Predict unfinished (2)" in html
+
+    # Re-predicting all filtered unfinished matches works with replace=True
+    for mid in unfinished_ids:
+        res = price_one_score_model(conn, mid, replace=True)
+        assert res["ok"] is True
+    conn.close()

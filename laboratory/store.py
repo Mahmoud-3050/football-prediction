@@ -309,7 +309,7 @@ def connect(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA wal_autocheckpoint = 1000")
     connection.execute("PRAGMA temp_store = MEMORY")
     # Laboratory + bot tables live in the same file.
-    from database import ensure_shared_schemas
+    from db.database import ensure_shared_schemas
 
     ensure_shared_schemas(connection)
     return connection
@@ -358,7 +358,7 @@ COMPETITION_EMBLEM_FILES = {
 
 
 def crest_cache_dir() -> Path:
-    from db_paths import resolve_database_path
+    from db.db_paths import resolve_database_path
 
     return resolve_database_path(prefer_lab_override=True).parent / "crests"
 
@@ -528,7 +528,7 @@ def cache_competition_logos(
 
     emblem_remote = league_emblem_url
     if not emblem_remote and code == "SPL":
-        from live_football_api import lfa_league_id
+        from providers.live_football_api import lfa_league_id
 
         emblem_remote = f"https://live-football-api.com/leagues/{lfa_league_id(code)}.png"
     emblem_path = crest_cache_dir() / f"{code}.png"

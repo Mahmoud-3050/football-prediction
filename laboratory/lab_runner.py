@@ -8,24 +8,36 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from multiprocessing import shared_memory
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from laboratory.lab_experiment import ExperimentConfig, make_model_id
-from laboratory.score_model_adapter import SCORE_MODEL_ENGINE, price_from_snapshot
-from laboratory.snapshot import MatchRecord, build_snapshot, priors_from_snapshot
-from laboratory.store import (
-    connect,
-    insert_evaluation,
-    insert_prediction,
-    list_matches,
-    record_run,
-    save_snapshot,
+import numpy as np
+
+from domain.entities import EncodedDataset, ModelConfig
+from domain.features import encode_matches
+from laboratory.lab_experiment import (
+    ExperimentConfig,
+    expand_param_grid,
+    make_model_id,
+    merge_configs,
 )
-from score_model import club_venue_ratios, prior_means_for_fixture
+from laboratory.metrics import StreamingMetricsAccumulator
+from laboratory.repositories import (
+    ExperimentRepository,
+    MatchRepository,
+    connect_managed,
+    transaction,
+)
+from laboratory.score_model_adapter import SCORE_MODEL_ENGINE, price_from_snapshot
+from laboratory.snapshot import MatchRecord, build_snapshot
+from laboratory.store import connect
+from modeling.score_model import club_venue_ratios, prior_means_for_fixture
 from laboratory.score_model_adapter import team_int_id
 
 logger = logging.getLogger(__name__)
@@ -89,6 +101,74 @@ class ExperimentResult:
     all_runs: list[dict[str, Any]]
 
 
+def _init_worker() -> None:
+    """Pin BLAS/OpenMP thread pools to 1 inside worker processes to avoid contention."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+
+@contextmanager
+def shared_encoded_dataset(dataset: EncodedDataset) -> Iterator[dict[str, Any]]:
+    """Publish EncodedDataset NumPy arrays via SharedMemory (with memmap fallback)."""
+    import shutil
+    import tempfile
+
+    specs = {
+        "home_idx": dataset.home_idx,
+        "away_idx": dataset.away_idx,
+        "ft_home": dataset.ft_home,
+        "ft_away": dataset.ft_away,
+        "ht_home": dataset.ht_home,
+        "ht_away": dataset.ht_away,
+        "ht_usable": dataset.ht_usable,
+        "kickoff_days": dataset.kickoff_days,
+        "season_codes": dataset.season_codes,
+    }
+    blocks: list[shared_memory.SharedMemory] = []
+    tmp_dir: str | None = None
+    meta: dict[str, Any] = {"backend": "shm", "arrays": {}}
+    try:
+        try:
+            for name, arr in specs.items():
+                contig = np.ascontiguousarray(arr)
+                size = max(1, contig.nbytes)
+                shm = shared_memory.SharedMemory(create=True, size=size)
+                blocks.append(shm)
+                if contig.nbytes > 0:
+                    buf = np.ndarray(contig.shape, dtype=contig.dtype, buffer=shm.buf)
+                    buf[:] = contig
+                meta["arrays"][name] = (shm.name, contig.shape, contig.dtype.str)
+        except PermissionError:
+            for shm in blocks:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:
+                    pass
+            blocks.clear()
+            tmp_dir = tempfile.mkdtemp(prefix="fp_shared_")
+            meta = {"backend": "memmap", "dir": tmp_dir, "arrays": {}}
+            for name, arr in specs.items():
+                contig = np.ascontiguousarray(arr)
+                fpath = os.path.join(tmp_dir, f"{name}.npy")
+                np.save(fpath, contig, allow_pickle=False)
+                meta["arrays"][name] = (fpath, contig.shape, contig.dtype.str)
+        yield meta
+    finally:
+        for shm in blocks:
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except Exception:
+                pass
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @dataclass(frozen=True)
 class _WorkerInput:
     """Input passed to worker process (must be picklable)."""
@@ -99,6 +179,7 @@ class _WorkerInput:
     experiment_id: str
     live_db_path: str  # Path string for read-only access
     lab_db_path: str = "data/lab.db"  # Path string for lab DB access
+    persist_predictions: bool = True
 
 
 @dataclass(frozen=True)
@@ -146,45 +227,13 @@ def _build_snapshot_cache(
     ``seasons``; ``all_loaded_matches`` may also include the previous season so
     ``prior_mean=last_season`` can fit club ratios without leakage into priors.
     """
-    conn = sqlite3.connect(f"file:{live_db_path.resolve()}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-
     season_keys = _history_season_keys(seasons, include_previous=include_previous_season)
     target_season_keys = {str(int(s)) for s in seasons}
-    placeholders = ",".join("?" for _ in season_keys)
-    rows = conn.execute(
-        f"""
-        SELECT m.*, r.ft_home, r.ft_away, r.ht_home, r.ht_away, r.revision
-        FROM matches m
-        LEFT JOIN result_revisions r
-          ON r.match_id = m.match_id
-         AND r.revision = (
-            SELECT MAX(revision) FROM result_revisions WHERE match_id = m.match_id
-         )
-        WHERE m.competition = ? AND m.season IN ({placeholders})
-        ORDER BY m.kickoff, m.match_id
-        """,
-        (competition.upper(), *season_keys),
-    ).fetchall()
-    conn.close()
-
-    all_matches: list[MatchRecord] = []
-    for row in rows:
-        all_matches.append(
-            MatchRecord(
-                match_id=row["match_id"],
-                season=str(row["season"]),
-                kickoff=row["kickoff"],
-                home_id=row["home_id"],
-                home_name=row["home_name"],
-                away_id=row["away_id"],
-                away_name=row["away_name"],
-                ft_home=row["ft_home"],
-                ft_away=row["ft_away"],
-                ht_home=row["ht_home"],
-                ht_away=row["ht_away"],
-                competition=str(row["competition"] or competition.upper()),
-            )
+    with connect_managed(live_db_path, read_only=True) as conn:
+        all_matches = MatchRepository.fetch_matches(
+            conn,
+            competition=competition.upper(),
+            seasons=season_keys,
         )
 
     matches_by_season: dict[str, list[MatchRecord]] = {}
@@ -272,9 +321,27 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
 
     priced = 0
     evaluated = 0
-    pending_commits = 0
+    acc = StreamingMetricsAccumulator()
+    batch_snapshots: list[tuple[str, dict[str, Any]]] = []
+    batch_predictions: list[dict[str, Any]] = []
+    batch_evaluations: list[tuple[str, int, dict[str, Any]]] = []
+
+    def _flush_batches() -> None:
+        if not input_data.persist_predictions:
+            return
+        if not batch_snapshots and not batch_predictions and not batch_evaluations:
+            return
+        with transaction(lab_conn):
+            ExperimentRepository.bulk_save_snapshots(lab_conn, batch_snapshots)
+            ExperimentRepository.bulk_insert_predictions(lab_conn, batch_predictions)
+            ExperimentRepository.bulk_insert_evaluations(lab_conn, batch_evaluations)
+        batch_snapshots.clear()
+        batch_predictions.clear()
+        batch_evaluations.clear()
 
     try:
+        from laboratory.evaluate import evaluate_prediction
+
         for cached in cache.values():
             target = cached.target
             priors = cached.priors
@@ -327,21 +394,22 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                 continue
 
             priced += 1
-
-            snapshot_id = save_snapshot(lab_conn, payload, experiment_id=input_data.experiment_id)
-            prediction_id = insert_prediction(
-                lab_conn,
-                match_id=target.match_id,
-                snapshot_id=snapshot_id,
-                engine=SCORE_MODEL_ENGINE,
-                model_id=input_data.model_id,
-                body=outcome.body,
-                experiment_id=input_data.experiment_id,
-            )
+            if input_data.persist_predictions:
+                snapshot_id = f"{input_data.experiment_id}:{payload['payload_hash']}"
+                prediction_id = f"{input_data.experiment_id}:{snapshot_id}:{SCORE_MODEL_ENGINE}:{input_data.model_id}"
+                batch_snapshots.append((input_data.experiment_id, payload))
+                batch_predictions.append(
+                    {
+                        "experiment_id": input_data.experiment_id,
+                        "match_id": target.match_id,
+                        "snapshot_id": snapshot_id,
+                        "engine": SCORE_MODEL_ENGINE,
+                        "model_id": input_data.model_id,
+                        "body": outcome.body,
+                    }
+                )
 
             if target.ft_home is not None and target.ft_away is not None:
-                from laboratory.evaluate import evaluate_prediction
-
                 metrics = evaluate_prediction(
                     outcome.body,
                     {
@@ -352,21 +420,19 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                     },
                 )
                 evaluated += 1
-                if prediction_id:
-                    insert_evaluation(lab_conn, prediction_id, 1, metrics)
+                acc.add_evaluation(metrics)
+                if input_data.persist_predictions:
+                    batch_evaluations.append((prediction_id, 1, metrics))
 
-            pending_commits += 1
-            if pending_commits >= 50:
-                _commit_with_retry(lab_conn)
-                pending_commits = 0
+            if input_data.persist_predictions and len(batch_predictions) >= 50:
+                _flush_batches()
 
-        if pending_commits:
-            _commit_with_retry(lab_conn)
+        _flush_batches()
 
         return _WorkerOutput(
             model_id=input_data.model_id,
             status="completed",
-            metrics=None,
+            metrics=acc.finalize() if not input_data.persist_predictions else None,
             matches_priced=priced,
             matches_evaluated=evaluated,
             error=None,
@@ -432,82 +498,18 @@ def _aggregate_metrics(
     model_id: str,
 ) -> dict[str, Any]:
     """Compute aggregate metrics for a model from evaluations in lab DB."""
-    conn = connect(lab_db_path)
-    try:
-        # Get all evaluations for this model
-        rows = conn.execute(
-            """
-            SELECT e.metrics_json
-            FROM evaluations e
-            JOIN predictions p ON p.prediction_id = e.prediction_id
-            WHERE p.experiment_id = ? AND p.model_id = ?
-            """,
-            (experiment_id, model_id),
-        ).fetchall()
+    with connect_managed(lab_db_path) as conn:
+        metrics_rows = ExperimentRepository.fetch_evaluation_metrics_json(
+            conn, experiment_id=experiment_id, model_id=model_id
+        )
 
-        if not rows:
-            return {}
+    if not metrics_rows:
+        return {}
 
-        # Aggregate
-        total = len(rows)
-        metrics_sum: dict[str, float] = {}
-        metrics_count: dict[str, int] = {}
-
-        for row in rows:
-            metrics = json.loads(row["metrics_json"])
-            for market, vals in metrics.items():
-                if vals.get("status") != "scored":
-                    continue
-                if market not in metrics_sum:
-                    metrics_sum[market] = 0.0
-                    metrics_count[market] = 0
-                if "log_loss" in vals:
-                    key = f"{market}_log_loss"
-                    metrics_sum[key] = metrics_sum.get(key, 0.0) + vals["log_loss"]
-                    metrics_count[key] = metrics_count.get(key, 0) + 1
-                if "brier" in vals:
-                    key = f"{market}_brier"
-                    metrics_sum[key] = metrics_sum.get(key, 0.0) + vals["brier"]
-                    metrics_count[key] = metrics_count.get(key, 0) + 1
-                if "correct" in vals:
-                    key = f"{market}_accuracy"
-                    metrics_sum[key] = metrics_sum.get(key, 0.0) + (1.0 if vals["correct"] else 0.0)
-                    metrics_count[key] = metrics_count.get(key, 0) + 1
-
-        # Compute means
-        result: dict[str, Any] = {"n_matches": total}
-        for key in metrics_sum:
-            if metrics_count.get(key, 0) > 0:
-                result[key] = metrics_sum[key] / metrics_count[key]
-
-        # Nested market blocks for dashboard leaderboard / AI prompt.
-        for market in (
-            "exact_score",
-            "half_time_1x2",
-            "over_under_2_5",
-            "over_under_3_5",
-        ):
-            block: dict[str, Any] = {}
-            acc_key = f"{market}_accuracy"
-            ll_key = f"{market}_log_loss"
-            if acc_key in result:
-                block["hit"] = result[acc_key]
-                block["accuracy"] = result[acc_key]
-                if market == "exact_score":
-                    # Alias used by Exact Hit % readers / primary-metric tooling.
-                    result["exact_score_hit_rate"] = result[acc_key]
-                    block["hit_rate"] = result[acc_key]
-                    block["correct"] = result[acc_key]
-            if ll_key in result:
-                block["log_loss"] = result[ll_key]
-            if metrics_count.get(acc_key, 0) > 0:
-                block["n"] = metrics_count[acc_key]
-            if block:
-                result[market] = block
-
-        return result
-    finally:
-        conn.close()
+    acc = StreamingMetricsAccumulator()
+    for raw_json in metrics_rows:
+        acc.add_evaluation(json.loads(raw_json))
+    return acc.finalize()
 
 
 def run_experiment(
@@ -517,6 +519,7 @@ def run_experiment(
     *,
     max_workers: int = 4,
     resume: bool = True,
+    persist_predictions: bool = True,
 ) -> ExperimentResult:
     """Run a full experiment with parallel config evaluation.
 
@@ -540,8 +543,8 @@ def run_experiment(
 
     # Generate all model configs
     model_configs = []
-    for combo in _expand_param_grid(config.param_grid):
-        merged = _merge_configs(config.base_config, combo)
+    for combo in expand_param_grid(config.param_grid):
+        merged = merge_configs(config.base_config, combo)
         model_id = make_model_id(config.experiment_id, merged)
         model_configs.append((merged, model_id))
 
@@ -553,14 +556,10 @@ def run_experiment(
     )
 
     # Check for existing completed runs
-    conn = connect(lab_db_path)
-    existing = conn.execute(
-        "SELECT model_id FROM lab_experiment_runs WHERE experiment_id = ? AND status = 'completed'",
-        (config.experiment_id,),
-    ).fetchall()
-    conn.close()
-
-    completed_model_ids = {row["model_id"] for row in existing}
+    with connect_managed(lab_db_path) as conn:
+        completed_model_ids = ExperimentRepository.fetch_completed_model_ids(
+            conn, experiment_id=config.experiment_id
+        )
     pending = [(c, mid) for c, mid in model_configs if mid not in completed_model_ids]
 
     logger.info("Resuming: %d completed, %d pending", len(completed_model_ids), len(pending))
@@ -579,6 +578,7 @@ def run_experiment(
             experiment_id=config.experiment_id,
             live_db_path=str(live_db_path),
             lab_db_path=str(lab_db_path),
+            persist_predictions=persist_predictions,
         )
         for cfg, mid in pending
     ]
@@ -587,7 +587,10 @@ def run_experiment(
     completed_runs = 0
     failed_runs = 0
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_worker,
+    ) as executor:
         futures = {executor.submit(_price_worker, inp): inp.model_id for inp in worker_inputs}
 
         for future in concurrent.futures.as_completed(futures):
@@ -606,8 +609,8 @@ def run_experiment(
                 )
 
             # Aggregate metrics for completed runs
-            metrics = None
-            if output.status == "completed" and output.matches_evaluated > 0:
+            metrics = output.metrics
+            if metrics is None and output.status == "completed" and output.matches_evaluated > 0:
                 metrics = _aggregate_metrics(lab_db_path, config.experiment_id, model_id)
 
             # Record run in DB (retry through WAL contention with dashboard readers)
@@ -654,18 +657,10 @@ def _collect_results(
     failed_runs: int = 0,
 ) -> ExperimentResult:
     """Collect and rank all experiment results."""
-    conn = connect(lab_db_path)
-    runs = conn.execute(
-        """
-        SELECT run_id, model_id, config_json, status, metrics_json,
-               matches_priced, matches_evaluated, error
-        FROM lab_experiment_runs
-        WHERE experiment_id = ? AND status = 'completed'
-        ORDER BY matches_evaluated DESC
-        """,
-        (config.experiment_id,),
-    ).fetchall()
-    conn.close()
+    with connect_managed(lab_db_path) as conn:
+        runs = ExperimentRepository.fetch_completed_runs(
+            conn, experiment_id=config.experiment_id
+        )
 
     if not runs:
         return ExperimentResult(
@@ -723,35 +718,8 @@ def _collect_results(
     )
 
 
-def _expand_param_grid(param_grid: dict[str, list[Any]]) -> list[dict[str, Any]]:
-    """Expand a parameter grid into all combinations (cartesian product)."""
-    if not param_grid:
-        return [{}]
-
-    keys = list(param_grid.keys())
-    values = list(param_grid.values())
-
-    def _product(idx: int) -> list[dict[str, Any]]:
-        if idx == len(keys):
-            return [{}]
-        rest = _product(idx + 1)
-        result: list[dict[str, Any]] = []
-        for value in values[idx]:
-            for combo in rest:
-                combo = dict(combo)
-                combo[keys[idx]] = value
-                result.append(combo)
-        return result
-
-    return _product(0)
-
-
-def _merge_configs(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
-    """Deep merge base config with overrides (explicit None overrides base)."""
-    result = dict(base)
-    for key, value in overrides.items():
-        result[key] = value
-    return result
+_expand_param_grid = expand_param_grid
+_merge_configs = merge_configs
 
 
 def _last_kickoff_by_team(history, target_kickoff):

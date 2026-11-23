@@ -24,7 +24,7 @@ from laboratory.store import (
     record_run,
     save_snapshot,
 )
-from score_model import club_venue_ratios, prior_means_for_fixture
+from modeling.score_model import club_venue_ratios, prior_means_for_fixture
 
 EXPERIMENT_CONFIG = {
     "experiment_id": EXPERIMENT_ID,
@@ -167,6 +167,10 @@ def run_score_model(
     rest_defence_factor: float = 1.05,
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
+    persistent_priors: bool = False,
+    elo_blend: float = 0.0,
+    domestic_prior_weight: float = 0.0,
+    min_scored_matches: int | None = None,
 ) -> dict[str, int]:
     """Walk-forward using the Telegram bot scorer. No Gemini."""
 
@@ -202,6 +206,28 @@ def run_score_model(
             goal_cap=goal_cap,
             goal_cap_slope=goal_cap_slope,
         )
+    cl_track_b = competition == "CL" and (
+        persistent_priors or elo_blend > 0.0 or domestic_prior_weight > 0.0
+    )
+    cl_elo_map: dict[str, tuple[float, float]] = {}
+    cl_team_matches: dict[str, list[Any]] = {}
+    cl_league_avgs: dict[str, tuple[float, float]] = {}
+    if cl_track_b:
+        from laboratory.cl_features import (
+            compute_cl_elo_timeline,
+            load_all_competitions_data,
+        )
+
+        if elo_blend > 0.0:
+            cl_elo_map = compute_cl_elo_timeline(history)
+        if domestic_prior_weight > 0.0:
+            db_row = connection.execute("PRAGMA database_list").fetchone()
+            db_file = db_row[2] if db_row and len(db_row) > 2 and db_row[2] else None
+            if db_file:
+                cl_team_matches, cl_league_avgs = load_all_competitions_data(db_file)
+    effective_min_scored = (
+        0 if (min_scored_matches is None and cl_track_b) else min_scored_matches
+    )
     counts = {
         "competition": competition,
         "experiment_id": experiment_id,
@@ -232,7 +258,69 @@ def run_score_model(
             counts["failed"] += 1
             continue
         means = None
-        if prior_mean == "last_season":
+        if cl_track_b:
+            import math
+            from laboratory.cl_features import (
+                build_persistent_cl_priors,
+                domestic_team_prior,
+            )
+
+            atk_def = float(promoted_attack_prior or 0.85)
+            def_def = float(promoted_defence_prior or 1.15)
+            if persistent_priors:
+                means = build_persistent_cl_priors(
+                    history,
+                    target,
+                    k=k,
+                    season_decay=0.60,
+                    default_atk=atk_def,
+                    default_def=def_def,
+                )
+            elif prior_mean == "last_season":
+                means = prior_means_for_fixture(
+                    season_ratio_cache.get(target.season) or {},
+                    home_id=target.home_id,
+                    away_id=target.away_id,
+                    promoted_attack_prior=promoted_attack_prior,
+                    promoted_defence_prior=promoted_defence_prior,
+                )
+            else:
+                means = {
+                    "attack_home": atk_def,
+                    "defence_home": def_def,
+                    "attack_away": atk_def,
+                    "defence_away": def_def,
+                }
+            if elo_blend > 0.0 and target.match_id in cl_elo_map:
+                eh, ea = cl_elo_map[target.match_id]
+                h_factor = math.exp(0.35 * elo_blend * (eh - 1500.0) / 400.0)
+                a_factor = math.exp(0.35 * elo_blend * (ea - 1500.0) / 400.0)
+                means["attack_home"] *= h_factor
+                means["defence_home"] /= h_factor
+                means["attack_away"] *= a_factor
+                means["defence_away"] /= a_factor
+            if domestic_prior_weight > 0.0 and cl_team_matches:
+                dh = domestic_team_prior(
+                    target.home_id, target.kickoff, cl_team_matches, cl_league_avgs
+                )
+                da = domestic_team_prior(
+                    target.away_id, target.kickoff, cl_team_matches, cl_league_avgs
+                )
+                if dh is not None:
+                    means["attack_home"] = (1.0 - domestic_prior_weight) * means[
+                        "attack_home"
+                    ] + domestic_prior_weight * dh[0]
+                    means["defence_home"] = (1.0 - domestic_prior_weight) * means[
+                        "defence_home"
+                    ] + domestic_prior_weight * dh[1]
+                if da is not None:
+                    means["attack_away"] = (1.0 - domestic_prior_weight) * means[
+                        "attack_away"
+                    ] + domestic_prior_weight * da[0]
+                    means["defence_away"] = (1.0 - domestic_prior_weight) * means[
+                        "defence_away"
+                    ] + domestic_prior_weight * da[1]
+        elif prior_mean == "last_season":
             means = prior_means_for_fixture(
                 season_ratio_cache.get(target.season) or {},
                 home_id=target.home_id,
@@ -268,6 +356,7 @@ def run_score_model(
             last_kickoff_by_team=_last_kickoff_by_team(history, target.kickoff) if short_rest_days is not None else None,
             standings_blend=standings_blend,
             standings_min_games=standings_min_games,
+            min_scored_matches=effective_min_scored,
         )
         if outcome.excluded or outcome.body is None:
             record_run(
@@ -407,7 +496,7 @@ def price_one_score_model(
     if row is None:
         return {"ok": False, "status": "missing", "detail": "Match not found in laboratory."}
 
-    from league_stacks import draw_calibration_kwargs, live_stack_for
+    from modeling.league_stacks import draw_calibration_kwargs, live_stack_for
 
     competition = str(row["competition"] or "PL").upper()
     if competition == "PL":
@@ -482,7 +571,28 @@ def price_one_score_model(
         }
 
     means = None
-    if prior_mean == "last_season":
+    if competition == "CL" and (
+        stack.get("persistent_priors")
+        or float(stack.get("elo_blend") or 0.0) > 0.0
+        or float(stack.get("domestic_prior_weight") or 0.0) > 0.0
+    ):
+        from laboratory.cl_features import resolve_cl_live_prior_means
+
+        db_row = connection.execute("PRAGMA database_list").fetchone()
+        db_file = db_row[2] if db_row and len(db_row) > 2 and db_row[2] else None
+        means = resolve_cl_live_prior_means(
+            home_id=target.home_id,
+            away_id=target.away_id,
+            kickoff=target.kickoff,
+            k=k,
+            persistent_priors=bool(stack.get("persistent_priors")),
+            elo_blend=float(stack.get("elo_blend") or 0.0),
+            domestic_prior_weight=float(stack.get("domestic_prior_weight") or 0.0),
+            default_atk=float(draw_kwargs.get("promoted_attack_prior") or 0.85),
+            default_def=float(draw_kwargs.get("promoted_defence_prior") or 1.15),
+            db_path=db_file,
+        )
+    if means is None and prior_mean == "last_season":
         means = prior_means_for_fixture(
             season_ratio_cache.get(target.season) or {},
             home_id=target.home_id,
@@ -490,6 +600,17 @@ def price_one_score_model(
             promoted_attack_prior=draw_kwargs.get("promoted_attack_prior"),
             promoted_defence_prior=draw_kwargs.get("promoted_defence_prior"),
         )
+    cl_min_scored = (
+        0
+        if (
+            competition == "CL"
+            and (
+                stack.get("persistent_priors")
+                or float(stack.get("domestic_prior_weight") or 0.0) > 0.0
+            )
+        )
+        else None
+    )
     outcome = price_from_snapshot(
         payload,
         k=k,
@@ -499,6 +620,7 @@ def price_one_score_model(
         dependence=dependence,
         half_time_share_mode=half_time_share_mode,
         decay_half_life_days=float(decay) if decay is not None else None,
+        min_scored_matches=cl_min_scored,
         **draw_kwargs,
     )
     if outcome.excluded or outcome.body is None:
