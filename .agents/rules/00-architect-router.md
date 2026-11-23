@@ -17,7 +17,7 @@ Before editing or answering, identify which subsystem(s) the task touches and co
 
 ## 2. Universal Anti-Hallucination & Safety Invariants
 1. **Read Before Edit:** Read the target file(s) in full (or relevant section) in the current session before editing. Never edit from memory alone.
-2. **No Invented Identifiers:** Never invent config keys, stack keys, SQL columns, CLI flags, env vars, or module paths. Grep/read source (`__main__.py`, `league_stacks.py`, SQL DDL) first.
+2. **No Invented Identifiers:** Never invent config keys, stack keys, SQL columns, CLI flags, env vars, or module paths. Grep/read source (`laboratory/__main__.py`, `modeling/league_stacks.py`, SQL DDL) first.
 3. **Verify Unimplemented Plans:** Do NOT assume separate `lab.db`, `?mode=ro` URIs, `[lab]` extras, or enforced `code_version` gates exist unless verified in source; if absent, inform the user rather than coding against them.
 4. **Domain Identity:** Estimates **one named football match at a time** and **abstains** when data is insufficient (`<3` scored matches). Not a fixture browser or tipster; bot replies must state results are **statistical estimates, not betting tips**.
 5. **Tech Conventions:** Python 3.9+ (`from __future__ import annotations`), frozen dataclasses for configs/outcomes, `StageError`/`ProviderError`/`ModelError` with `stage`, stdlib `logging`. Never commit `.env` or call live external APIs in tests.

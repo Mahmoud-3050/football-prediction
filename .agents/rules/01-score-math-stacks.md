@@ -23,7 +23,7 @@ globs: "**/modeling/**/*.py, **/domain/**/*.py, **/live/eligibility.py, **/confi
 - **FORBIDDEN:** Applying SPL draw-pick rules globally or editing PL stack while changing SPL. Touch only `live_stack_for("SPL")` / SPL stack path.
 - `league_stacks.live_stack_for` must keep working when `configs/live/` is absent (fallback to `DEFAULT_LIVE_STACK` / `data/spl_stack.json`).
 - Pass stack knobs exclusively via `league_stacks.draw_calibration_kwargs(stack)` → `estimate_score` / `price_from_snapshot` / `run_score_model`.
-- `stack["code_version"]` (default `"score_model_v1"`) travels with the stack. Do not add keys to `DEFAULT_LIVE_STACK` without reading `league_stacks.py` and updating tests.
+- `stack["code_version"]` (default `"score_model_v1"`) travels with the stack. Do not add keys to `DEFAULT_LIVE_STACK` without reading `modeling/league_stacks.py` and updating tests.
 - Atomic stack writes only (`save_live_stack` via temp file + `os.replace`).
 
 ## 4. Verification

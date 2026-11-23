@@ -12,7 +12,7 @@
 
 Primary production workflows:
 
-1. **On-demand `/predict`** (`bot.py` → `pipeline.Pipeline.execute` → `score_model.estimate_score` → Gemini reasoning via `predictor.Predictor` → SQLite bot tables).
+1. **On-demand `/predict`** (`live/bot.py` → `live/pipeline.Pipeline.execute` → `modeling/score_model.estimate_score` → Gemini reasoning via `live/predictor.Predictor` → SQLite bot tables).
 2. **Fixture listing** `/today` and `/matches DD-MM-YYYY` (list only; optional inline button `p:<match_id>` triggers the same predict path).
 3. **Server jobs** (`python -m jobs`): Cairo-tomorrow pricing + standings refresh on a timer (`JOBS_INTERVAL_SECONDS`, default 3600).
 4. **Laboratory / backtesting** (`python -m laboratory …`): import seasons, walk-forward price finished matches with the **same** `score_model` (no Gemini), evaluate markets, tune SPL stacks, optional lab experiment grid + promotion.
@@ -51,7 +51,7 @@ Given home, away, and competition (or a provider match id), the system:
 
 Live list (`data_fetcher.LIVE_MATCH_COMPETITIONS` / `TODAY_MATCH_COMPETITIONS`): `PL`, `CL`, `PD`, `SA`, `BL1`, `FL1`, `PPL`, `DED`, `SPL`.
 
-SPL history: Live Football API league_id **8454** (`live_football_api.py`; **8485 is wrong**—Serbia U19). Live fixtures/standings may use API Ninjas when `NINJAS_API_KEY` is set.
+SPL history: Live Football API league_id **8454** (`providers/live_football_api.py`; **8485 is wrong**—Serbia U19). Live fixtures/standings may use API Ninjas when `NINJAS_API_KEY` is set.
 
 ---
 
@@ -77,13 +77,13 @@ SPL history: Live Football API league_id **8454** (`live_football_api.py`; **848
        │                                  │                                    │
        ▼                                  ▼                                    ▼
 ┌──────────────┐                   ┌──────────────┐              ┌─────────────────────────┐
-│ bot.py       │                   │ build_pipeline│              │ serve / import-* /      │
+│ live/bot.py  │                   │ build_pipeline│              │ serve / import-* /      │
 │ parse cmds   │◄──────────────────│ (same as bot) │              │ price-finished /        │
 └──────┬───────┘                   └──────┬───────┘              │ tune-spl / lab-run …    │
        │                                  │                      └────────────┬────────────┘
        ▼                                  ▼                                   │
 ┌──────────────┐                   ┌──────────────┐                           │
-│ pipeline.py  │──────────────────►│ storage.py   │◄──────────────────────────┤
+│ live/pipeline│──────────────────►│ db/storage.py│◄──────────────────────────┤
 │ identify →   │   bot tables      │ prediction_* │                           │
 │ fetch →      │                   └──────┬───────┘                           │
 │ eligibility  │                          │ shared file                       │
@@ -92,7 +92,7 @@ SPL history: Live Football API league_id **8454** (`live_football_api.py`; **848
 └──────┬───────┘                          │                                   │
        │                                  │                                   ▼
        │                           ┌──────┴───────┐              ┌─────────────────────────┐
-       │                           │ database.py  │              │ laboratory/store.py     │
+       │                           │ db/database  │              │ laboratory/store.py     │
        │                           │ ensure both  │◄─────────────│ matches, results,       │
        │                           │ schemas      │              │ snapshots, predictions, │
        │                           └──────────────┘              │ evaluations, lab_* …    │
@@ -100,17 +100,17 @@ SPL history: Live Football API league_id **8454** (`live_football_api.py`; **848
        │                                                                      │
        ▼                                                                      ▼
 ┌──────────────┐                                                 ┌─────────────────────────┐
-│ score_model  │◄── league_stacks.live_stack_for(code)           │ job.py run_score_model  │
-│ estimate_*   │    configs/live/* or data/spl_stack.json        │ score_model_adapter     │
+│ modeling/    │◄── modeling.league_stacks.live_stack_for(code)  │ job.py run_score_model  │
+│ score_model  │    configs/live/* or data/spl_stack.json        │ score_model_adapter     │
 └──────────────┘                                                 │ snapshot.build_snapshot │
                                                                  │ evaluate_prediction     │
                                                                  └─────────────────────────┘
 
 Providers (read-only network):
-  Football-Data.org  ← data_fetcher / laboratory/football_data / standings
-  Live Football API  ← live_football_api (SPL seasons, league_id 8454)
-  API Ninjas         ← api_ninjas (SPL live fixtures/standings)
-  Google GenAI       ← predictor.py only (reasoning text)
+  Football-Data.org  ← providers/data_fetcher / laboratory/football_data / standings
+  Live Football API  ← providers/live_football_api (SPL seasons, league_id 8454)
+  API Ninjas         ← providers/api_ninjas (SPL live fixtures/standings)
+  Google GenAI       ← live/predictor.py only (reasoning text)
 ```
 
 ### Module boundaries (import / I/O rules)
@@ -119,7 +119,7 @@ Providers (read-only network):
 | --- | --- |
 | `core/models.py` | Pure dataclasses/errors; **no** Telegram, HTTP, Gemini, SQLite. |
 | `domain/*` | Pure immutable value objects (`ModelConfig`, `ScoringConstants`, `EncodedDataset`) & zero-copy NumPy feature engineering; **no** SQLite. |
-| `modeling/*` | Pure math & vectorized NumPy/SciPy strategies (`score_model.py`, `base.py`, `shrinkage.py`, `dixon_coles.py`, `distributions.py`); **no** Gemini, Telegram, or SQLite. |
+| `modeling/*` | Pure math & vectorized NumPy/SciPy strategies (`modeling/score_model.py`, `base.py`, `shrinkage.py`, `dixon_coles.py`, `distributions.py`); **no** Gemini, Telegram, or SQLite. |
 | `live/eligibility.py` | Validation only; gaps stay empty (never fill zeros). |
 | `live/pipeline.py` | Orchestrates live predict; may write bot `Storage` tables. |
 | `laboratory/*` | Must not start the Telegram bot; lab pricing must not call Gemini (`score_model_adapter` / `poisson_engine`). SQL isolated in `laboratory/repositories.py` & `laboratory/store.py`. |
@@ -331,7 +331,7 @@ Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_seas
 
 Unknown competition codes → `DEFAULT_LIVE_STACK`. **Do not** overwrite PL/SPL when promoting other leagues.
 
-### Exact Score / goal-volume knobs (`score_model.py`)
+### Exact Score / goal-volume knobs (`modeling/score_model.py`)
 
 Defaults leave `score_model_v1` behavior unchanged (`goal_cap=None`, `nb_alpha=0.0`, promoted priors `None` → prior mean 1.0):
 
@@ -373,7 +373,7 @@ Dashboard: `/experiments` form + optional `config_json` textarea (`parse_experim
 | Item | Fact |
 | --- | --- |
 | Python | **3.9+** (README recommends 3.10+; 3.9 EOL) |
-| Dependencies (`requirements.txt`) | `python-telegram-bot>=20.7`, `httpx>=0.27`, `google-genai>=1.0`, `python-dotenv>=1.0`, `pytest>=8.0` |
+| Dependencies (`requirements.txt`) | `python-telegram-bot>=20.7`, `httpx>=0.27`, `google-genai>=1.0`, `python-dotenv>=1.0`, `pytest>=8.0`, `numpy>=1.24,<2.0`, `scipy>=1.10,<1.14` |
 | Typing | `from __future__ import annotations`; dataclasses; `Mapping`/`Sequence`; frozen dataclasses for configs/outcomes |
 | Config | `python-dotenv` with `load_dotenv(override=True)` so `.env` beats stale shell exports |
 | Async | Bot/jobs/pipeline use asyncio; lab CLI is sync SQLite |
@@ -384,7 +384,7 @@ Dashboard: `/experiments` form + optional `config_json` textarea (`parse_experim
 | Tests | Local fixtures only; do not call external APIs |
 | UI | Dashboard is server-rendered HTML strings in `dashboard.py` (no React SPA) |
 
-Score-model constants (authoritative in `score_model.py`): `K=6.0`, `TAIL_TOLERANCE=0.001`, `MAX_GRID_GOALS=25`, `MINIMUM_HALF_TIME_SAMPLES=3`, `MIN_RHO_TRAINING_MATCHES=30`.
+Score-model constants (authoritative in `modeling/score_model.py` & `domain/entities.py`): `K=6.0`, `TAIL_TOLERANCE=0.001`, `MAX_GRID_GOALS=25`, `MINIMUM_HALF_TIME_SAMPLES=3`, `MIN_RHO_TRAINING_MATCHES=30`.
 
 ---
 
