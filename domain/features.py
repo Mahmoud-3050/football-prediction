@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from domain.entities import DEFAULT_CONSTANTS, EncodedDataset, ScoringConstants
+from domain.entities import DEFAULT_CONSTANTS, EncodedDataset, MatchStakes, ScoringConstants
 
 
 def parse_kickoff_days(
@@ -188,3 +188,112 @@ def compute_standings_blend_means(
     _blend_team(home_team_idx, "attack_home", "defence_home")
     _blend_team(away_team_idx, "attack_away", "defence_away")
     return means
+
+
+def compute_match_stakes(
+    priors: EncodedDataset,
+    home_team_idx: int,
+    away_team_idx: int,
+    *,
+    stakes_blend: float = 0.0,
+    stakes_min_games: int = DEFAULT_CONSTANTS.stakes_min_games,
+    stakes_late_threshold: float = DEFAULT_CONSTANTS.stakes_late_threshold,
+    competition: str | None = None,
+    expected_games_override: int | None = None,
+) -> MatchStakes:
+    """Compute pre-kickoff match importance & competition stakes from season-to-date table.
+
+    Strictly uses only matches in ``priors`` (already filtered ``kickoff < target.kickoff``).
+    Returns neutral factors (1.0, 1.0) when ``stakes_blend <= 0`` or early in the season.
+    """
+    if priors.n_matches == 0 or home_team_idx < 0 or away_team_idx < 0:
+        return MatchStakes(0.0, 0.5, 0.5, 1.0, 1.0, "early")
+
+    n_teams = priors.n_teams
+    h = priors.home_idx
+    a = priors.away_idx
+    fth = priors.ft_home
+    fta = priors.ft_away
+
+    games = np.bincount(h, minlength=n_teams) + np.bincount(a, minlength=n_teams)
+    active = games > 0
+    n_active = int(np.sum(active))
+    if n_active < 4:
+        return MatchStakes(0.0, 0.5, 0.5, 1.0, 1.0, "early")
+
+    is_cl = (competition or "").strip().upper() == "CL"
+    effective_min_games = min(stakes_min_games, 4) if is_cl else stakes_min_games
+    avg_games = float(np.mean(games[active]))
+    if expected_games_override is not None:
+        expected_games = max(1, int(expected_games_override))
+    elif is_cl:
+        expected_games = 8 if n_active >= 33 else 6
+    else:
+        expected_games = max(1, 2 * (n_active - 1))
+    progress = min(1.0, avg_games / float(expected_games))
+
+    if avg_games < effective_min_games:
+        return MatchStakes(progress, 0.5, 0.5, 1.0, 1.0, "early")
+
+    h_pts = np.where(fth > fta, 3, np.where(fth == fta, 1, 0))
+    a_pts = np.where(fta > fth, 3, np.where(fta == fth, 1, 0))
+    points = np.bincount(h, weights=h_pts, minlength=n_teams) + np.bincount(
+        a, weights=a_pts, minlength=n_teams
+    )
+
+    sorted_pts = np.sort(points[active])[::-1]
+    top_idx = max(0, min(n_active - 1, max(1, n_active // 4) - 1))
+    rel_idx = max(0, min(n_active - 1, n_active - max(2, n_active // 6) - 1))
+    p_leader = float(sorted_pts[0])
+    p_top = float(sorted_pts[top_idx])
+    p_rel = float(sorted_pts[rel_idx])
+
+    def _urgency(t_idx: int) -> float:
+        if t_idx >= n_teams:
+            return 0.5
+        g = int(games[t_idx])
+        pts = float(points[t_idx])
+        rem = max(0, expected_games - g)
+        max_pts = pts + 3.0 * rem
+
+        in_top_race = (max_pts >= p_top) and ((p_leader - pts) <= 3.0 * rem or pts >= p_top - 6.0)
+        in_rel_battle = (pts <= p_rel + 6.0) and (max_pts >= p_rel)
+        contending = in_top_race or in_rel_battle
+
+        if progress < stakes_late_threshold:
+            return 0.5 + (0.25 if contending else 0.0) * (progress / max(1e-6, stakes_late_threshold))
+        return 1.0 if contending else 0.15
+
+    u_home = _urgency(home_team_idx)
+    u_away = _urgency(away_team_idx)
+
+    diff = u_home - u_away
+    if progress < stakes_late_threshold:
+        label = "early"
+    elif abs(diff) >= 0.4:
+        label = "asymmetric_home" if diff > 0 else "asymmetric_away"
+    elif u_home >= 0.8 and u_away >= 0.8:
+        label = "high_stakes_clash"
+    elif u_home <= 0.25 and u_away <= 0.25:
+        label = "dead_rubber"
+    else:
+        label = "balanced"
+
+    if stakes_blend <= 0.0 or progress < stakes_late_threshold:
+        return MatchStakes(progress, u_home, u_away, 1.0, 1.0, label)
+
+    home_factor = 1.0
+    away_factor = 1.0
+    if abs(diff) >= 0.4:
+        home_factor = max(0.75, min(1.25, 1.0 + stakes_blend * 0.5 * diff))
+        away_factor = max(0.75, min(1.25, 1.0 - stakes_blend * 0.5 * diff))
+    elif label == "high_stakes_clash":
+        tight = max(0.80, 1.0 - 0.15 * stakes_blend)
+        home_factor = tight
+        away_factor = tight
+    elif label == "dead_rubber":
+        open_up = min(1.20, 1.0 + 0.20 * stakes_blend)
+        home_factor = open_up
+        away_factor = open_up
+
+    return MatchStakes(progress, u_home, u_away, home_factor, away_factor, label)

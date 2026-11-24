@@ -31,6 +31,8 @@ class ScoringConstants:
     elo_base: float = 1500.0
     elo_divisor: float = 400.0
     cl_season_decay: float = 0.60
+    stakes_min_games: int = 15
+    stakes_late_threshold: float = 0.70
     seconds_per_day: float = 86400.0
     rho_grid: tuple[float, ...] = tuple(
         round(-0.20 + 0.01 * step, 2) for step in range(0, 36)
@@ -69,6 +71,9 @@ class ModelConfig:
     standings_blend: float = 0.0
     standings_min_games: int = 6
     standings_full_games: float = 19.0
+    stakes_blend: float = 0.0
+    stakes_min_games: int = 15
+    stakes_late_threshold: float = 0.70
     neutral_venue: bool = False
     tail_tolerance: float = 0.001
 
@@ -131,6 +136,9 @@ class ModelConfig:
             standings_blend=float(raw.get("standings_blend", 0.0)),
             standings_min_games=int(raw.get("standings_min_games", 6)),
             standings_full_games=float(raw.get("standings_full_games", 19.0)),
+            stakes_blend=float(raw.get("stakes_blend", 0.0)),
+            stakes_min_games=int(raw.get("stakes_min_games", 15)),
+            stakes_late_threshold=float(raw.get("stakes_late_threshold", 0.70)),
             neutral_venue=bool(raw.get("neutral_venue", False)),
             tail_tolerance=float(raw.get("tail_tolerance", 0.001)),
         )
@@ -178,6 +186,18 @@ class EncodedDataset:
             season_codes=self.season_codes[:end_idx],
             match_ids=self.match_ids[:end_idx],
         )
+
+
+@dataclass(frozen=True)
+class MatchStakes:
+    """Pre-kickoff match importance & competition context derived from season-to-date table."""
+
+    season_progress: float
+    home_urgency: float
+    away_urgency: float
+    home_factor: float
+    away_factor: float
+    context_label: str
 
 
 @dataclass(frozen=True)

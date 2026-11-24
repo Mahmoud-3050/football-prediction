@@ -300,6 +300,8 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
     rest_defence_factor = float(input_data.config.get("rest_defence_factor", 1.05))
     standings_blend = float(input_data.config.get("standings_blend", 0.0))
     standings_min_games = int(input_data.config.get("standings_min_games", 6))
+    stakes_blend = float(input_data.config.get("stakes_blend", 0.0))
+    stakes_min_games = int(input_data.config.get("stakes_min_games", 15))
 
     cache, all_history = _build_snapshot_cache(
         live_db,
@@ -388,6 +390,8 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                 last_kickoff_by_team=_last_kickoff_by_team(all_history, target.kickoff) if short_rest_days is not None else None,
                 standings_blend=standings_blend,
                 standings_min_games=standings_min_games,
+                stakes_blend=stakes_blend,
+                stakes_min_games=stakes_min_games,
             )
 
             if outcome.excluded or outcome.body is None:

@@ -378,6 +378,8 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "rest_defence_factor",
         "standings_blend",
         "standings_min_games",
+        "stakes_blend",
+        "stakes_min_games",
     ):
         if key in flat and flat[key] is not None:
             merged[key] = flat[key]
@@ -447,6 +449,8 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "rest_defence_factor",
         "standings_blend",
         "standings_min_games",
+        "stakes_blend",
+        "stakes_min_games",
     ):
         if opt_key in merged:
             val = _as_optional_float(merged.get(opt_key), label=opt_key)

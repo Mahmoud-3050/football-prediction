@@ -37,6 +37,8 @@ DEFAULT_LIVE_STACK: dict[str, Any] = {
     "rest_defence_factor": 1.05,
     "standings_blend": 0.0,
     "standings_min_games": 6,
+    "stakes_blend": 0.0,
+    "stakes_min_games": 15,
     "persistent_priors": False,
     "elo_blend": 0.0,
     "domestic_prior_weight": 0.0,
@@ -68,6 +70,8 @@ _STACK_KEYS = (
     "rest_defence_factor",
     "standings_blend",
     "standings_min_games",
+    "stakes_blend",
+    "stakes_min_games",
     "persistent_priors",
     "elo_blend",
     "domestic_prior_weight",
@@ -184,6 +188,8 @@ def draw_calibration_kwargs(stack: Mapping[str, Any]) -> dict[str, Any]:
         "rest_defence_factor": float(stack.get("rest_defence_factor") or 1.05),
         "standings_blend": float(stack.get("standings_blend") or 0.0),
         "standings_min_games": int(stack.get("standings_min_games") or 6),
+        "stakes_blend": float(stack.get("stakes_blend") or 0.0),
+        "stakes_min_games": int(stack.get("stakes_min_games") or 15),
     }
 
 
@@ -237,10 +243,17 @@ def _merge_stack(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[st
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number
-        elif key in {"nb_alpha", "elo_blend", "domestic_prior_weight"}:
+        elif key in {"nb_alpha", "elo_blend", "domestic_prior_weight", "standings_blend", "stakes_blend"}:
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number
+        elif key in {"standings_min_games", "stakes_min_games"}:
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                continue
+            if ival >= 0:
+                merged[key] = ival
         elif key == "persistent_priors":
             merged[key] = bool(value)
         elif key in {"promoted_attack_prior", "promoted_defence_prior", "venue_k"}:

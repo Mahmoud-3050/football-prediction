@@ -30,6 +30,8 @@
   "rest_defence_factor": 1.05,
   "selected_experiment_id": "EXP-CL-OPT-02",
   "short_rest_days": null,
+  "stakes_blend": 0.3,
+  "stakes_min_games": 4,
   "standings_blend": 0.0,
   "standings_min_games": 6,
   "venue_k": null

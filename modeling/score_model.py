@@ -84,6 +84,8 @@ class ScoreEstimate:
     target_kickoff: str | None = None
     standings_blend: float = 0.0
     standings_min_games: int = 6
+    stakes_blend: float = 0.0
+    stakes_min_games: int = 15
 
     def probability(self, home_goals: int, away_goals: int) -> float:
         if home_goals >= len(self.matrix) or away_goals >= len(self.matrix[0]):
@@ -297,6 +299,8 @@ def estimate_from_lambdas(
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
     standings_full_games: float = 19.0,
+    stakes_blend: float = 0.0,
+    stakes_min_games: int = 15,
     neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Price a full-time grid, and a half-time grid when that market is eligible."""
@@ -417,6 +421,8 @@ def estimate_from_lambdas(
         target_kickoff=target_kickoff,
         standings_blend=standings_blend,
         standings_min_games=standings_min_games,
+        stakes_blend=stakes_blend,
+        stakes_min_games=stakes_min_games,
     )
 
 
@@ -457,6 +463,8 @@ def estimate_score(
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
     standings_full_games: float = 19.0,
+    stakes_blend: float = 0.0,
+    stakes_min_games: int = 15,
     neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Expected goals from shrunk multiplicative rates, then modal scores and markets."""
@@ -743,6 +751,29 @@ def estimate_score(
         lambda_home = lambda_home * (neutral_avg / league_home)
         lambda_away = lambda_away * (neutral_avg / league_away)
 
+    if stakes_blend and stakes_blend > 0.0 and priors:
+        from domain.features import compute_match_stakes, encode_matches
+
+        comp_meta = competition_finished_payload.get("competition")
+        comp_code = comp_meta.get("code") if isinstance(comp_meta, dict) else None
+        ds_stakes = encode_matches(priors)
+        h_idx = ds_stakes.team_to_idx.get(str(home_team_id), -1)
+        a_idx = ds_stakes.team_to_idx.get(str(away_team_id), -1)
+        stakes = compute_match_stakes(
+            ds_stakes,
+            h_idx,
+            a_idx,
+            stakes_blend=stakes_blend,
+            stakes_min_games=stakes_min_games,
+            competition=comp_code,
+        )
+        lambda_home = lambda_home * stakes.home_factor
+        lambda_away = lambda_away * stakes.away_factor
+        if stakes.context_label != "early":
+            limitations.append(
+                f"Match stakes context ({stakes.context_label}, progress={stakes.season_progress:.0%}) adjusted expected goals."
+            )
+
     # Fixture congestion / rest-days adjustment (optional).
     if short_rest_days is not None and target_kickoff is not None:
         target_dt = _parse_kickoff(target_kickoff)
@@ -836,6 +867,8 @@ def estimate_score(
         promoted_attack_prior=promo_atk,
         promoted_defence_prior=promo_def,
         venue_k=venue_k,
+        stakes_blend=stakes_blend,
+        stakes_min_games=stakes_min_games,
     )
 
 

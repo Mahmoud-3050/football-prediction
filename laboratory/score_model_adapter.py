@@ -60,6 +60,8 @@ def price_from_snapshot(
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
     standings_full_games: float = 19.0,
+    stakes_blend: float = 0.0,
+    stakes_min_games: int = 15,
     neutral_venue: bool = False,
     min_scored_matches: int | None = None,
 ) -> ScoreModelOutcome:
@@ -85,9 +87,10 @@ def price_from_snapshot(
 
     competition_code = str(payload.get("competition") or "PL")
     competition_payload = {
+        "competition": {"code": competition_code},
         "matches": [
             _to_fd_match(prior, competition_code=competition_code) for prior in priors
-        ]
+        ],
     }
     home_payload = {
         "matches": [
@@ -141,6 +144,8 @@ def price_from_snapshot(
         standings_blend=standings_blend,
         standings_min_games=standings_min_games,
         standings_full_games=standings_full_games,
+        stakes_blend=stakes_blend,
+        stakes_min_games=stakes_min_games,
         neutral_venue=neutral_venue,
     )
     return ScoreModelOutcome(

@@ -167,6 +167,8 @@ def run_score_model(
     rest_defence_factor: float = 1.05,
     standings_blend: float = 0.0,
     standings_min_games: int = 6,
+    stakes_blend: float = 0.0,
+    stakes_min_games: int = 15,
     persistent_priors: bool = False,
     elo_blend: float = 0.0,
     domestic_prior_weight: float = 0.0,
@@ -356,6 +358,8 @@ def run_score_model(
             last_kickoff_by_team=_last_kickoff_by_team(history, target.kickoff) if short_rest_days is not None else None,
             standings_blend=standings_blend,
             standings_min_games=standings_min_games,
+            stakes_blend=stakes_blend,
+            stakes_min_games=stakes_min_games,
             min_scored_matches=effective_min_scored,
         )
         if outcome.excluded or outcome.body is None:

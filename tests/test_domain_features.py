@@ -6,6 +6,7 @@ import numpy as np
 
 from domain.entities import ModelConfig
 from domain.features import (
+    compute_match_stakes,
     compute_standings_blend_means,
     compute_time_decay_weights,
     encode_matches,
@@ -64,3 +65,60 @@ def test_vectorized_feature_helpers() -> None:
     )
     assert means["attack_home"] > 1.0
     assert means["attack_away"] < 1.0
+
+
+def test_compute_match_stakes_and_pricing() -> None:
+    from datetime import datetime, timedelta, timezone
+    from laboratory.score_model_adapter import price_from_snapshot
+    from laboratory.snapshot import build_snapshot
+
+    # Build an 8-team double round-robin (14 games per team) up to round 12 (~85% progress)
+    base_dt = datetime(2025, 8, 10, 15, 0, tzinfo=timezone.utc)
+    records = []
+    mid = 1
+    day = 0
+    for rnd in range(2):
+        for i in range(1, 9):
+            for j in range(1, 9):
+                if i == j:
+                    continue
+                if rnd == 1 and i > 4 and j > 4:
+                    continue  # leave last few matches unplayed so progress ~0.85
+                # Stronger teams (1,2) win most; mid-table (5) draws; bottom (7,8) lose
+                if i <= 2 and j >= 5:
+                    fh, fa = 2, 0
+                elif j <= 2 and i >= 5:
+                    fh, fa = 0, 2
+                elif i in (4, 5) and j in (4, 5):
+                    fh, fa = 1, 1
+                else:
+                    fh, fa = 1, 0
+                ko = (base_dt + timedelta(days=day)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                records.append(MatchRecord(f"m{mid}", "2025", ko, str(i), f"T{i}", str(j), f"T{j}", fh, fa, 0, 0))
+                mid += 1
+                day += 1
+
+    ds = encode_matches(records)
+    # Zero blend is always 1.0, 1.0
+    s0 = compute_match_stakes(ds, ds.team_to_idx["1"], ds.team_to_idx["2"], stakes_blend=0.0, stakes_min_games=6)
+    assert s0.home_factor == 1.0 and s0.away_factor == 1.0
+
+    # Active blend in late season produces valid bounded factors
+    s1 = compute_match_stakes(ds, ds.team_to_idx["1"], ds.team_to_idx["2"], stakes_blend=0.25, stakes_min_games=6)
+    assert s1.season_progress >= 0.70
+    assert 0.75 <= s1.home_factor <= 1.25
+    assert 0.75 <= s1.away_factor <= 1.25
+
+    # Early season threshold keeps factors neutral
+    s_early = compute_match_stakes(ds, ds.team_to_idx["1"], ds.team_to_idx["2"], stakes_blend=0.25, stakes_min_games=99)
+    assert s_early.context_label == "early"
+    assert s_early.home_factor == 1.0 and s_early.away_factor == 1.0
+
+    # End-to-end adapter smoke test with stakes_blend > 0
+    tgt = MatchRecord("tgt", "2025", (base_dt + timedelta(days=day + 5)).strftime("%Y-%m-%dT%H:%M:%SZ"), "1", "T1", "2", "T2", None, None, None, None)
+    snap = build_snapshot(tgt, records)
+    out_base = price_from_snapshot(snap, stakes_blend=0.0)
+    out_stakes = price_from_snapshot(snap, stakes_blend=0.25, stakes_min_games=6)
+    assert not out_stakes.excluded and out_stakes.body is not None
+    assert abs(sum(out_stakes.body["full_time"]["result_1x2"][k] for k in ("home", "draw", "away")) - 1.0) < 1e-9
+    assert out_base.body["lambda_home"] != out_stakes.body["lambda_home"]
