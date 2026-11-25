@@ -272,6 +272,459 @@ def _market_edge_section(
     )
 
 
+def _pct_badge_class(pct: float | None, *, high: float = 55.0, mid: float = 45.0) -> str:
+    if pct is None:
+        return "muted"
+    if pct >= high:
+        return "good"
+    if pct >= mid:
+        return "wait"
+    return "bad"
+
+
+def _fmt_stat_pct(stat: dict[str, Any] | None) -> str:
+    if not stat or stat.get("pct") is None:
+        return "—"
+    return f"{float(stat['pct']):.1f}%"
+
+
+def _fmt_stat_ratio(stat: dict[str, Any] | None) -> str:
+    if not stat:
+        return "0 / 0"
+    return f"{int(stat.get('hits') or 0)} / {int(stat.get('total') or 0)}"
+
+
+def _analytics_kpi_card(
+    label: str,
+    stat: dict[str, Any] | None,
+    *,
+    high: float = 55.0,
+    mid: float = 45.0,
+    extra_sub: str = "",
+) -> str:
+    pct = stat.get("pct") if stat else None
+    pct_str = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "—"
+    badge_cls = _pct_badge_class(pct if isinstance(pct, (int, float)) else None, high=high, mid=mid)
+    width = max(0.0, min(100.0, float(pct))) if isinstance(pct, (int, float)) else 0.0
+    ratio = _fmt_stat_ratio(stat)
+    sub = ratio if not extra_sub else f"{ratio} · {extra_sub}"
+    return (
+        '<article class="analytics-kpi">'
+        f'  <div class="analytics-kpi-head"><span>{html.escape(label)}</span>'
+        f'  <span class="badge {badge_cls}">{html.escape(pct_str)}</span></div>'
+        f'  <strong class="mono">{html.escape(pct_str)}</strong>'
+        f'  <div class="kpi-bar"><i style="width:{width:.1f}%"></i></div>'
+        f'  <div class="kpi-sub mono">{html.escape(sub)}</div>'
+        "</article>"
+    )
+
+
+def analytics_view(
+    connection: sqlite3.Connection,
+    query: dict[str, list[str]] | None = None,
+) -> str:
+    """Comprehensive percentage-based live prediction analytics (Prospective vs. Retrospective)."""
+    from laboratory.analytics import RECORD_TYPES, compute_analytics_summary
+
+    q = query or {}
+    rec_type = (q.get("record_type") or ["retrospective"])[0].strip().lower()
+    if rec_type not in RECORD_TYPES:
+        rec_type = "retrospective"
+    league = (q.get("league") or [""])[0].strip().upper()
+    season = (q.get("season") or ["all"])[0].strip()
+    sort_by = (q.get("sort") or ["total"])[0].strip()
+    sort_dir = (q.get("dir") or ["desc"])[0].strip().lower()
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "desc"
+
+    filters = _filters(q, connection)
+    leagues, seasons, _ = _filter_choices(connection, league)
+
+    summary = compute_analytics_summary(
+        connection,
+        record_type=rec_type,
+        competition=league or None,
+        season=season or None,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+    counts = summary["counts"]
+    overall = summary["overall"]
+    per_comp = summary["per_competition"]
+    active_filters = summary["filters"]
+
+    rec_labels = {
+        "retrospective": "Retrospective (Updated Model Backtest)",
+        "prospective": "Prospective Only (Pre-Kickoff Live)",
+        "all": "All (Prospective + Retrospective)",
+    }
+    rec_options = "".join(
+        f'<option value="{html.escape(k)}"{" selected" if k == rec_type else ""}>{html.escape(v)}</option>'
+        for k, v in rec_labels.items()
+    )
+    league_options = '<option value="">All Competitions</option>' + "".join(
+        f'<option value="{html.escape(c)}"{" selected" if c == league else ""}>{html.escape(_league_label(c))} ({html.escape(c)})</option>'
+        for c in leagues
+    )
+    season_choices = [("all", "All Seasons"), ("last_30d", "Last 30 Days")] + [
+        (str(s), str(s)) for s in seasons
+    ]
+    season_options = "".join(
+        f'<option value="{html.escape(val)}"{" selected" if val == active_filters["season"] else ""}>{html.escape(lbl)}</option>'
+        for val, lbl in season_choices
+    )
+
+    filter_form = (
+        '<form class="filters" method="get" action="/analytics">'
+        '  <label>Record Type'
+        f'    <select name="record_type">{rec_options}</select>'
+        "  </label>"
+        '  <label>Competition'
+        f'    <select name="league">{league_options}</select>'
+        "  </label>"
+        '  <label>Season / Time Window'
+        f'    <select name="season">{season_options}</select>'
+        "  </label>"
+        '  <div class="filter-actions">'
+        '    <button type="submit">Apply</button>'
+        '    <a class="clear" href="/analytics">Reset</a>'
+        "  </div>"
+        "</form>"
+    )
+
+    if rec_type == "prospective":
+        mode_badge = '<span class="badge good">Prospective Only (is_prospective = 1)</span>'
+        mode_note = "Genuine pre-kickoff live predictions only — never mixed with backtest rows."
+    elif rec_type == "all":
+        mode_badge = '<span class="badge wait">Combined View (Explicitly Separated)</span>'
+        mode_note = (
+            f"Prospective: {counts['prospective']} · Retrospective: {counts['retrospective']} "
+            f"(Total: {counts['total']})."
+        )
+    else:
+        mode_badge = '<span class="badge muted">Retrospective Backtest (is_prospective = 0)</span>'
+        mode_note = "Chronological walk-forward evaluations of active live model stacks (BOT-*-live)."
+
+    banner = (
+        '<div class="analytics-banner">'
+        f'  <div>{mode_badge}<p class="note" style="margin-top:6px;">{html.escape(mode_note)}</p></div>'
+        f'  <div class="mono" style="font-size:0.85rem;">Sample: <strong>{counts["total"]}</strong> matches '
+        f'(Prosp: {counts["prospective"]} · Retro: {counts["retrospective"]})</div>'
+        "</div>"
+    )
+
+    body: list[str] = [
+        _masthead("Live Performance Analytics", filters, active="analytics"),
+        filter_form,
+        banner,
+    ]
+
+    if counts["total"] == 0:
+        empty_lead = (
+            "0 settled pre-kickoff prospective predictions match these filters yet."
+            if rec_type == "prospective"
+            else "No evaluated predictions match the selected filters."
+        )
+        body.append(
+            _state(
+                kind="info",
+                title="No evaluated predictions in this slice",
+                lead=empty_lead,
+                action_href="/analytics?record_type=retrospective",
+                action_label="View Retrospective Backtest" if rec_type == "prospective" else "Reset filters",
+            )
+        )
+
+    me = overall["market_edge"]
+    clv_str = f"Mean CLV {me['mean_clv_pct']:+.2f}%" if isinstance(me.get("mean_clv_pct"), (int, float)) else "No closing odds"
+    trend = overall["trend"]
+    delta_str = (
+        f"vs Full {trend['delta_20_pct']:+.1f}pp"
+        if isinstance(trend.get("delta_20_pct"), (int, float))
+        else "Trend"
+    )
+
+    kpis = (
+        '<section aria-label="Summary KPIs">'
+        '  <div class="analytics-kpis">'
+        + _analytics_kpi_card("FT 1X2 Hit Rate", overall["ft_1x2"], high=52.0, mid=45.0)
+        + _analytics_kpi_card("Exact Score Top-1", overall["exact_top1"], high=12.0, mid=8.0)
+        + _analytics_kpi_card("Top-3 Exact Scores", overall["exact_top3"], high=30.0, mid=22.0)
+        + _analytics_kpi_card("Double Chance (Top-2)", overall["double_chance"], high=76.0, mid=70.0)
+        + _analytics_kpi_card("Over / Under 2.5", overall["ou_25"], high=55.0, mid=50.0)
+        + _analytics_kpi_card("Over / Under 1.5", overall["ou_15"], high=75.0, mid=68.0)
+        + _analytics_kpi_card("BTTS (Yes / No)", overall["btts"], high=54.0, mid=48.0)
+        + _analytics_kpi_card("Beat Closing Line", me["beat_closing"], high=52.0, mid=48.0, extra_sub=clv_str)
+        + _analytics_kpi_card("Value Pick (+3% Edge)", me["value_pick"], high=50.0, mid=42.0)
+        + _analytics_kpi_card("Last 20 Form (1X2)", trend["last_20"], high=52.0, mid=45.0, extra_sub=delta_str)
+        + "  </div>"
+        "</section>"
+    )
+    body.append(kpis)
+
+    # Per-competition comparison table with sortable columns
+    def _sort_header(col: str, label: str) -> str:
+        is_active = active_filters["sort_by"] == col
+        next_dir = "asc" if (is_active and active_filters["sort_dir"] == "desc") else "desc"
+        arrow = " ▼" if (is_active and active_filters["sort_dir"] == "desc") else (" ▲" if is_active else "")
+        qs = urlencode(
+            {
+                "record_type": rec_type,
+                "league": league,
+                "season": active_filters["season"],
+                "sort": col,
+                "dir": next_dir,
+            }
+        )
+        cls = "sort-link active" if is_active else "sort-link"
+        return f'<th><a class="{cls}" href="/analytics?{html.escape(qs)}">{html.escape(label)}{arrow}</a></th>'
+
+    def _cell_pct(stat: dict[str, Any] | None, *, high: float = 55.0, mid: float = 45.0) -> str:
+        if not stat or stat.get("pct") is None:
+            return '<td class="num muted">—<span class="cell-sub mono">0/0</span></td>'
+        pct = float(stat["pct"])
+        cls = _pct_badge_class(pct, high=high, mid=mid)
+        ratio = f"{int(stat['hits'])}/{int(stat['total'])}"
+        return (
+            f'<td class="num"><span class="badge {cls} mono">{pct:.1f}%</span>'
+            f'<span class="cell-sub mono">{html.escape(ratio)}</span></td>'
+        )
+
+    comp_rows_html: list[str] = []
+    for row in per_comp:
+        code = str(row["competition"])
+        comp_rows_html.append(
+            "<tr>"
+            f'<td><strong>{html.escape(code)}</strong><span class="cell-sub">{html.escape(_league_label(code))}</span></td>'
+            f'<td class="mono" style="font-size:0.78rem;">{html.escape(str(row["model_id"]))}</td>'
+            f'<td class="num mono">{int(row["total"])}</td>'
+            + _cell_pct(row["ft_1x2"], high=52.0, mid=45.0)
+            + _cell_pct(row["exact_top1"], high=12.0, mid=8.0)
+            + _cell_pct(row["exact_top3"], high=30.0, mid=22.0)
+            + _cell_pct(row["double_chance"], high=76.0, mid=70.0)
+            + _cell_pct(row["ou_25"], high=55.0, mid=50.0)
+            + _cell_pct(row["btts"], high=54.0, mid=48.0)
+            + _cell_pct(row["high_conf"], high=62.0, mid=55.0)
+            + _cell_pct(row["beat_closing"], high=52.0, mid=48.0)
+            + _cell_pct(row["last_20"], high=52.0, mid=45.0)
+            + "</tr>"
+        )
+
+    comp_table = (
+        '<section>'
+        '  <h2>Per-Competition Comparison</h2>'
+        '  <div class="table-wrap">'
+        '    <table>'
+        '      <thead><tr>'
+        + _sort_header("competition", "League")
+        + "<th>Model</th>"
+        + _sort_header("total", "Matches")
+        + _sort_header("ft_1x2_pct", "FT 1X2 %")
+        + _sort_header("exact_top1_pct", "Exact Top-1 %")
+        + _sort_header("exact_top3_pct", "Exact Top-3 %")
+        + _sort_header("double_chance_pct", "Double Chance %")
+        + _sort_header("ou_25_pct", "O/U 2.5 %")
+        + _sort_header("btts_pct", "BTTS %")
+        + _sort_header("high_conf_pct", "High-Conf Hit %")
+        + _sort_header("beat_closing_pct", "Beat Closing %")
+        + _sort_header("last_20_pct", "Last 20 %")
+        + "      </tr></thead>"
+        f'      <tbody>{"".join(comp_rows_html) if comp_rows_html else "<tr><td colspan=12 class=note>No competition rows.</td></tr>"}</tbody>'
+        "    </table>"
+        "  </div>"
+        "</section>"
+    )
+    body.append(comp_table)
+
+    # Confidence-Tier Calibration & Outcome Breakdown Panel
+    tier_rows_html: list[str] = []
+    for t in overall["confidence_tiers"]:
+        cnt = int(t["count"])
+        pred_s = f"{t['avg_predicted_pct']:.1f}%" if isinstance(t["avg_predicted_pct"], (int, float)) else "—"
+        act_s = f"{t['actual_hit_pct']:.1f}%" if isinstance(t["actual_hit_pct"], (int, float)) else "—"
+        gap = t["calibration_gap_pct"]
+        if isinstance(gap, (int, float)):
+            gap_s = f"{gap:+.1f}pp"
+            gap_cls = "pos" if gap >= -3.0 else "neg"
+        else:
+            gap_s = "—"
+            gap_cls = ""
+        tier_rows_html.append(
+            "<tr>"
+            f'<td>{html.escape(t["label"])}</td>'
+            f'<td class="num mono">{int(t["hits"])} / {cnt}</td>'
+            f'<td class="num mono">{html.escape(pred_s)}</td>'
+            f'<td class="num mono"><strong>{html.escape(act_s)}</strong></td>'
+            f'<td class="num mono {gap_cls}">{html.escape(gap_s)}</td>'
+            "</tr>"
+        )
+
+    outcome_rows_html: list[str] = []
+    for code in ("H", "D", "A"):
+        ob = overall["outcome_breakdown"][code]
+        outcome_rows_html.append(
+            "<tr>"
+            f'<td><strong>{html.escape(ob["label"])}</strong></td>'
+            f'<td class="num mono">{int(ob["predicted_count"])}</td>'
+            f'<td class="num mono">{int(ob["actual_count"])}</td>'
+            f'<td class="num mono">{int(ob["correct_count"])}</td>'
+            f'<td class="num mono"><strong>{html.escape(_fmt_stat_pct(ob["precision"]))}</strong>'
+            f'<span class="cell-sub mono">{html.escape(_fmt_stat_ratio(ob["precision"]))}</span></td>'
+            f'<td class="num mono">{html.escape(_fmt_stat_pct(ob["recall"]))}'
+            f'<span class="cell-sub mono">{html.escape(_fmt_stat_ratio(ob["recall"]))}</span></td>'
+            "</tr>"
+        )
+
+    dc_bd = overall["double_chance_breakdown"]
+    dc_summary = " · ".join(
+        f"{k}: {_fmt_stat_pct(dc_bd[k])} ({_fmt_stat_ratio(dc_bd[k])})"
+        for k in ("1X", "X2", "12")
+    )
+
+    panels = (
+        '<section class="analytics-grid">'
+        '  <div class="panel">'
+        '    <h2 style="margin-top:0;">Confidence-Tier Calibration</h2>'
+        '    <p class="note">Predicted win probability vs. actual hit rate by max(1, X, 2) tier.</p>'
+        '    <div class="table-wrap" style="margin-top:12px;">'
+        '      <table><thead><tr><th>Tier</th><th class="num">Hits / n</th><th class="num">Pred %</th><th class="num">Actual %</th><th class="num">Gap</th></tr></thead>'
+        f'      <tbody>{"".join(tier_rows_html)}</tbody></table>'
+        '    </div>'
+        '  </div>'
+        '  <div class="panel">'
+        '    <h2 style="margin-top:0;">Outcome Breakdown (1 / X / 2)</h2>'
+        '    <p class="note">Hit rate when predicted (Precision) &amp; capture rate when actual (Recall).</p>'
+        '    <div class="table-wrap" style="margin-top:12px;">'
+        '      <table><thead><tr><th>Outcome</th><th class="num">Pred</th><th class="num">Actual</th><th class="num">Hits</th><th class="num">Hit %</th><th class="num">Recall %</th></tr></thead>'
+        f'      <tbody>{"".join(outcome_rows_html)}</tbody></table>'
+        '    </div>'
+        f'    <p class="note mono" style="font-size:0.78rem;">Double Chance split — {html.escape(dc_summary)}</p>'
+        '    <p class="note mono" style="font-size:0.78rem; margin-top:6px;">'
+        f'      Recent Form — Last 20: {html.escape(_fmt_stat_pct(trend["last_20"]))} ({html.escape(_fmt_stat_ratio(trend["last_20"]))})'
+        f'      · Last 50: {html.escape(_fmt_stat_pct(trend["last_50"]))} ({html.escape(_fmt_stat_ratio(trend["last_50"]))})'
+        f'      · Full: {html.escape(_fmt_stat_pct(trend["full"]))} ({html.escape(_fmt_stat_ratio(trend["full"]))})'
+        "    </p>"
+        "  </div>"
+        "</section>"
+    )
+    body.append(panels)
+
+    # Season-by-Season Historical Breakdown
+    def _season_table_rows(rows_list: list[dict[str, Any]], *, show_league: bool) -> str:
+        if not rows_list:
+            colspan = 16 if show_league else 14
+            return f'<tr><td colspan="{colspan}" class="note">No season records in this slice.</td></tr>'
+        trs: list[str] = []
+        for sr in rows_list:
+            badges = ""
+            if sr.get("is_best_ft_1x2"):
+                badges += ' <span class="badge good" title="Highest FT 1X2 %">Best 1X2</span>'
+            if sr.get("is_best_exact_ll"):
+                badges += ' <span class="badge good" title="Lowest Exact Score Log-Loss">Best LL</span>'
+
+            yoy_ft = sr.get("yoy_ft_1x2_delta_pp")
+            yoy_ll = sr.get("yoy_exact_ll_delta")
+            if isinstance(yoy_ft, (int, float)):
+                ft_d_str = f"{yoy_ft:+.1f}pp"
+                ft_d_cls = "pos" if yoy_ft > 0 else ("neg" if yoy_ft < 0 else "")
+            else:
+                ft_d_str, ft_d_cls = "—", ""
+            if isinstance(yoy_ll, (int, float)):
+                ll_d_str = f"LL {yoy_ll:+.3f}"
+            else:
+                ll_d_str = ""
+
+            ex_ll = f"{sr['exact_score_ll']:.3f}" if isinstance(sr.get("exact_score_ll"), (int, float)) else "—"
+            ft_ll = f"{sr['ft_1x2_ll']:.3f}" if isinstance(sr.get("ft_1x2_ll"), (int, float)) else "—"
+            brier_s = f"{sr['ft_brier']:.3f}" if isinstance(sr.get("ft_brier"), (int, float)) else "—"
+            ece_s = f"{sr['draw_ece']:.3f}" if isinstance(sr.get("draw_ece"), (int, float)) else "—"
+            mean_clv = sr.get("mean_clv_pct")
+            clv_sub = f"CLV {mean_clv:+.2f}%" if isinstance(mean_clv, (int, float)) else "—"
+
+            h_pct = _fmt_stat_pct(sr.get("home_hit"))
+            d_pct = _fmt_stat_pct(sr.get("draw_hit"))
+            a_pct = _fmt_stat_pct(sr.get("away_hit"))
+            split_title = (
+                f"1: {_fmt_stat_ratio(sr.get('home_hit'))} | "
+                f"X: {_fmt_stat_ratio(sr.get('draw_hit'))} | "
+                f"2: {_fmt_stat_ratio(sr.get('away_hit'))}"
+            )
+
+            league_cols = ""
+            if show_league:
+                league_cols = (
+                    f'<td><strong>{html.escape(str(sr["competition"]))}</strong></td>'
+                    f'<td class="mono" style="font-size:0.75rem;">{html.escape(str(sr["model_id"]))}</td>'
+                )
+
+            def _sc(stat: dict[str, Any] | None, *, high: float = 55.0, mid: float = 45.0) -> str:
+                if not stat or stat.get("pct") is None:
+                    return '<td class="num muted" title="0 / 0">—<span class="cell-sub mono">0/0</span></td>'
+                pct = float(stat["pct"])
+                ratio = f"{int(stat['hits'])}/{int(stat['total'])}"
+                cls = _pct_badge_class(pct, high=high, mid=mid)
+                return (
+                    f'<td class="num" title="{html.escape(ratio)}">'
+                    f'<span class="badge {cls} mono">{pct:.1f}%</span>'
+                    f'<span class="cell-sub mono">{html.escape(ratio)}</span></td>'
+                )
+
+            trs.append(
+                "<tr>"
+                f'<td class="mono"><strong>{html.escape(str(sr["season"]))}</strong>{badges}</td>'
+                + league_cols
+                + f'<td class="num mono">{int(sr["n_matches"])}</td>'
+                + _sc(sr["ft_1x2"], high=52.0, mid=45.0)
+                + f'<td class="num mono" style="font-size:0.76rem;" title="{html.escape(split_title)}">{html.escape(h_pct)} / {html.escape(d_pct)} / {html.escape(a_pct)}</td>'
+                + _sc(sr["exact_top1"], high=12.0, mid=8.0)
+                + _sc(sr["exact_top3"], high=30.0, mid=22.0)
+                + _sc(sr["double_chance"], high=76.0, mid=70.0)
+                + _sc(sr["ou_25"], high=55.0, mid=50.0)
+                + _sc(sr["btts"], high=54.0, mid=48.0)
+                + _sc(sr["high_conf"], high=62.0, mid=55.0)
+                + f'<td class="num mono">{html.escape(ex_ll)}<span class="cell-sub mono">FT {html.escape(ft_ll)}</span></td>'
+                + f'<td class="num mono">{html.escape(brier_s)}<span class="cell-sub mono">ECE {html.escape(ece_s)}</span></td>'
+                + f'<td class="num mono">{html.escape(_fmt_stat_pct(sr.get("beat_closing")))}<span class="cell-sub mono">{html.escape(clv_sub)}</span></td>'
+                + f'<td class="num mono {ft_d_cls}">{html.escape(ft_d_str)}<span class="cell-sub mono">{html.escape(ll_d_str)}</span></td>'
+                + "</tr>"
+            )
+        return "".join(trs)
+
+    by_season_all = summary.get("by_season_overall") or []
+    by_season_comp = summary.get("by_season_competition") or []
+
+    season_section_parts = [
+        '<section id="season-breakdown">',
+        '  <h2>Season-by-Season Historical Breakdown</h2>',
+        '  <p class="note">Chronological season comparison with Year-over-Year (YoY Δ) shifts and best-season highlights.</p>',
+    ]
+    if not league:
+        season_section_parts.append(
+            '  <h3>Overall Cross-League by Season</h3>'
+            '  <div class="table-wrap"><table><thead><tr>'
+            '    <th>Season</th><th class="num">n</th><th class="num">FT 1X2 %</th>'
+            '    <th class="num">1 / X / 2 %</th><th class="num">Top-1 %</th><th class="num">Top-3 %</th>'
+            '    <th class="num">DC %</th><th class="num">O/U 2.5 %</th><th class="num">BTTS %</th>'
+            '    <th class="num">High-Conf %</th><th class="num">Exact / FT LL</th>'
+            '    <th class="num">Brier / ECE</th><th class="num">Beat Close / CLV</th><th class="num">YoY Δ</th>'
+            f'  </tr></thead><tbody>{_season_table_rows(by_season_all, show_league=False)}</tbody></table></div>'
+        )
+    season_section_parts.append(
+        '  <h3>Per-Competition by Season</h3>'
+        '  <div class="table-wrap"><table><thead><tr>'
+        '    <th>Season</th><th>League</th><th>Model</th><th class="num">n</th><th class="num">FT 1X2 %</th>'
+        '    <th class="num">1 / X / 2 %</th><th class="num">Top-1 %</th><th class="num">Top-3 %</th>'
+        '    <th class="num">DC %</th><th class="num">O/U 2.5 %</th><th class="num">BTTS %</th>'
+        '    <th class="num">High-Conf %</th><th class="num">Exact / FT LL</th>'
+        '    <th class="num">Brier / ECE</th><th class="num">Beat Close / CLV</th><th class="num">YoY Δ</th>'
+        f'  </tr></thead><tbody>{_season_table_rows(by_season_comp, show_league=True)}</tbody></table></div>'
+        "</section>"
+    )
+    body.append("\n".join(season_section_parts))
+
+    return _page("Live Performance Analytics", "\n".join(body), filters)
+
+
 def overview(
     connection: sqlite3.Connection,
     query: dict[str, list[str]] | None = None,
@@ -3217,6 +3670,7 @@ def _masthead(
         {link(match_href, "Matches", "matches")}
         {link("/standings", "Standings", "standings")}
         {link("/experiments", "Experiments", "experiments")}
+        {link("/analytics", "Analytics", "analytics")}
         {logout}
       </nav>
       <div class="title-row">{back}<h1>{html.escape(title)}</h1></div>
@@ -4353,6 +4807,43 @@ def _page(title: str, body: str, filters: dict[str, str] | None = None, *, extra
       padding: 14px; resize: vertical;
     }}
     .pills-group {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 12px; }}
+    .analytics-banner {{
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 12px; margin: 12px 0 16px; padding: 12px 16px;
+      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-md);
+    }}
+    .analytics-kpis {{
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(12.5rem, 1fr));
+      gap: 12px; margin: 12px 0 20px;
+    }}
+    .analytics-kpi {{
+      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-md);
+      padding: 14px 16px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+      display: grid; gap: 6px;
+    }}
+    .analytics-kpi-head {{
+      display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+      color: var(--muted); font-size: 0.78rem; font-weight: 500;
+    }}
+    .analytics-kpi strong {{ font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; }}
+    .kpi-bar {{
+      height: 6px; width: 100%; background: var(--bg); border-radius: 999px; overflow: hidden;
+    }}
+    .kpi-bar i {{
+      display: block; height: 100%; border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent-2), var(--accent));
+    }}
+    .kpi-sub {{ color: var(--muted); font-size: 0.76rem; }}
+    .analytics-grid {{
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+      gap: 16px; margin: 16px 0 24px;
+    }}
+    .sort-link {{
+      color: var(--muted); display: inline-flex; align-items: center; gap: 4px;
+      white-space: nowrap;
+    }}
+    .sort-link:hover, .sort-link.active {{ color: var(--text); text-decoration: none; }}
+    .cell-sub {{ display: block; color: var(--muted); font-size: 0.72rem; margin-top: 2px; }}
     @media (prefers-reduced-motion: reduce) {{
       *, *::before, *::after {{
         animation: none !important;

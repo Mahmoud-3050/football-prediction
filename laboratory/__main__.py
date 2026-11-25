@@ -31,6 +31,7 @@ from laboratory.auth import (
     require_auth_for_host,
 )
 from laboratory.dashboard import (
+    analytics_view,
     database_busy_page,
     login_page,
     match_detail,
@@ -246,6 +247,35 @@ def build_dashboard_server(
                         lab_db=self.server.lab_db,
                     )
                     status = 200
+                elif parsed.path == "/analytics":
+                    page = analytics_view(connection, query)
+                    status = 200
+                elif parsed.path == "/api/analytics":
+                    from laboratory.analytics import compute_analytics_summary
+
+                    rec_type = (query.get("record_type") or ["retrospective"])[0].strip() or "retrospective"
+                    comp_filter = (query.get("league") or query.get("competition") or [""])[0].strip() or None
+                    season_filter = (query.get("season") or ["all"])[0].strip() or None
+                    sort_by = (query.get("sort") or ["total"])[0].strip() or "total"
+                    sort_dir = (query.get("dir") or ["desc"])[0].strip() or "desc"
+                    payload = json.dumps(
+                        compute_analytics_summary(
+                            connection,
+                            record_type=rec_type,
+                            competition=comp_filter,
+                            season=season_filter,
+                            sort_by=sort_by,
+                            sort_dir=sort_dir,
+                        ),
+                        default=str,
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 elif parsed.path.startswith("/experiments/"):
                     exp_id = unquote(parsed.path.removeprefix("/experiments/"))
                     page = experiment_detail(
@@ -1862,6 +1892,9 @@ def main() -> None:
                     if stack.get("decay_half_life_days") is not None
                     else None
                 ),
+                persistent_priors=bool(stack.get("persistent_priors")),
+                elo_blend=float(stack.get("elo_blend") or 0.0),
+                domestic_prior_weight=float(stack.get("domestic_prior_weight") or 0.0),
                 **draw_kwargs,
             )
             print(counts, flush=True)
