@@ -42,6 +42,23 @@ CREATE TABLE IF NOT EXISTS lab_experiment_runs (
     completed_at TEXT,
     FOREIGN KEY (experiment_id) REFERENCES lab_experiments(experiment_id)
 );
+CREATE TABLE IF NOT EXISTS lab_promotions (
+    promotion_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    competition TEXT NOT NULL,
+    promotion_type TEXT NOT NULL,
+    promoted_model_id TEXT,
+    live_code_version TEXT,
+    exp_code_version TEXT,
+    previous_config_json TEXT,
+    new_config_json TEXT,
+    bundle_path TEXT,
+    evidence_json TEXT,
+    status TEXT NOT NULL,
+    rejection_reason TEXT,
+    promoted_at TEXT NOT NULL,
+    rolled_back_at TEXT
+);
 CREATE TABLE IF NOT EXISTS matches (
     match_id TEXT PRIMARY KEY,
     dataset_version TEXT NOT NULL,
