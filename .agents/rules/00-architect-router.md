@@ -11,7 +11,7 @@ trigger: always_on
 Before editing or answering, identify which subsystem(s) the task touches and consult the corresponding rule in `.agents/rules/`:
 - **Math, Poisson/DC, Draw Controls, League Stacks, Eligibility:** `.agents/rules/01-score-math-stacks.md` (`modeling/*`, `domain/*`, `live/eligibility.py`, `configs/live/*`)
 - **Telegram Bot, Live Pipeline, Providers, Cairo Jobs:** `.agents/rules/02-live-bot-jobs.md` (`main.py`, `live/*`, `providers/*`, `core/*`, `jobs/*`)
-- **Backtesting Lab, Snapshots, Experiments, Promotion:** `.agents/rules/03-laboratory-backtest.md` (`laboratory/*` excluding dashboard UI, `experiments/*`, `scripts/research/*`)
+- **Backtesting Lab, Snapshots, Experiments, Promotion:** `.agents/rules/03-laboratory-backtest.md` (`laboratory/*` excluding dashboard UI, `experiments/*`)
 - **Shared SQLite, Schemas, WAL Concurrency:** `.agents/rules/04-database-storage.md` (`db/*`, `laboratory/store.py`, `laboratory/repositories.py`)
 - **Web Dashboard UI/UX, Routes, Auth & Visuals:** `.agents/rules/05-dashboard-ui-ux.md` (`laboratory/dashboard.py`, `laboratory/auth.py`, `laboratory/team_display.py`, `tests/test_dashboard_*.py`, `tests/test_match_predict_button.py`, `tests/test_product_ops.py`)
 

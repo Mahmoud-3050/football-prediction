@@ -163,7 +163,8 @@ Providers (read-only network):
 | `db/db_paths.py` | Shared DB path | `resolve_database_path`, `resolve_lab_database_path`, `DEFAULT_DATABASE_PATH` | env → `Path` |
 | `db/database.py` | Dual schema bootstrap | `ensure_shared_schemas` | connection → bot+lab DDL |
 | `db/storage.py` | Bot SQLite traces | `Storage`, `BOT_SCHEMA` | run/snapshot/version CRUD |
-| `db/migrate_db.py` | Merge old DBs | `merge_into_shared` | legacy → `football.db` |
+| `db/migrate_db.py` | Merge old DBs & compact DBs | `merge_into_shared`, `compact_database` | legacy → `football.db`; slim + `VACUUM` |
+| `db/team_mapping.py` | Central team identity & strict resolution | `resolve_team_id`, `register_team_mapping`, `backfill_team_mappings`, `UnmappedTeamError` | `canonical_teams` + `team_provider_mappings` |
 | `domain/entities.py` | Domain value objects & constants | `ScoringConstants`, `ModelConfig`, `EncodedDataset`, `FittedModelState` | Zero-copy `slice_view` |
 | `domain/features.py` | Vectorized feature engineering | `encode_matches`, `compute_time_decay_weights`, `soft_cap_goals_vec`, `compute_standings_blend_means` | Records → contiguous NumPy arrays |
 | `modeling/base.py` | Strategy interface | `BaseScoreModel` (`fit`, `predict_lambdas`) | Dataset + config → rates |
@@ -172,7 +173,6 @@ Providers (read-only network):
 | `modeling/distributions.py` | Vectorized score matrices | `build_score_matrix_vec`, `market_1x2_from_matrix` | λ → normalized `(G+1, G+1)` grid |
 | `modeling/score_model.py` | Facade & multiplicative Poisson (+ NB) + DC + draw knobs | `estimate_score`, `estimate_from_lambdas`, `select_1x2_outcome`, `_boost_draw_scorelines`, `ScoreEstimate` | Finished payloads + ids → grid, markets, λ |
 | `modeling/league_stacks.py` | Per-league live knobs | `live_stack_for`, `draw_calibration_kwargs`, `save_live_stack`, `save_spl_stack` | code → stack dict |
-| `modeling/enhanced.py` | Experimental ensembles / bivariate / copula | `estimate_score_ensemble`, `estimate_score_special` | Research; not default live path |
 | `live/pipeline.py` | One-match live analysis | `Pipeline.execute`, `_analyze` | home/away/comp → `PipelineResult`; may abstain |
 | `live/predictor.py` | Gemini reasoning | `Predictor`, prompt builders | Snapshot + estimate → tactical text JSON |
 | `live/eligibility.py` | Gate checks | `evaluate`, `MINIMUM_SCORED_MATCHES=3`, `FORM_WINDOW=5` | Payloads → `Evaluation` |
@@ -180,7 +180,7 @@ Providers (read-only network):
 | `providers/data_fetcher.py` | Football-Data (+ Ninjas routing) | `DataFetcher`, `resolve_competition`, `fixture_is_predictable`, `LIVE_MATCH_COMPETITIONS` | API → fixtures/teams/standings caches |
 | `providers/api_ninjas.py` | SPL live provider | Ninjas client helpers | Key → fixtures/standings |
 | `providers/live_football_api.py` | SPL multi-season archive | `LFA_LEAGUE_IDS["SPL"]=8454`, season fetch | Key → season bodies |
-| `scripts/research/evaluate_models*.py` | Ad-hoc evaluation scripts | season evaluation helpers | Research utilities |
+| `archive/` | Superseded historical scripts | `evaluate_models*.py`, `enhanced.py` | Out of runtime import paths |
 
 ### Laboratory
 
@@ -203,7 +203,7 @@ Providers (read-only network):
 | `laboratory/lab_experiment.py` | Experiment config + JSON launch | `ExperimentConfig`, `parse_experiment_launch_json`, `merge_configs`, `resolve_primary_metric`, `make_model_id` | Explicit `None` in overrides wins; SHA-256 model ids |
 | `laboratory/lab_runner.py` | Parallel grid runs | `run_experiment`, `shared_encoded_dataset`, `_aggregate_metrics` | `SharedMemory`/memmap, `OMP/MKL/OPENBLAS=1`, `persist_predictions` toggle |
 | `laboratory/lab_analysis.py` | Compare / calibration | `compare_to_baseline`, bootstrap CIs | |
-| `laboratory/lab_promotion.py` | Promote/rollback live stacks | `promote_best_config`, `PromotionGuardrails` | Atomic write + rollback files |
+| `laboratory/lab_promotion.py` | Holdout + Bootstrap CI gates & rollback | `promote_experiment_run`, `promote_best_config`, `compute_paired_bootstrap_ci`, `get_promotion_audit_log`, `rollback_promotion` | Enforces Clean Holdout, 95% CI, SPL isolation, `lab_promotions` |
 | `laboratory/team_display.py` | Display names | helpers for UI | |
 
 ### Tests & docs
@@ -254,7 +254,7 @@ Verified tables (live DB):
 - **`predictions`**: `prediction_id PK`, UNIQUE `(experiment_id, snapshot_id, engine, model_id)`, `body_json`, `created_at`
 - **`evaluations`**: UNIQUE `(prediction_id, revision)`, `metrics_json`
 - **`engine_runs`**: per-match engine status/detail
-- **`raw_payloads`**, **`teams`**, **`competitions`**, **`standings_meta`**, **`standings_rows`**, **`job_runs`**
+- **`raw_payloads`**, **`teams`**, **`canonical_teams`**, **`team_provider_mappings`**, **`competitions`**, **`standings_meta`**, **`standings_rows`**, **`job_runs`**, **`lab_promotions`**
 
 ### Score / prediction body shapes
 
