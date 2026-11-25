@@ -275,6 +275,21 @@ def build_dashboard_server(
                     self.end_headers()
                     self.wfile.write(payload)
                     return
+                elif parsed.path == "/api/market-edge":
+                    from db.market_odds import evaluate_market_edge
+
+                    comp_filter = (query.get("league") or query.get("competition") or [""])[0].strip() or None
+                    payload = json.dumps(
+                        evaluate_market_edge(connection, competition=comp_filter),
+                        default=str,
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 else:
                     page = not_found_page(resource="Page")
                     status = 404
@@ -1552,6 +1567,7 @@ def main() -> None:
             "map-team",
             "settle-prospective",
             "import-xg",
+            "import-odds",
         ),
     )
     parser.add_argument(
@@ -2116,6 +2132,28 @@ def main() -> None:
                 connection,
                 records,
                 source=args.source,
+                competition=args.competitions[0],
+                season=int(args.seasons[0]),
+            )
+            checkpoint_wal(connection, mode="TRUNCATE")
+            print(json.dumps(summary, indent=2))
+        finally:
+            connection.close()
+        return
+
+    if args.command == "import-odds":
+        from db.market_odds import import_closing_odds_csv
+
+        if not args.file or not args.competitions or not args.seasons:
+            raise SystemExit("import-odds requires --file, --competition, and --season")
+        src = args.source or "football_data_co_uk"
+        db_path = Path(args.db).resolve() if args.db else path
+        connection = connect(db_path)
+        try:
+            summary = import_closing_odds_csv(
+                connection,
+                args.file,
+                source=src,
                 competition=args.competitions[0],
                 season=int(args.seasons[0]),
             )

@@ -138,6 +138,23 @@ CREATE TABLE IF NOT EXISTS match_xg (
     imported_at_utc TEXT NOT NULL,
     UNIQUE(competition, season, home_team_id, away_team_id, source)
 );
+CREATE TABLE IF NOT EXISTS match_odds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    competition TEXT NOT NULL,
+    season INTEGER NOT NULL,
+    kickoff_utc TEXT NOT NULL,
+    home_team_id TEXT NOT NULL REFERENCES canonical_teams(team_id),
+    away_team_id TEXT NOT NULL REFERENCES canonical_teams(team_id),
+    source TEXT NOT NULL,
+    open_home_odds REAL,
+    open_draw_odds REAL,
+    open_away_odds REAL,
+    close_home_odds REAL NOT NULL,
+    close_draw_odds REAL NOT NULL,
+    close_away_odds REAL NOT NULL,
+    imported_at_utc TEXT NOT NULL,
+    UNIQUE(competition, season, home_team_id, away_team_id, source)
+);
 CREATE TABLE IF NOT EXISTS matches (
     match_id TEXT PRIMARY KEY,
     dataset_version TEXT NOT NULL,

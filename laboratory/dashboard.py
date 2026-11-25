@@ -210,6 +210,68 @@ def _prospective_scorecard_section(
     return "\n".join(parts)
 
 
+def _market_edge_section(
+    connection: sqlite3.Connection,
+    *,
+    competition: str | None = None,
+) -> str:
+    """Render the Market Benchmark & Closing Line Value (CLV) verdict card."""
+    from db.market_odds import evaluate_market_edge
+
+    try:
+        report = evaluate_market_edge(connection, competition=competition)
+    except sqlite3.OperationalError:
+        return ""
+
+    verdict = str(report["verdict"])
+    verdict_ar = str(report["verdict_ar"])
+    combined = report["combined"]
+    prosp = report["prospective"]
+    backtest = report["backtest"]
+    n_matched = int(combined["n_matched"])
+
+    if verdict == "EDGE_DETECTED":
+        badge_cls, badge_label = "good", "Edge Detected"
+    elif verdict == "NO_EDGE":
+        badge_cls, badge_label = "bad", "No Edge Detected"
+    else:
+        badge_cls, badge_label = "muted", "Insufficient Sample Size"
+
+    m_ll = combined["model_log_loss"]
+    c_ll = combined["closing_market_log_loss"]
+    m_ll_str = f"{m_ll:.4f}" if isinstance(m_ll, (int, float)) else "—"
+    c_ll_str = f"{c_ll:.4f}" if isinstance(c_ll, (int, float)) else "—"
+
+    clv_bt = backtest["mean_clv"]
+    clv_pr = prosp["mean_clv"]
+    clv_bt_str = f"{clv_bt:+.2%}" if isinstance(clv_bt, (int, float)) else "—"
+    clv_pr_str = f"{clv_pr:+.2%}" if isinstance(clv_pr, (int, float)) else "—"
+
+    roi = combined["roi_pct"]
+    roi_str = f"{roi:+.2f}% ({combined['bets_count']} bets)" if isinstance(roi, (int, float)) else "—"
+
+    return "\n".join(
+        [
+            '<section class="panel" id="market-edge-panel">',
+            '  <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">',
+            '    <h2 style="margin:0;">Market Benchmark &amp; Closing Line Value (CLV)</h2>',
+            f'    <span class="badge {badge_cls}">{html.escape(badge_label)} (n={n_matched})</span>',
+            '  </div>',
+            f'  <p class="note" style="margin-top:6px;">{html.escape(verdict_ar)}</p>',
+            '  <div class="cards" style="margin-top:12px;">',
+            f'    <article><span>Model Log-Loss</span><strong>{html.escape(m_ll_str)}</strong></article>',
+            f'    <article><span>Vig-Free Closing LL</span><strong>{html.escape(c_ll_str)}</strong></article>',
+            f'    <article><span>Mean CLV (Backtest)</span><strong>{html.escape(clv_bt_str)}</strong></article>',
+            f'    <article><span>Mean CLV (Live Prosp.)</span><strong>{html.escape(clv_pr_str)}</strong></article>',
+            f'    <article><span>Simulated Flat-Stake ROI</span><strong>{html.escape(roi_str)}</strong></article>',
+            '  </div>',
+            f'  <p class="note" style="margin-top:10px;">{html.escape(str(report["assumptions"]))}</p>',
+            f'  <p class="note" style="margin-top:6px; font-weight:600;">{html.escape(str(report["disclaimer"]))}</p>',
+            '</section>',
+        ]
+    )
+
+
 def overview(
     connection: sqlite3.Connection,
     query: dict[str, list[str]] | None = None,
@@ -283,6 +345,7 @@ def overview(
                 )
             )
     body.append(_prospective_scorecard_section(connection, competition=filters.get("league") or None))
+    body.append(_market_edge_section(connection, competition=filters.get("league") or None))
     try:
         latest_sync = get_latest_sync_job(connection)
     except sqlite3.OperationalError:
