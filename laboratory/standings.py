@@ -138,11 +138,25 @@ def parse_standings(body: dict[str, Any], *, competition: str) -> dict[str, Any]
     }
 
 
-def replace_standings(connection: sqlite3.Connection, parsed: dict[str, Any]) -> int:
+def replace_standings(
+    connection: sqlite3.Connection,
+    parsed: dict[str, Any],
+    *,
+    strict_team_mapping: bool = False,
+) -> int:
+    from db.team_mapping import (
+        has_provider_mappings,
+        register_team_mapping,
+        resolve_team_id,
+    )
     from laboratory.store import upsert_competition, upsert_team
 
     competition = str(parsed["competition"])
     season = str(parsed["season"])
+    mapping_provider = "api_ninjas" if competition.upper() == "SPL" else "football_data"
+    enforce_strict = strict_team_mapping or has_provider_mappings(
+        connection, provider=mapping_provider
+    )
     connection.execute(
         "DELETE FROM standings_rows WHERE competition = ? AND season = ?",
         (competition, season),
@@ -174,10 +188,30 @@ def replace_standings(connection: sqlite3.Connection, parsed: dict[str, Any]) ->
         emblem_url=parsed.get("emblem_url") if isinstance(parsed.get("emblem_url"), str) else None,
     )
     for row in parsed["rows"]:
+        raw_tid = str(row["team_id"])
+        raw_tname = str(row["team_name"])
+        if enforce_strict:
+            resolved_tid = resolve_team_id(
+                connection,
+                provider=mapping_provider,
+                raw_name=raw_tname,
+                provider_team_id=raw_tid,
+                competition=competition,
+            )
+        else:
+            resolved_tid = register_team_mapping(
+                connection,
+                canonical_name=raw_tname,
+                provider=mapping_provider,
+                provider_name=raw_tname,
+                provider_team_id=raw_tid,
+                competition=competition,
+                team_id=raw_tid,
+            )
         upsert_team(
             connection,
-            team_id=str(row["team_id"]),
-            name=str(row["team_name"]),
+            team_id=resolved_tid,
+            name=raw_tname,
             crest_url=row.get("crest_url") if isinstance(row.get("crest_url"), str) else None,
             short_name=row.get("short_name") if isinstance(row.get("short_name"), str) else None,
         )

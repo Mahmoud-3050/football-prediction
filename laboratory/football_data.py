@@ -299,6 +299,7 @@ def import_bodies(
     *,
     competition: str = "PL",
     experiment_config: dict[str, Any] | None = None,
+    strict_team_mapping: bool = False,
 ) -> dict[str, int]:
     """Store fetched season payloads. `bodies` is `(requested_season, response)`."""
 
@@ -319,10 +320,22 @@ def import_bodies(
 
     if is_live_football_competition(code):
         result_source = LIVE_FOOTBALL_SOURCE
+        mapping_provider = "live_football"
     elif is_ninjas_competition(code):
         result_source = NINJAS_SOURCE
+        mapping_provider = "api_ninjas"
     else:
         result_source = SOURCE
+        mapping_provider = "football_data"
+    from db.team_mapping import (
+        has_provider_mappings,
+        register_team_mapping,
+        resolve_team_id,
+    )
+
+    enforce_strict = strict_team_mapping or has_provider_mappings(
+        connection, provider=mapping_provider
+    )
     ensure_experiment(connection, experiment_config or EXPERIMENT_CONFIG)
     upsert_competition(connection, code=code, name=COMPETITION_NAMES.get(code, code))
     removed = remove_datasets_with_prefix(connection, "demo-")
@@ -373,6 +386,42 @@ def import_bodies(
                 name=str(competition_name),
                 emblem_url=emblem_url if isinstance(emblem_url, str) else None,
             )
+            if enforce_strict:
+                resolved_home_id = resolve_team_id(
+                    connection,
+                    provider=mapping_provider,
+                    raw_name=str(record["home_name"]),
+                    provider_team_id=str(record["home_id"]),
+                    competition=str(record["competition"]),
+                )
+                resolved_away_id = resolve_team_id(
+                    connection,
+                    provider=mapping_provider,
+                    raw_name=str(record["away_name"]),
+                    provider_team_id=str(record["away_id"]),
+                    competition=str(record["competition"]),
+                )
+                record["home_id"] = resolved_home_id
+                record["away_id"] = resolved_away_id
+            else:
+                register_team_mapping(
+                    connection,
+                    canonical_name=str(record["home_name"]),
+                    provider=mapping_provider,
+                    provider_name=str(record["home_name"]),
+                    provider_team_id=str(record["home_id"]),
+                    competition=str(record["competition"]),
+                    team_id=str(record["home_id"]),
+                )
+                register_team_mapping(
+                    connection,
+                    canonical_name=str(record["away_name"]),
+                    provider=mapping_provider,
+                    provider_name=str(record["away_name"]),
+                    provider_team_id=str(record["away_id"]),
+                    competition=str(record["competition"]),
+                    team_id=str(record["away_id"]),
+                )
             upsert_team(
                 connection,
                 team_id=str(record["home_id"]),

@@ -37,6 +37,7 @@ from core.models import (
     PipelineResult,
     ProviderError,
     Team,
+    TeamResolution,
 )
 from live.predictor import Predictor
 from modeling.score_model import estimate_score
@@ -191,10 +192,10 @@ class Pipeline:
     ) -> PipelineResult:
         teams_payload = await self.fetcher.get_teams(competition.code)
         teams = teams_from_payload(teams_payload)
-        home_team = resolve_team(raw_home, teams, competition.name)
+        home_team = self._resolve_club(raw_home, teams, competition)
         if home_team.team is None:
             return self._finish(run_id, status="abstained", stage="teams", reason=home_team.reason)
-        away_team = resolve_team(raw_away, teams, competition.name)
+        away_team = self._resolve_club(raw_away, teams, competition)
         if away_team.team is None:
             return self._finish(run_id, status="abstained", stage="teams", reason=away_team.reason)
         home = home_team.team
@@ -551,6 +552,62 @@ class Pipeline:
             probabilities=produced.probabilities,
             top_scores=produced.top_scores,
         )
+
+    def _resolve_club(
+        self,
+        raw_query: str,
+        teams: list[Team],
+        competition: Any,
+    ) -> TeamResolution:
+        """Resolve club strictly via central team_mapping when populated, else provider list."""
+        conn = getattr(self.store, "_conn", None)
+        comp_code = str(getattr(competition, "code", "") or "").upper()
+        comp_provider = "api_ninjas" if comp_code == "SPL" else "football_data"
+        if conn is not None:
+            from db.team_mapping import (
+                UnmappedTeamError,
+                has_provider_mappings,
+                normalize_team_name,
+                resolve_team_id,
+            )
+
+            use_strict = has_provider_mappings(conn, provider="manual") or has_provider_mappings(
+                conn, provider=comp_provider
+            )
+            if use_strict:
+                resolved_id: str | None = None
+                last_err: UnmappedTeamError | None = None
+                for prov in ("manual", comp_provider, "live_football"):
+                    try:
+                        resolved_id = resolve_team_id(
+                            conn,
+                            provider=prov,
+                            raw_name=raw_query,
+                            competition=comp_code or None,
+                        )
+                        break
+                    except UnmappedTeamError as exc:
+                        last_err = exc
+                if resolved_id is None:
+                    assert last_err is not None
+                    return TeamResolution(None, str(last_err))
+                for team in teams:
+                    if str(team.id) == resolved_id:
+                        return TeamResolution(team, None)
+                row = conn.execute(
+                    "SELECT canonical_name FROM canonical_teams WHERE team_id = ?",
+                    (resolved_id,),
+                ).fetchone()
+                if row is not None:
+                    canon_norm = normalize_team_name(str(row[0]))
+                    for team in teams:
+                        if normalize_team_name(team.name) == canon_norm:
+                            return TeamResolution(team, None)
+                return TeamResolution(
+                    None,
+                    f'Mapped team_id={resolved_id!r} for "{raw_query}" is not in {competition.name} teams list.',
+                )
+        return resolve_team(raw_query, teams, competition.name)
 
     def _finish(self, run_id: int, **fields: Any) -> PipelineResult:
         self.store.update_run(

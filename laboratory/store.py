@@ -129,6 +129,23 @@ CREATE TABLE IF NOT EXISTS teams (
     crest_url TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS canonical_teams (
+    team_id TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL,
+    competition TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS team_provider_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id TEXT NOT NULL REFERENCES canonical_teams(team_id),
+    provider TEXT NOT NULL,
+    provider_team_id TEXT,
+    provider_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    UNIQUE(provider, normalized_name)
+);
+CREATE INDEX IF NOT EXISTS idx_team_provider_id
+ON team_provider_mappings(provider, provider_team_id);
 CREATE TABLE IF NOT EXISTS competitions (
     code TEXT PRIMARY KEY,
     name TEXT NOT NULL,

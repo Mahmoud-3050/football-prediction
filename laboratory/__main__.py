@@ -1458,6 +1458,7 @@ def main() -> None:
             "lab-promote",
             "lab-rollback",
             "sync-data",
+            "map-team",
         ),
     )
     parser.add_argument(
@@ -1548,6 +1549,13 @@ def main() -> None:
         default=IMPORT_PAUSE_SECONDS,
         help="Pause seconds between league fetches (default 7.0).",
     )
+    parser.add_argument("--provider", type=str, default=None, help="Provider for map-team.")
+    parser.add_argument("--provider-name", type=str, default=None, help="Raw provider team name for map-team.")
+    parser.add_argument("--canonical-name", type=str, default=None, help="Canonical team name for map-team.")
+    parser.add_argument("--provider-id", type=str, default=None, help="Provider team ID for map-team.")
+    parser.add_argument("--team-id", type=str, default=None, help="Existing canonical team_id for map-team.")
+    parser.add_argument("--audit", action="store_true", help="Audit team mappings coverage.")
+    parser.add_argument("--backfill", action="store_true", help="Backfill canonical_teams and team_provider_mappings.")
     args = parser.parse_args()
     path = database_path()
     if args.command == "sync-data":
@@ -1923,6 +1931,60 @@ def main() -> None:
             promotion_id=promo_id,
         )
         print(f"Rollback: {result.message}")
+        return
+
+    if args.command == "map-team":
+        from db.team_mapping import (
+            audit_team_mappings,
+            backfill_team_mappings,
+            register_team_mapping,
+        )
+
+        db_path = Path(args.db).resolve() if args.db else path
+        connection = connect(db_path)
+        try:
+            if args.backfill:
+                bf = backfill_team_mappings(connection)
+                checkpoint_wal(connection, mode="TRUNCATE")
+                print(json.dumps({"backfill": bf}, indent=2))
+                if not args.audit and not args.provider:
+                    return
+            if args.audit:
+                report = audit_team_mappings(connection)
+                print(json.dumps(report, indent=2))
+                if not report["ok"]:
+                    raise SystemExit(1)
+                return
+            if not args.provider or not args.provider_name or not args.canonical_name:
+                raise SystemExit(
+                    "map-team requires --provider, --provider-name, and --canonical-name "
+                    "(or --audit / --backfill)."
+                )
+            comp = args.competitions[0].upper() if args.competitions else None
+            tid = register_team_mapping(
+                connection,
+                canonical_name=args.canonical_name,
+                provider=args.provider,
+                provider_name=args.provider_name,
+                provider_team_id=args.provider_id,
+                competition=comp,
+                team_id=args.team_id,
+            )
+            connection.commit()
+            checkpoint_wal(connection, mode="TRUNCATE")
+            print(
+                json.dumps(
+                    {
+                        "team_id": tid,
+                        "provider": args.provider,
+                        "provider_name": args.provider_name,
+                        "canonical_name": args.canonical_name,
+                    },
+                    indent=2,
+                )
+            )
+        finally:
+            connection.close()
         return
 
     serve(path, args.host, args.port)
