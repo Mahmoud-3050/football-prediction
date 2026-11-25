@@ -9,7 +9,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 ALLOWED_PROVIDERS = frozenset(
-    {"football_data", "live_football", "api_ninjas", "manual", "understat", "fbref", "football_data_co_uk"}
+    {
+        "football_data",
+        "live_football",
+        "api_ninjas",
+        "manual",
+        "understat",
+        "fbref",
+        "football_data_co_uk",
+        "fpl_opta_github",
+    }
 )
 
 # Explicit SPL mappings between API Ninjas (standings/live) and Live Football API (historical matches)

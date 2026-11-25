@@ -255,6 +255,29 @@ def fetch_competition_for_sync(
     return body, "window"
 
 
+def _refresh_pl_xg_best_effort(connection: sqlite3.Connection, *, season: int) -> None:
+    """Best-effort non-blocking refresh of current-season PL xG from fpl_opta_github."""
+    try:
+        from db.xg_store import import_xg_records
+        from scripts.fetch_pl_xg import _fetch_fpl_opta_github
+
+        records, status = _fetch_fpl_opta_github(int(season))
+        if not records:
+            logger.warning("PL xG sync skipped for season=%s: %s", season, status)
+            return
+        res = import_xg_records(
+            connection,
+            records,
+            source="fpl_opta_github",
+            competition="PL",
+            season=int(season),
+        )
+        checkpoint_wal(connection, mode="TRUNCATE")
+        logger.info("PL xG sync season=%s imported=%s", season, res.get("imported", 0))
+    except Exception as exc:
+        logger.warning("PL xG sync failed (non-blocking): %s", exc)
+
+
 def run_sync(
     connection: sqlite3.Connection,
     *,
@@ -408,6 +431,10 @@ def run_sync(
                 league_entry["matches_status"] = "failed"
                 league_entry["matches_error"] = str(exc)
                 league_entry["price_status"] = "skipped"
+
+        # 1a-bis. Best-effort non-blocking current-season PL xG refresh
+        if "PL" in match_comps and not os.environ.get("PYTEST_CURRENT_TEST"):
+            _refresh_pl_xg_best_effort(connection, season=max(seasons))
 
         # 1b. Price new finished matches / evaluate existing predictions (no Gemini)
         from laboratory.job import price_or_evaluate_finished_in_window

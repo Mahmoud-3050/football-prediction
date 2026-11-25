@@ -1,4 +1,6 @@
 {
+  "calib_draw_bias": 0.0,
+  "calib_temperature": 1.0,
   "code_version": "score_model_v1",
   "decay_half_life_days": 150.0,
   "dependence": "independent",
@@ -17,33 +19,33 @@
   "goal_cap_slope": 0.5,
   "half_time_share_mode": "club_shrunk",
   "k": 12.0,
-  "lab_stack_version": "promo_EXP-PL-ELO-HOLD-02_20261125_122925_655981",
-  "model_id": "bot-score-model-pl-v4",
+  "lab_stack_version": "promo_EXP-PL-XG-HOLDOUT_20261125_133708_643648",
+  "model_id": "bot-score-model-pl-v5",
   "nb_alpha": 0.0,
   "persistent_priors": false,
   "prior_mean": "last_season",
-  "promoted_at": "2026-11-25T12:29:25.820628+00:00",
+  "promoted_at": "2026-11-25T13:37:08.810918+00:00",
   "promoted_attack_prior": 0.8,
   "promoted_defence_prior": 1.25,
   "promotion_meta": {
-    "baseline_metric": 3.1574494394080914,
-    "candidate_metric": 3.1483425485740955,
-    "ci_lower": -0.014995867097837822,
-    "ci_upper": -0.0034091825287630973,
+    "baseline_metric": 3.156681300242065,
+    "candidate_metric": 3.1491434960937412,
+    "ci_lower": -0.01222810433822653,
+    "ci_upper": -0.0026351813591468888,
     "competition": "PL",
-    "experiment_id": "EXP-PL-ELO-HOLD-02",
+    "experiment_id": "EXP-PL-XG-HOLDOUT",
     "holdout_seasons": [
       2022,
       2023
     ],
-    "mean_diff": -0.009106890834000654,
+    "mean_diff": -0.007537804148326269,
     "metric_name": "exact_score_log_loss",
     "n_holdout_matches": 349,
-    "new_model_id": "bot-score-model-pl-v4",
-    "previous_model_id": "bot-score-model-pl-v3",
-    "promoted_at": "2026-11-25T12:29:25.820554+00:00",
-    "reason": "Clean Holdout 2022-2023 (n=349) Paired Bootstrap 95% CI gate passed for PL Elo (elo_weight=0.08, elo_k=24.0, elo_home_adv=55.0)",
-    "run_id": "EXP-PL-ELO-HOLD-02:EXP-PL-ELO-HOLD-02-35df28bd6c"
+    "new_model_id": "bot-score-model-pl-v5",
+    "previous_model_id": "bot-score-model-pl-v4",
+    "promoted_at": "2026-11-25T13:37:08.810839+00:00",
+    "reason": "PL xg_weight=0.0->0.25 (Opta fpl_opta_github): Holdout 2022-2023 (n=349) Exact Score LL delta=-0.00754, 95% CI=[-0.01223, -0.00264] PASS; Full 2022-2025 (n=1049) Exact Score LL delta=-0.00820 [-0.01106, -0.00523], FT 1X2 LL delta=-0.00295 [-0.00489, -0.00095]",
+    "run_id": "EXP-PL-XG-HOLDOUT:EXP-PL-XG-HOLDOUT-96bac7ad3e"
   },
   "ratio_mode": "one_pass",
   "rest_attack_factor": 0.94,
@@ -54,5 +56,6 @@
   "stakes_min_games": 15,
   "standings_blend": 0.25,
   "standings_min_games": 6,
-  "venue_k": null
+  "venue_k": null,
+  "xg_weight": 0.25
 }

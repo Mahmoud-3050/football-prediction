@@ -319,7 +319,7 @@ Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_seas
 
 | Code | File | Experiment | k | draw_boost | goal_cap | promoted atk/def | model_id |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| PL | `configs/live/pl_stack.json` | `EXP-PL-ELO-HOLD-02` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-pl-v4` (`elo_weight=0.08`, `elo_k=24.0`, `elo_home_adv=55.0`; Holdout 2022–2023 `n=349`, `mean_diff=-0.0091`, 95% CI `[-0.0150, -0.0034]`) |
+| PL | `configs/live/pl_stack.json` | `EXP-PL-XG-HOLDOUT` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-pl-v5` (`elo_weight=0.08`, `elo_k=24.0`, `elo_home_adv=55.0`, `xg_weight=0.25` via `fpl_opta_github` auto-sync; Holdout 2022–2023 `n=349`, `Exact LL Δ=-0.00754`, 95% CI `[-0.01223, -0.00264]`) |
 | PD | `configs/live/pd_stack.json` | `EXP-EURO-DOMESTIC-01-PD` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-pd-v2` |
 | SA | `configs/live/sa_stack.json` | `EXP-EURO-DOMESTIC-01-SA` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-sa-v2` |
 | BL1 | `configs/live/bl1_stack.json` | `EXP-EURO-DOMESTIC-01-BL1` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-bl1-v2` |
@@ -341,6 +341,11 @@ Defaults leave `score_model_v1` behavior unchanged (`goal_cap=None`, `nb_alpha=0
 | `xg_weight` | `0.0` | Secondary xG blend weight in `[0.0, 1.0]` (`eff = (1 - w)*capped_goals + w*capped_xg`; missing xG falls back to 100% actual goals, never `0.0`). Imported into `match_xg` via `python -m laboratory import-xg --file <csv|json> --source <understat|fbref> --competition <COMP> --season <YEAR>` using strict `resolve_team_id` canonical mapping. |
 | `nb_alpha` | `0.0` | `>0` → Negative Binomial marginals (mean λ, Var=λ+αλ²) via stdlib recurrence; same tail/renorm/DC/draw pipeline |
 | `promoted_attack_prior`, `promoted_defence_prior` | `None` | When `prior_mean=last_season` and club missing from previous-season ratios, use these instead of 1.0 |
+
+### Stage 3 — Calibration & Market Benchmark (Items 8 & 9 Completed)
+
+- **Item 8 (`laboratory/calibration.py` + `EXP-PL-CALIB-01`, PL 2023–2025, `n=1049`):** Manual `draw_boost=1.06` (`calibration_mode="none"`) outperformed out-of-sample `platt_fit_prior_season` (`Exact Score LL=3.0074` vs `3.0109`, `FT 1X2 LL=1.0056` vs `1.0090`, `Brier=0.6011` vs `0.6034`, `FT Draw ECE=0.0071` vs `0.0152`). Live `PL` keeps `draw_boost=1.06`.
+- **Item 9 (`db/market_odds.py` + `match_odds`, PL 2022–2025 `football_data_co_uk` closing odds):** Imported `1520` matches (`380` × 4 seasons) via `scripts/fetch_pl_odds.py` & `import-odds`. Matched `n=1049` backtest fixtures: `Model LL=1.0056` vs `Vig-Free Closing Market LL=0.9664` (`Δ=+0.0391`), `Model Brier=0.6011` vs `Market Brier=0.5745`, `Mean CLV=-2.43%` (`41.94%` positive CLV), `Simulated Flat-Stake ROI=-12.20%` (`839` bets, `205` hits, `-102.35` units) → Honest Verdict: **`NO_EDGE`**. Scientific diagnostic only; never a betting tip.
 
 ### Experiment grid merge (`merge_configs` / `_merge_configs`)
 

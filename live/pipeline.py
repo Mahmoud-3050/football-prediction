@@ -450,6 +450,10 @@ class Pipeline:
                     default_atk=float(stack.get("promoted_attack_prior") or 0.85),
                     default_def=float(stack.get("promoted_defence_prior") or 1.15),
                 )
+            if float(stack.get("xg_weight") or 0.0) > 0.0:
+                competition_finished = self._attach_live_xg(competition_finished, competition.code)
+                home_form = self._attach_live_xg(home_form, competition.code)
+                away_form = self._attach_live_xg(away_form, competition.code)
             estimate = estimate_score(
                 competition_finished_payload=competition_finished,
                 home_finished_payload=home_form,
@@ -612,6 +616,38 @@ class Pipeline:
             )
         except Exception:
             logger.warning("failed to record prospective prediction", exc_info=True)
+
+    def _attach_live_xg(self, payload: dict[str, Any], competition_code: str) -> dict[str, Any]:
+        """Attach match_xg values from SQLite onto finished match payloads when available."""
+        matches = payload.get("matches") or []
+        if not matches:
+            return payload
+        try:
+            from db.xg_store import attach_xg_to_matches
+
+            queries: list[dict[str, Any]] = []
+            for raw in matches:
+                ht = raw.get("homeTeam") or {}
+                at = raw.get("awayTeam") or {}
+                queries.append(
+                    {
+                        "competition": competition_code,
+                        "home_id": str(ht.get("id") or ""),
+                        "away_id": str(at.get("id") or ""),
+                        "kickoff": raw.get("utcDate") or "",
+                    }
+                )
+            attached = attach_xg_to_matches(self.store._conn, queries)
+            enriched = []
+            for raw, att in zip(matches, attached):
+                if att.get("home_xg") is not None and att.get("away_xg") is not None:
+                    enriched.append({**raw, "home_xg": att["home_xg"], "away_xg": att["away_xg"]})
+                else:
+                    enriched.append(raw)
+            return {**payload, "matches": enriched}
+        except Exception:
+            logger.warning("failed to attach live match_xg (falling back to actual goals)", exc_info=True)
+            return payload
 
     def _resolve_club(
         self,

@@ -282,3 +282,73 @@ def test_run_experiment_xg_weight_grid_offline(tmp_path: Path) -> None:
     )
     assert res.completed_runs == 2
     assert res.failed_runs == 0
+
+
+def test_live_pipeline_attach_xg_and_missing_match_fallback(tmp_path: Path) -> None:
+    from db.storage import Storage
+    from live.pipeline import Pipeline
+
+    db_path = tmp_path / "live.db"
+    store = Storage(db_path)
+    try:
+        conn = store._conn
+        register_team_mapping(
+            conn,
+            canonical_name="Arsenal",
+            provider="fpl_opta_github",
+            provider_name="Arsenal",
+            competition="PL",
+            team_id="57",
+        )
+        register_team_mapping(
+            conn,
+            canonical_name="Chelsea",
+            provider="fpl_opta_github",
+            provider_name="Chelsea",
+            competition="PL",
+            team_id="61",
+        )
+        import_xg_records(
+            conn,
+            [
+                {
+                    "home_team": "Arsenal",
+                    "away_team": "Chelsea",
+                    "kickoff_utc": "2026-10-01T15:00:00Z",
+                    "home_xg": 2.1,
+                    "away_xg": 0.6,
+                }
+            ],
+            source="fpl_opta_github",
+            competition="PL",
+            season=2026,
+        )
+
+        pipe = Pipeline(fetcher=None, predictor=None, store=store)  # type: ignore[arg-type]
+        raw_payload = {
+            "matches": [
+                {
+                    "id": 1,
+                    "utcDate": "2026-10-01T15:00:00Z",
+                    "status": "FINISHED",
+                    "homeTeam": {"id": 57, "name": "Arsenal"},
+                    "awayTeam": {"id": 61, "name": "Chelsea"},
+                    "score": {"fullTime": {"home": 1, "away": 0}},
+                },
+                {
+                    "id": 2,
+                    "utcDate": "2026-10-15T15:00:00Z",
+                    "status": "FINISHED",
+                    "homeTeam": {"id": 61, "name": "Chelsea"},
+                    "awayTeam": {"id": 57, "name": "Arsenal"},
+                    "score": {"fullTime": {"home": 2, "away": 2}},
+                },
+            ]
+        }
+        enriched = pipe._attach_live_xg(raw_payload, "PL")
+        assert enriched["matches"][0]["home_xg"] == pytest.approx(2.1)
+        assert enriched["matches"][0]["away_xg"] == pytest.approx(0.6)
+        assert "home_xg" not in enriched["matches"][1]
+        assert "away_xg" not in enriched["matches"][1]
+    finally:
+        store.close()

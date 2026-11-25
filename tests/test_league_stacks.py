@@ -24,7 +24,8 @@ _PROMOTED_LIVE = {
         "elo_weight": 0.08,
         "elo_k": 24.0,
         "elo_home_adv": 55.0,
-        "model_id": "bot-score-model-pl-v4",
+        "xg_weight": 0.25,
+        "model_id": "bot-score-model-pl-v5",
     },
     "PD": {
         "k": 12.0,
