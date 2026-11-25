@@ -4323,6 +4323,133 @@ def _experiment_rerun_form(
     )
 
 
+def _experiment_promote_form(
+    experiment_id: str,
+    competition: str,
+    csrf_token: str | None = None,
+    *,
+    disabled: bool = False,
+) -> str:
+    """Confirm + POST form to promote an experiment after Holdout & Bootstrap validation."""
+
+    import re
+    from urllib.parse import quote
+
+    csrf = f'<input type="hidden" name="csrf" value="{html.escape(csrf_token)}">' if csrf_token else ""
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", experiment_id)
+    dialog_id = f"promote-dialog-{safe_id}"
+    form_id = f"form-promote-{safe_id}"
+    promote_url = f"/experiments/{quote(experiment_id, safe='')}/promote"
+    disabled_attr = " disabled" if disabled else ""
+    if competition.upper() == "SPL":
+        title = "SPL live stack is protected from automatic promotion"
+    elif disabled:
+        title = "Experiment must be completed before promotion"
+    else:
+        title = "Promote to live stack (requires Clean Holdout & Paired Bootstrap 95% CI)"
+
+    return (
+        f'<button type="button" class="btn-rerun"{disabled_attr} title="{html.escape(title)}" '
+        f'onclick="const d=document.getElementById(\'{dialog_id}\'); if(d&&d.showModal){{d.showModal();}}">'
+        f'Promote to Live</button>'
+        f'<dialog id="{dialog_id}" class="confirm-dialog">'
+        f'  <div class="confirm-dialog-content">'
+        f'    <div class="confirm-dialog-header">'
+        f'      <h3>Promote Experiment to Live ({html.escape(competition)})</h3>'
+        f'    </div>'
+        f'    <p class="confirm-dialog-text">Validate <code class="mono">{html.escape(experiment_id)}</code> against Clean Holdout &amp; Paired Bootstrap 95% CI before updating <code>configs/live/{html.escape(competition)}_stack.json</code>.</p>'
+        f'    <form id="{form_id}" method="post" action="{promote_url}" style="display:flex; flex-direction:column; gap:10px; margin-top:8px;">'
+        f'      {csrf}'
+        f'      <input type="hidden" name="competition" value="{html.escape(competition)}">'
+        f'      <label style="font-size:0.85rem;">Baseline Experiment ID (optional)'
+        f'        <input type="text" name="baseline_experiment_id" placeholder="e.g. baseline-exp-id" style="width:100%; margin-top:4px;">'
+        f'      </label>'
+        f'      <label style="font-size:0.85rem;">Baseline Model ID (optional)'
+        f'        <input type="text" name="baseline_model_id" placeholder="e.g. live_baseline" style="width:100%; margin-top:4px;">'
+        f'      </label>'
+        f'      <label style="font-size:0.85rem;">Promotion Reason (required)'
+        f'        <input type="text" name="reason" required placeholder="e.g. Holdout improvement verified" style="width:100%; margin-top:4px;">'
+        f'      </label>'
+        f'      <div class="confirm-dialog-actions">'
+        f'        <button type="button" class="btn-secondary" onclick="this.closest(\'dialog\').close()">Cancel</button>'
+        f'        <button type="submit" class="btn-rerun">Confirm Promote</button>'
+        f'      </div>'
+        f'    </form>'
+        f'  </div>'
+        f'</dialog>'
+    )
+
+
+def _promotion_audit_history_section(audit_rows: list[dict[str, Any]]) -> str:
+    """Render the Promotion Audit History table inside a .table-wrap container."""
+
+    if not audit_rows:
+        return (
+            '<section class="panel">'
+            '  <h2>Promotion Audit History</h2>'
+            '  <p class="muted" style="margin:6px 0 0;">No live promotions recorded yet.</p>'
+            '</section>'
+        )
+
+    from urllib.parse import quote
+
+    trs = []
+    for row in audit_rows:
+        exp_id = str(row.get("experiment_id") or "")
+        comp = str(row.get("competition") or "")
+        promoted_at = str(row.get("promoted_at") or "")
+        n_matches = row.get("n_holdout_matches") if row.get("n_holdout_matches") is not None else row.get("n_matches")
+        mean_diff = row.get("mean_diff")
+        ci_lower = row.get("ci_lower")
+        ci_upper = row.get("ci_upper")
+        reason = str(row.get("reason") or "")
+        status = str(row.get("status") or "active")
+
+        n_str = str(n_matches) if isinstance(n_matches, int) else "—"
+        mean_str = f"{mean_diff:+.4f}" if isinstance(mean_diff, (int, float)) else "—"
+        if isinstance(ci_lower, (int, float)) and isinstance(ci_upper, (int, float)):
+            ci_str = f"[{ci_lower:+.4f}, {ci_upper:+.4f}]"
+        else:
+            ci_str = "—"
+
+        badge_cls = "good" if status == "active" else "muted"
+        trs.append(
+            "<tr>"
+            f'<td class="mono">{html.escape(promoted_at[:19].replace("T", " "))}</td>'
+            f'<td><span class="scope-badge league">{html.escape(comp)}</span></td>'
+            f'<td><a href="/experiments/{quote(exp_id, safe="")}"><code>{html.escape(exp_id)}</code></a></td>'
+            f'<td class="mono">{html.escape(n_str)}</td>'
+            f'<td class="mono">{html.escape(mean_str)}</td>'
+            f'<td class="mono">{html.escape(ci_str)}</td>'
+            f'<td>{html.escape(reason or "—")}</td>'
+            f'<td><span class="badge {badge_cls}">{html.escape(status.title())}</span></td>'
+            "</tr>"
+        )
+
+    return (
+        '<section class="panel">'
+        '  <h2>Promotion Audit History</h2>'
+        '  <div class="table-wrap">'
+        '    <table>'
+        '      <thead>'
+        '        <tr>'
+        '          <th>Promoted At</th>'
+        '          <th>League</th>'
+        '          <th>Experiment</th>'
+        '          <th>Holdout n</th>'
+        '          <th>Mean Δ LL</th>'
+        '          <th>Bootstrap 95% CI</th>'
+        '          <th>Reason</th>'
+        '          <th>Status</th>'
+        '        </tr>'
+        '      </thead>'
+        f'      <tbody>{"".join(trs)}</tbody>'
+        '    </table>'
+        '  </div>'
+        '</section>'
+    )
+
+
 def _run_experiment_form(
     filters: dict[str, str],
     competitions: list[str] | None = None,
@@ -4701,6 +4828,14 @@ def experiments_list(
 
         body.append(f'<section class="experiment-grid">{"".join(cards)}</section>')
 
+    from laboratory.lab_promotion import get_promotion_audit_log
+
+    try:
+        audit_rows = get_promotion_audit_log(target_lab_db, limit=25)
+    except Exception:
+        audit_rows = []
+    body.append(_promotion_audit_history_section(audit_rows))
+
     has_running = any(row["status"] == "running" for row, _ in filtered_rows)
     extra_head = '<meta http-equiv="refresh" content="5">' if has_running else None
     return _page("Lab Experiments", "\n".join(body), filters, extra_head=extra_head)
@@ -4867,6 +5002,34 @@ def experiment_detail(
             )
         )
 
+    promo_status = (query.get("promo_status") or [""])[0].strip() if query else (filters.get("promo_status") or "").strip()
+    promo_detail = (query.get("promo_detail") or [""])[0].strip() if query else (filters.get("promo_detail") or "").strip()
+    if promo_status:
+        if promo_status == "active":
+            body.append(
+                _state(
+                    kind="info",
+                    title="Promotion Succeeded",
+                    lead=promo_detail or "Live stack promoted.",
+                )
+            )
+        elif promo_status == "rejected":
+            body.append(
+                _state(
+                    kind="error",
+                    title="Promotion Rejected by Statistical Guardrail",
+                    lead=promo_detail or "Failed Clean Holdout / Paired Bootstrap 95% CI validation.",
+                )
+            )
+        else:
+            body.append(
+                _state(
+                    kind="error",
+                    title=f"Promotion {promo_status.title()}",
+                    lead=promo_detail or f"Status: {promo_status}",
+                )
+            )
+
     # Header Panel
     status_badge = {
         "completed": "good",
@@ -4885,6 +5048,12 @@ def experiment_detail(
         experiment_id,
         csrf_token,
         disabled=status == "running",
+    )
+    promote_form = _experiment_promote_form(
+        experiment_id,
+        exp["competition"],
+        csrf_token,
+        disabled=(status != "completed" or str(exp["competition"]).upper() == "SPL"),
     )
 
     total_runs = len(runs)
@@ -4911,7 +5080,7 @@ def experiment_detail(
         f'        <div class="scope-badges">{"".join(scope_badges)}</div>'
         f'      </div>'
         f'    </div>'
-        f'    <div class="exp-actions">{rerun_form}{delete_form}</div>'
+        f'    <div class="exp-actions">{promote_form}{rerun_form}{delete_form}</div>'
         f'  </div>'
         f'  <div class="cards" style="margin-top:16px;">'
         f'    <article><span>Total Runs</span><strong>{completed_runs}/{total_runs}</strong></article>'

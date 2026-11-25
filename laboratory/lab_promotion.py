@@ -101,6 +101,7 @@ class PromotionGuardrails:
     """Guardrails that must pass for promotion."""
 
     min_holdout_matches: int = 30
+    max_holdout_candidates: int = 3
     max_ece_degradation: float = 0.01
     max_brier_degradation: float = 0.005
     n_bootstrap_resamples: int = 2000
@@ -157,7 +158,7 @@ def _normalize_promoted_stack(config: Mapping[str, Any] | dict[str, Any]) -> dic
             value = raw[key]
             if isinstance(value, str) and value.strip():
                 normalized[key] = value.strip()
-    for key in ("lab_stack_version", "promoted_at", "source_experiment", "source_model_id", "_meta"):
+    for key in ("lab_stack_version", "promoted_at", "source_experiment", "source_model_id", "_meta", "promotion_meta"):
         if key in raw:
             normalized[key] = raw[key]
     return normalized
@@ -169,18 +170,23 @@ def _write_live_config_atomic(
     *,
     promotion_id: str,
     previous_config: dict[str, Any] | None,
-) -> None:
+    promotion_meta: dict[str, Any] | None = None,
+) -> str | None:
     path = _get_live_config_path(competition)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     config = _normalize_promoted_stack(config)
     config["lab_stack_version"] = promotion_id
     config["promoted_at"] = datetime.now(timezone.utc).isoformat()
+    if promotion_meta is not None:
+        config["promotion_meta"] = dict(promotion_meta)
 
+    backup_path_str: str | None = None
     if previous_config:
         rollback_path = path.parent / f".{path.name}.rollback_{promotion_id}"
         with open(rollback_path, "w") as f:
             json.dump(previous_config, f, indent=2, sort_keys=True)
+        backup_path_str = str(rollback_path)
 
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -193,6 +199,7 @@ def _write_live_config_atomic(
         tmp_path = Path(tmp.name)
 
     os.replace(tmp_path, path)
+    return backup_path_str
 
 
 def _export_pr_bundle(
@@ -250,6 +257,8 @@ def _record_promotion_audit(
     competition: str,
     promotion_type: str,
     promoted_model_id: str | None,
+    previous_model_id: str | None = None,
+    run_id: str | None = None,
     live_code_version: str,
     exp_code_version: str,
     previous_config: dict[str, Any] | None,
@@ -258,7 +267,10 @@ def _record_promotion_audit(
     evidence: dict[str, Any],
     status: str,
     rejection_reason: str | None = None,
+    reason: str | None = None,
+    backup_path: str | None = None,
 ) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
     conn = connect(lab_db_path)
     try:
         conn.execute(
@@ -284,10 +296,82 @@ def _record_promotion_audit(
                 json.dumps(evidence),
                 status,
                 rejection_reason,
+                now_iso,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO promotion_audit_log (
+                promotion_id, promoted_at, competition, experiment_id, run_id,
+                previous_model_id, new_model_id, holdout_seasons, n_holdout_matches,
+                metric_name, baseline_metric, candidate_metric,
+                mean_diff, ci_lower, ci_upper, status, reason, backup_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                promotion_id,
+                now_iso,
+                competition,
+                experiment_id,
+                run_id or f"{experiment_id}:{promoted_model_id or ''}",
+                previous_model_id,
+                promoted_model_id or "",
+                json.dumps(evidence.get("holdout_seasons") or []),
+                int(evidence.get("n_holdout_matches") or 0),
+                str(evidence.get("metric_name") or "log_loss"),
+                evidence.get("baseline_metric"),
+                evidence.get("candidate_metric"),
+                float(evidence.get("bootstrap_mean_diff") or 0.0),
+                float(evidence.get("bootstrap_ci_lower") or 0.0),
+                float(evidence.get("bootstrap_ci_upper") or 0.0),
+                status,
+                reason or rejection_reason or "",
+                backup_path,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_holdout_evaluation(
+    lab_db_path: Path,
+    *,
+    competition: str,
+    holdout_seasons: Sequence[int],
+    experiment_id: str,
+    model_id: str,
+) -> int:
+    """Record a Holdout evaluation and return count of distinct candidates tested on this window."""
+    seasons_json = json.dumps(sorted(int(s) for s in holdout_seasons))
+    conn = connect(lab_db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO holdout_evaluations (
+                competition, holdout_seasons_json, experiment_id, model_id, evaluated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(competition, holdout_seasons_json, experiment_id, model_id) DO NOTHING
+            """,
+            (
+                competition.upper(),
+                seasons_json,
+                experiment_id,
+                model_id,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
         conn.commit()
+        count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM holdout_evaluations
+                WHERE competition = ? AND holdout_seasons_json = ?
+                """,
+                (competition.upper(), seasons_json),
+            ).fetchone()[0]
+        )
+        return count
     finally:
         conn.close()
 
@@ -355,6 +439,8 @@ def promote_experiment_run(
     baseline_model_id: str | None = None,
     brier_degradation: float = 0.0,
     ece_degradation: float = 0.0,
+    reason: str = "",
+    run_id: str | None = None,
     dry_run: bool = False,
 ) -> PromotionResult:
     """Enforce Clean Holdout + Paired Bootstrap 95% CI + SPL isolation before promoting."""
@@ -390,8 +476,10 @@ def promote_experiment_run(
     live_code_version = _read_live_code_version(comp_upper) or "unknown"
     exp_code_version = str(exp_cfg.get("code_version") or "score_model_v1")
     live_config = _read_live_config(comp_upper)
+    previous_model_id = str((live_config or {}).get("model_id") or "") or None
+    metric_name = str(exp_cfg.get("primary_metric") or "log_loss")
 
-    def _reject(reason: str, evidence: dict[str, Any] | None = None) -> None:
+    def _reject(rej_reason: str, evidence: dict[str, Any] | None = None) -> None:
         if not dry_run:
             _record_promotion_audit(
                 lab_db_path,
@@ -400,22 +488,40 @@ def promote_experiment_run(
                 competition=comp_upper,
                 promotion_type="blocked",
                 promoted_model_id=best_model_id,
+                previous_model_id=previous_model_id,
+                run_id=run_id,
                 live_code_version=live_code_version,
                 exp_code_version=exp_code_version,
                 previous_config=live_config,
                 new_config=best_config,
                 bundle_path=None,
-                evidence=evidence or {},
+                evidence=evidence or {"holdout_seasons": list(holdout_seasons), "metric_name": metric_name},
                 status="rejected",
-                rejection_reason=reason,
+                rejection_reason=rej_reason,
+                reason=reason or rej_reason,
             )
-        raise PromotionRejectedError(reason)
+        raise PromotionRejectedError(rej_reason)
 
     # 2. Mandatory Clean Holdout Evaluation (disjoint from tuning_seasons)
     if not holdout_seasons or (set(tuning_seasons) & set(holdout_seasons)):
         _reject(
             "Tuning-only results cannot be promoted without a clean Holdout evaluation."
         )
+
+    # 2b. Anti-Holdout-Pollution Guardrail
+    if not dry_run:
+        distinct_holdout_candidates = record_holdout_evaluation(
+            lab_db_path,
+            competition=comp_upper,
+            holdout_seasons=holdout_seasons,
+            experiment_id=experiment_id,
+            model_id=best_model_id,
+        )
+        if distinct_holdout_candidates > guardrails.max_holdout_candidates:
+            _reject(
+                f"Anti-Holdout-Pollution guardrail: {distinct_holdout_candidates} distinct candidates "
+                f"exceeded max_holdout_candidates={guardrails.max_holdout_candidates} on holdout_seasons={list(holdout_seasons)}."
+            )
 
     cand_losses: list[float]
     base_losses: list[float]
@@ -456,9 +562,13 @@ def promote_experiment_run(
     evidence = {
         "experiment_id": experiment_id,
         "winning_model_id": best_model_id,
+        "previous_model_id": previous_model_id,
+        "metric_name": metric_name,
         "tuning_seasons": list(tuning_seasons),
         "holdout_seasons": list(holdout_seasons),
         "n_holdout_matches": boot.n_matches,
+        "baseline_metric": sum(base_losses) / len(base_losses),
+        "candidate_metric": sum(cand_losses) / len(cand_losses),
         "bootstrap_mean_diff": boot.mean_diff,
         "bootstrap_ci_lower": boot.ci_lower,
         "bootstrap_ci_upper": boot.ci_upper,
@@ -533,8 +643,29 @@ def promote_experiment_run(
             evidence=evidence,
         )
 
-    _write_live_config_atomic(
-        comp_upper, best_config, promotion_id=promotion_id, previous_config=live_config
+    promotion_meta = {
+        "promoted_at": datetime.now(timezone.utc).isoformat(),
+        "competition": comp_upper,
+        "experiment_id": experiment_id,
+        "run_id": run_id or f"{experiment_id}:{best_model_id}",
+        "previous_model_id": previous_model_id,
+        "new_model_id": best_model_id,
+        "holdout_seasons": list(holdout_seasons),
+        "n_holdout_matches": boot.n_matches,
+        "metric_name": metric_name,
+        "baseline_metric": evidence["baseline_metric"],
+        "candidate_metric": evidence["candidate_metric"],
+        "mean_diff": boot.mean_diff,
+        "ci_lower": boot.ci_lower,
+        "ci_upper": boot.ci_upper,
+        "reason": reason,
+    }
+    backup_path = _write_live_config_atomic(
+        comp_upper,
+        best_config,
+        promotion_id=promotion_id,
+        previous_config=live_config,
+        promotion_meta=promotion_meta,
     )
     _record_promotion_audit(
         lab_db_path,
@@ -543,6 +674,8 @@ def promote_experiment_run(
         competition=comp_upper,
         promotion_type="config_only",
         promoted_model_id=best_model_id,
+        previous_model_id=previous_model_id,
+        run_id=run_id,
         live_code_version=live_code_version,
         exp_code_version=exp_code_version,
         previous_config=live_config,
@@ -550,6 +683,8 @@ def promote_experiment_run(
         bundle_path=None,
         evidence=evidence,
         status="active",
+        reason=reason,
+        backup_path=backup_path,
     )
     return PromotionResult(
         success=True,
@@ -597,12 +732,12 @@ def get_promotion_audit_log(
     """Read promotion audit history (active, pending_pr, rejected, rolled_back)."""
     conn = connect(lab_db_path)
     try:
-        sql = "SELECT * FROM lab_promotions"
+        sql = "SELECT * FROM promotion_audit_log"
         params: list[Any] = []
         if competition:
             sql += " WHERE competition = ?"
             params.append(competition.upper())
-        sql += " ORDER BY promoted_at DESC LIMIT ?"
+        sql += " ORDER BY id DESC LIMIT ?"
         params.append(int(limit))
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]

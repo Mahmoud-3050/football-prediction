@@ -59,6 +59,36 @@ CREATE TABLE IF NOT EXISTS lab_promotions (
     promoted_at TEXT NOT NULL,
     rolled_back_at TEXT
 );
+CREATE TABLE IF NOT EXISTS holdout_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    competition TEXT NOT NULL,
+    holdout_seasons_json TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    UNIQUE(competition, holdout_seasons_json, experiment_id, model_id)
+);
+CREATE TABLE IF NOT EXISTS promotion_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    promotion_id TEXT,
+    promoted_at TEXT NOT NULL,
+    competition TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    run_id TEXT,
+    previous_model_id TEXT,
+    new_model_id TEXT NOT NULL,
+    holdout_seasons TEXT NOT NULL,
+    n_holdout_matches INTEGER NOT NULL,
+    metric_name TEXT NOT NULL,
+    baseline_metric REAL,
+    candidate_metric REAL,
+    mean_diff REAL NOT NULL,
+    ci_lower REAL NOT NULL,
+    ci_upper REAL NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    backup_path TEXT
+);
 CREATE TABLE IF NOT EXISTS matches (
     match_id TEXT PRIMARY KEY,
     dataset_version TEXT NOT NULL,

@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 from db.db_paths import DEFAULT_DATABASE_PATH, resolve_database_path, resolve_lab_database_path
 from laboratory import BOT_BACKTEST_SEASONS, ExperimentConfig, run_experiment, promote_best_config, rollback_promotion
+from laboratory.lab_promotion import PromotionRejectedError, promote_experiment_run
 from laboratory.auth import (
     cookie_value,
     load_dashboard_auth,
@@ -294,6 +295,9 @@ def build_dashboard_server(
                 return
             if parsed.path.startswith("/experiments/") and parsed.path.endswith("/rerun"):
                 self._post_rerun_experiment(parsed.path)
+                return
+            if parsed.path.startswith("/experiments/") and parsed.path.endswith("/promote"):
+                self._post_promote_experiment(parsed.path)
                 return
             if parsed.path in ("/sync", "/ops/sync"):
                 self._post_sync()
@@ -710,6 +714,78 @@ def build_dashboard_server(
             self._redirect(
                 f"/experiments?run_status=deleted&run_detail="
                 f"{quote(f'Experiment {exp_id} deleted ({deleted} records removed).')}"
+            )
+
+        def _post_promote_experiment(self, request_path: str) -> None:
+            detail_next = request_path.removesuffix("/promote")
+            if credentials.enabled and not self._authenticated():
+                self._redirect(f"/login?next={quote(detail_next or '/experiments', safe='/?&=')}")
+                return
+            exp_id = unquote(request_path.removeprefix("/experiments/").removesuffix("/promote"))
+            form = parse_form(read_request_body(self))
+            if credentials.enabled and not secrets.compare_digest(
+                form.get("csrf") or "", credentials.csrf_token()
+            ):
+                self._redirect(
+                    f"/experiments/{quote(exp_id, safe='')}?promo_status=error&promo_detail="
+                    "Session+expired.+Try+again."
+                )
+                return
+
+            lab_conn = connect(self.server.lab_db)
+            try:
+                exp = get_lab_experiment(lab_conn, exp_id)
+            finally:
+                lab_conn.close()
+
+            if not exp:
+                self._redirect(
+                    "/experiments?run_status=failed&run_detail="
+                    + quote(f"Experiment {exp_id} not found.")
+                )
+                return
+
+            competition = (form.get("competition") or exp["competition"]).strip()
+            baseline_experiment_id = (form.get("baseline_experiment_id") or "").strip() or None
+            baseline_model_id = (form.get("baseline_model_id") or "").strip() or None
+            reason = (form.get("reason") or "").strip()
+
+            if not reason:
+                self._redirect(
+                    f"/experiments/{quote(exp_id, safe='')}?promo_status=rejected&promo_detail="
+                    + quote("Promotion reason is required.")
+                )
+                return
+
+            try:
+                result = promote_experiment_run(
+                    self.server.lab_db,
+                    exp_id,
+                    competition=competition,
+                    baseline_experiment_id=baseline_experiment_id,
+                    baseline_model_id=baseline_model_id,
+                    reason=reason,
+                )
+            except PromotionRejectedError as exc:
+                self._redirect(
+                    f"/experiments/{quote(exp_id, safe='')}?promo_status=rejected&promo_detail="
+                    + quote(str(exc))
+                )
+                return
+            except Exception as exc:
+                self._redirect(
+                    f"/experiments/{quote(exp_id, safe='')}?promo_status=error&promo_detail="
+                    + quote(str(exc))
+                )
+                return
+
+            self._redirect(
+                f"/experiments/{quote(exp_id, safe='')}?promo_status=active&promo_detail="
+                + quote(
+                    f"Promoted {competition} stack (mean_diff={result.bootstrap.mean_diff:+.4f}, "
+                    f"95% CI=[{result.bootstrap.ci_lower:+.4f}, {result.bootstrap.ci_upper:+.4f}], "
+                    f"n={result.bootstrap.n_matches})."
+                )
             )
 
         def _post_rerun_experiment(self, request_path: str) -> None:

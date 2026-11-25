@@ -155,3 +155,89 @@ def test_promotion_passes_clean_holdout_writes_atomically_and_rolls_back(
     assert rb.success is True
     restored = json.loads((tmp_path / "configs" / "live" / "pl_stack.json").read_text())
     assert restored["k"] == 6.0
+
+
+def test_promotion_anti_holdout_pollution_guardrail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "configs" / "live").mkdir(parents=True)
+    (tmp_path / "configs" / "live" / "pl_stack.json").write_text(
+        json.dumps({"k": 6.0, "code_version": "score_model_v1", "model_id": "live-v1"})
+    )
+
+    db_path = tmp_path / "lab.db"
+    guardrails = PromotionGuardrails(
+        min_holdout_matches=30,
+        max_holdout_candidates=2,
+        n_bootstrap_resamples=300,
+    )
+
+    for idx in (1, 2):
+        exp_id = f"EXP-POLL-{idx}"
+        _seed_completed_experiment(db_path, exp_id=exp_id, competition="PL", holdout_seasons=[2025])
+        res = promote_experiment_run(
+            db_path,
+            exp_id,
+            competition="PL",
+            guardrails=guardrails,
+            holdout_candidate_losses=[0.82] * 35,
+            holdout_baseline_losses=[0.90] * 35,
+            reason=f"Candidate {idx}",
+        )
+        assert res.success is True
+
+    _seed_completed_experiment(db_path, exp_id="EXP-POLL-3", competition="PL", holdout_seasons=[2025])
+    with pytest.raises(PromotionRejectedError, match="Holdout-Pollution"):
+        promote_experiment_run(
+            db_path,
+            "EXP-POLL-3",
+            competition="PL",
+            guardrails=guardrails,
+            holdout_candidate_losses=[0.82] * 35,
+            holdout_baseline_losses=[0.90] * 35,
+            reason="Candidate 3",
+        )
+
+
+def test_promotion_embeds_promotion_meta_and_audit_log_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "configs" / "live").mkdir(parents=True)
+    (tmp_path / "configs" / "live" / "pl_stack.json").write_text(
+        json.dumps({"k": 6.0, "code_version": "score_model_v1", "model_id": "live-v1"})
+    )
+
+    db_path = tmp_path / "lab.db"
+    _seed_completed_experiment(db_path, exp_id="EXP-META-1", competition="PL")
+
+    res = promote_experiment_run(
+        db_path,
+        "EXP-META-1",
+        competition="PL",
+        guardrails=PromotionGuardrails(min_holdout_matches=30, n_bootstrap_resamples=300),
+        holdout_candidate_losses=[0.80] * 35,
+        holdout_baseline_losses=[0.90] * 35,
+        reason="Verified clean holdout improvement",
+    )
+    assert res.success is True
+
+    promoted = json.loads((tmp_path / "configs" / "live" / "pl_stack.json").read_text())
+    meta = promoted["promotion_meta"]
+    assert meta["experiment_id"] == "EXP-META-1"
+    assert meta["n_holdout_matches"] == 35
+    assert meta["mean_diff"] < 0.0
+    assert meta["ci_upper"] < 0.0
+    assert meta["reason"] == "Verified clean holdout improvement"
+
+    audit = get_promotion_audit_log(db_path, competition="PL")
+    assert len(audit) == 1
+    row = audit[0]
+    assert row["experiment_id"] == "EXP-META-1"
+    assert row["reason"] == "Verified clean holdout improvement"
+    assert row["n_holdout_matches"] == 35
+    assert row["mean_diff"] == pytest.approx(meta["mean_diff"])
+    assert row["ci_lower"] == pytest.approx(meta["ci_lower"])
+    assert row["ci_upper"] == pytest.approx(meta["ci_upper"])
+    assert row["backup_path"]

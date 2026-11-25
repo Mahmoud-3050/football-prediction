@@ -844,3 +844,72 @@ def test_route_rerun_experiment_resets_and_spawns(tmp_path: Path) -> None:
         assert int(runs_n["n"]) == 0
     finally:
         server.shutdown()
+
+
+def test_experiments_list_renders_promotion_audit_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from laboratory.lab_promotion import PromotionGuardrails, promote_experiment_run
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "configs" / "live").mkdir(parents=True)
+    (tmp_path / "configs" / "live" / "pl_stack.json").write_text(
+        json.dumps({"k": 6.0, "code_version": "score_model_v1", "model_id": "live-v1"})
+    )
+
+    lab_db = tmp_path / "lab.db"
+    conn = connect(lab_db)
+    create_lab_experiment(
+        conn,
+        "EXP-AUDIT-UI",
+        "PL",
+        {"tuning_seasons": [2024], "holdout_seasons": [2025], "primary_metric": "log_loss"},
+    )
+    complete_lab_experiment(conn, "EXP-AUDIT-UI", best_config={"k": 10.0}, best_metrics={"full_time_1x2_log_loss": 0.95})
+    conn.close()
+
+    promote_experiment_run(
+        lab_db,
+        "EXP-AUDIT-UI",
+        competition="PL",
+        guardrails=PromotionGuardrails(min_holdout_matches=30, n_bootstrap_resamples=300),
+        holdout_candidate_losses=[0.81] * 35,
+        holdout_baseline_losses=[0.90] * 35,
+        reason="Audit UI check",
+    )
+
+    conn = connect(lab_db)
+    try:
+        page = experiments_list(conn, None, lab_db=lab_db)
+    finally:
+        conn.close()
+    assert "Promotion Audit History" in page
+    assert "EXP-AUDIT-UI" in page
+    assert "Audit UI check" in page
+    assert "Bootstrap 95% CI" in page
+
+
+def test_experiment_detail_renders_promote_form_and_rejected_banner(tmp_path: Path) -> None:
+    lab_db = tmp_path / "lab.db"
+    conn = connect(lab_db)
+    create_lab_experiment(conn, "EXP-PROMO-UI", "PL", {"seasons": [2025]})
+    complete_lab_experiment(conn, "EXP-PROMO-UI", best_config={"k": 8.0}, best_metrics={"full_time_1x2_log_loss": 1.0})
+    try:
+        page = experiment_detail(
+            conn,
+            "EXP-PROMO-UI",
+            query={
+                "promo_status": ["rejected"],
+                "promo_detail": ["Bootstrap 95% CI gate failed: [-0.0200, +0.0100]"],
+            },
+            csrf_token="tok-123",
+            lab_db=lab_db,
+        )
+    finally:
+        conn.close()
+
+    assert page is not None
+    assert "Promote to Live" in page
+    assert "/experiments/EXP-PROMO-UI/promote" in page
+    assert "Promotion Rejected by Statistical Guardrail" in page
+    assert "[-0.0200, +0.0100]" in page
