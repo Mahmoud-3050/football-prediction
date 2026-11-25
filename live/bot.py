@@ -452,6 +452,19 @@ def _success(result: PipelineResult, *, markdown: bool) -> str:
         "",
     ]
     lines.extend(_prob_block(probs, markdown=markdown))
+    p_h = probs.get("home")
+    p_d = probs.get("draw")
+    p_a = probs.get("away")
+    if p_h is not None and p_d is not None and p_a is not None:
+        argmax_label = max(
+            (("Home win", float(p_h)), ("Draw", float(p_d)), ("Away win", float(p_a))),
+            key=lambda item: item[1],
+        )[0]
+        if result.markets.result_1x2 != argmax_label:
+            lines.append(
+                f"Display Pick: {_em(result.markets.result_1x2, markdown)} "
+                f"{_plain(f'(rule-based vs raw probs H {_pct1(p_h)} / D {_pct1(p_d)} / A {_pct1(p_a)})', markdown)}"
+            )
     score_label = _score_display(result.full_time_score or "")
     lines.append("")
     lines.append(f"Most likely score {_em(score_label, markdown)}")

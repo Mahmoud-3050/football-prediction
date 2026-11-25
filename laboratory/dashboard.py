@@ -5437,6 +5437,63 @@ def experiment_detail(
                 f'</section>'
             )
 
+        # Calibration & Reliability Diagram Panel (Stage 3 Item 8)
+        calib_runs = [r for r in completed if (r.get("metrics") or {}).get("reliability_diagrams")]
+        if calib_runs:
+            top_calib = calib_runs[0]
+            rel_map = (top_calib.get("metrics") or {}).get("reliability_diagrams") or {}
+            ece_map = (top_calib.get("metrics") or {}).get("ece") or {}
+            market_cards = []
+            for m_key, m_label, ece_key in (
+                ("ft_draw", "FT Draw", "ft_draw_ece"),
+                ("ft_home", "FT Home", "ft_home_ece"),
+                ("ft_away", "FT Away", "ft_away_ece"),
+                ("over_under_2_5", "Over 2.5", "ou25_ece"),
+            ):
+                rel = rel_map.get(m_key)
+                if not rel:
+                    continue
+                ece_val = ece_map.get(ece_key) if ece_map.get(ece_key) is not None else rel.get("ece")
+                ece_str = f"{float(ece_val):.4f}" if isinstance(ece_val, (int, float)) else "—"
+                rows_html = []
+                for b in rel.get("bins") or []:
+                    cnt = int(b.get("count") or 0)
+                    if cnt == 0:
+                        continue
+                    mp = float(b["mean_predicted"])
+                    ef = float(b["empirical_frequency"])
+                    lo = int(round(float(b["lower"]) * 100))
+                    hi = int(round(float(b["upper"]) * 100))
+                    rows_html.append(
+                        f'<div style="display:grid; grid-template-columns:64px 1fr 110px; align-items:center; gap:8px; font-size:0.75rem; margin-bottom:4px;">'
+                        f'  <span class="mono">{lo}–{hi}%</span>'
+                        f'  <div style="position:relative; height:12px; background:var(--line); border-radius:4px; overflow:hidden;">'
+                        f'    <div style="position:absolute; top:0; left:0; height:6px; width:{min(100.0, mp * 100):.1f}%; background:var(--accent); opacity:0.8;"></div>'
+                        f'    <div style="position:absolute; bottom:0; left:0; height:6px; width:{min(100.0, ef * 100):.1f}%; background:var(--good);"></div>'
+                        f'  </div>'
+                        f'  <span class="mono">P {mp:.0%} / A {ef:.0%} ({cnt})</span>'
+                        f'</div>'
+                    )
+                market_cards.append(
+                    f'<div style="border:1px solid var(--line); border-radius:var(--radius-sm); padding:12px;">'
+                    f'  <div style="display:flex; justify-content:space-between; margin-bottom:8px;">'
+                    f'    <strong>{html.escape(m_label)}</strong>'
+                    f'    <span class="badge muted">ECE {html.escape(ece_str)}</span>'
+                    f'  </div>'
+                    f'  {"".join(rows_html) if rows_html else "<p class=muted>No bins</p>"}'
+                    f'</div>'
+                )
+            if market_cards:
+                body.append(
+                    f'<section class="panel" id="reliability-diagram-panel">'
+                    f'  <h2>Calibration &amp; Reliability Diagram</h2>'
+                    f'  <p class="note" style="margin-bottom:12px;">Predicted % (top bar) vs. Actual Empirical Frequency (bottom bar) across 10 probability bins for <code>{html.escape(top_calib["model_id"])}</code>.</p>'
+                    f'  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px;">'
+                    f'    {"".join(market_cards)}'
+                    f'  </div>'
+                    f'</section>'
+                )
+
     # AI Diagnostic Prompt Card
     prompt_content = _ai_diagnostic_prompt(exp, runs)
     body.append(

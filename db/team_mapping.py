@@ -8,7 +8,9 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
-ALLOWED_PROVIDERS = frozenset({"football_data", "live_football", "api_ninjas", "manual"})
+ALLOWED_PROVIDERS = frozenset(
+    {"football_data", "live_football", "api_ninjas", "manual", "understat", "fbref"}
+)
 
 # Explicit SPL mappings between API Ninjas (standings/live) and Live Football API (historical matches)
 SPL_NINJAS_TO_LFA_CANONICAL: dict[str, str] = {

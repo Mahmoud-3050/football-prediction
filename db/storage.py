@@ -87,6 +87,20 @@ CREATE TABLE IF NOT EXISTS prospective_predictions (
     settled_at_utc TEXT,
     UNIQUE(competition, home_team_id, away_team_id, kickoff_utc)
 );
+
+CREATE TABLE IF NOT EXISTS match_xg (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    competition TEXT NOT NULL,
+    season INTEGER NOT NULL,
+    kickoff_utc TEXT NOT NULL,
+    home_team_id TEXT NOT NULL REFERENCES canonical_teams(team_id),
+    away_team_id TEXT NOT NULL REFERENCES canonical_teams(team_id),
+    home_xg REAL NOT NULL,
+    away_xg REAL NOT NULL,
+    source TEXT NOT NULL,
+    imported_at_utc TEXT NOT NULL,
+    UNIQUE(competition, season, home_team_id, away_team_id, source)
+);
 """
 
 # Back-compat alias for older imports/tests.

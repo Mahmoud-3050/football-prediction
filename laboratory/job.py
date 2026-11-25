@@ -172,6 +172,7 @@ def run_score_model(
     elo_weight: float = 0.0,
     elo_k: float = 20.0,
     elo_home_adv: float = 55.0,
+    xg_weight: float = 0.0,
     persistent_priors: bool = False,
     elo_blend: float = 0.0,
     domestic_prior_weight: float = 0.0,
@@ -203,6 +204,28 @@ def run_score_model(
     ).upper()
     rows = list_matches(connection, competition=competition)
     history = [_record(row) for row in rows]
+    if xg_weight > 0.0:
+        from dataclasses import replace
+        from db.xg_store import attach_xg_to_matches
+
+        attached = attach_xg_to_matches(
+            connection,
+            [
+                {
+                    "competition": m.competition,
+                    "home_id": m.home_id,
+                    "away_id": m.away_id,
+                    "kickoff": m.kickoff,
+                }
+                for m in history
+            ],
+        )
+        history = [
+            replace(m, home_xg=att.get("home_xg"), away_xg=att.get("away_xg"))
+            if att.get("home_xg") is not None and att.get("away_xg") is not None
+            else m
+            for m, att in zip(history, attached)
+        ]
     season_ratio_cache: dict[str, dict[str, dict[str, float]]] = {}
     if prior_mean == "last_season":
         season_ratio_cache = _last_season_ratio_cache(
@@ -366,6 +389,7 @@ def run_score_model(
             elo_weight=elo_weight,
             elo_k=elo_k,
             elo_home_adv=elo_home_adv,
+            xg_weight=xg_weight,
             min_scored_matches=effective_min_scored,
         )
         if outcome.excluded or outcome.body is None:

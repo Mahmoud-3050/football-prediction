@@ -89,6 +89,9 @@ class ScoreEstimate:
     elo_weight: float = 0.0
     elo_k: float = 20.0
     elo_home_adv: float = 55.0
+    xg_weight: float = 0.0
+    calib_temperature: float = 1.0
+    calib_draw_bias: float = 0.0
 
     def probability(self, home_goals: int, away_goals: int) -> float:
         if home_goals >= len(self.matrix) or away_goals >= len(self.matrix[0]):
@@ -307,6 +310,9 @@ def estimate_from_lambdas(
     elo_weight: float = 0.0,
     elo_k: float = 20.0,
     elo_home_adv: float = 55.0,
+    xg_weight: float = 0.0,
+    calib_temperature: float = 1.0,
+    calib_draw_bias: float = 0.0,
     neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Price a full-time grid, and a half-time grid when that market is eligible."""
@@ -331,6 +337,12 @@ def estimate_from_lambdas(
         raise ValueError("elo_k must be a finite non-negative number.")
     if not math.isfinite(elo_home_adv):
         raise ValueError("elo_home_adv must be finite.")
+    if not math.isfinite(xg_weight) or xg_weight < 0.0 or xg_weight > 1.0:
+        raise ValueError("xg_weight must be a finite number in [0.0, 1.0].")
+    if not math.isfinite(calib_temperature) or calib_temperature <= 0.0:
+        raise ValueError("calib_temperature must be a finite positive number.")
+    if not math.isfinite(calib_draw_bias):
+        raise ValueError("calib_draw_bias must be finite.")
     nb_alpha_val = _validate_nb_alpha(nb_alpha)
     normalized_weights = _normalize_draw_weights(draw_weights)
     _validate_draw_pick_params(draw_pick_threshold, draw_pick_margin)
@@ -356,8 +368,33 @@ def estimate_from_lambdas(
         draw_weights=normalized_weights,
         tightness_factor=tightness,
     )
-    home_goals, away_goals, score_probability = _mode(matrix)
     probabilities = _market_probabilities(matrix)
+    if calib_temperature != 1.0 or calib_draw_bias != 0.0:
+        _eps = 1e-12
+        _raw_h = max(probabilities["home"], _eps)
+        _raw_d = max(probabilities["draw"], _eps)
+        _raw_a = max(probabilities["away"], _eps)
+        _logits = [
+            math.log(_raw_h) / float(calib_temperature),
+            (math.log(_raw_d) / float(calib_temperature)) + float(calib_draw_bias),
+            math.log(_raw_a) / float(calib_temperature),
+        ]
+        _m = max(_logits)
+        _exps = [math.exp(x - _m) for x in _logits]
+        _denom = sum(_exps)
+        _cal_h, _cal_d, _cal_a = _exps[0] / _denom, _exps[1] / _denom, _exps[2] / _denom
+        _sh = _cal_h / _raw_h
+        _sd = _cal_d / _raw_d
+        _sa = _cal_a / _raw_a
+        matrix = tuple(
+            tuple(
+                cell * (_sh if hg > ag else (_sd if hg == ag else _sa))
+                for ag, cell in enumerate(row)
+            )
+            for hg, row in enumerate(matrix)
+        )
+        probabilities = _market_probabilities(matrix)
+    home_goals, away_goals, score_probability = _mode(matrix)
     markets = _markets(
         probabilities,
         draw_pick_threshold=draw_pick_threshold,
@@ -438,6 +475,9 @@ def estimate_from_lambdas(
         elo_weight=elo_weight,
         elo_k=elo_k,
         elo_home_adv=elo_home_adv,
+        xg_weight=xg_weight,
+        calib_temperature=float(calib_temperature),
+        calib_draw_bias=float(calib_draw_bias),
     )
 
 
@@ -529,6 +569,9 @@ def estimate_score(
     elo_weight: float = 0.0,
     elo_k: float = 20.0,
     elo_home_adv: float = 55.0,
+    xg_weight: float = 0.0,
+    calib_temperature: float = 1.0,
+    calib_draw_bias: float = 0.0,
     neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Expected goals from shrunk multiplicative rates, then modal scores and markets."""
@@ -563,6 +606,12 @@ def estimate_score(
         raise ValueError("elo_k must be a finite non-negative number.")
     if not math.isfinite(elo_home_adv):
         raise ValueError("elo_home_adv must be finite.")
+    if not math.isfinite(xg_weight) or xg_weight < 0.0 or xg_weight > 1.0:
+        raise ValueError("xg_weight must be a finite number in [0.0, 1.0].")
+    if not math.isfinite(calib_temperature) or calib_temperature <= 0.0:
+        raise ValueError("calib_temperature must be a finite positive number.")
+    if not math.isfinite(calib_draw_bias):
+        raise ValueError("calib_draw_bias must be finite.")
     cap_val, slope_val = _validate_goal_cap(goal_cap, goal_cap_slope)
     nb_alpha_val = _validate_nb_alpha(nb_alpha)
     promo_atk, promo_def = _validate_promoted_priors(
@@ -636,13 +685,13 @@ def estimate_score(
     else:
         league_home = _weighted_mean(
             [
-                (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
+                (_effective_goals(match.ft_home, match.home_xg, xg_weight, cap_val, slope_val), weights[index])
                 for index, match in enumerate(priors)
             ]
         )
         league_away = _weighted_mean(
             [
-                (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
+                (_effective_goals(match.ft_away, match.away_xg, xg_weight, cap_val, slope_val), weights[index])
                 for index, match in enumerate(priors)
             ]
         )
@@ -699,6 +748,7 @@ def estimate_score(
             prior_means=means,
             goal_cap=cap_val,
             goal_cap_slope=slope_val,
+            xg_weight=xg_weight,
         )
         attack_home = ratios["attack_home"].shrunk
         defence_away = ratios["defence_away"].shrunk
@@ -708,7 +758,7 @@ def estimate_score(
         attack_home, attack_home_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
+                    (_effective_goals(match.ft_home, match.home_xg, xg_weight, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.home_id == home_team_id
                 ]
@@ -720,7 +770,7 @@ def estimate_score(
         defence_away, defence_away_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (_soft_cap_goals(match.ft_home, cap_val, slope_val), weights[index])
+                    (_effective_goals(match.ft_home, match.home_xg, xg_weight, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.away_id == away_team_id
                 ]
@@ -732,7 +782,7 @@ def estimate_score(
         attack_away, attack_away_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
+                    (_effective_goals(match.ft_away, match.away_xg, xg_weight, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.away_id == away_team_id
                 ]
@@ -744,7 +794,7 @@ def estimate_score(
         defence_home, defence_home_detail = _ratio(
             goals=_weighted_per_game(
                 [
-                    (_soft_cap_goals(match.ft_away, cap_val, slope_val), weights[index])
+                    (_effective_goals(match.ft_away, match.away_xg, xg_weight, cap_val, slope_val), weights[index])
                     for index, match in enumerate(priors)
                     if match.home_id == home_team_id
                 ]
@@ -958,6 +1008,9 @@ def estimate_score(
         elo_weight=elo_weight,
         elo_k=elo_k,
         elo_home_adv=elo_home_adv,
+        xg_weight=xg_weight,
+        calib_temperature=float(calib_temperature),
+        calib_draw_bias=float(calib_draw_bias),
     )
 
 
@@ -1007,6 +1060,21 @@ def _compute_dynamic_elo_ratings(
     return _decay_to(home_team_id, target_dt), _decay_to(away_team_id, target_dt)
 
 
+def _effective_goals(
+    goals: int | float,
+    xg: float | None,
+    xg_weight: float,
+    cap_val: float | None,
+    slope_val: float,
+) -> float:
+    """Blend capped actual goals with capped xG when xg_weight > 0 and xG is valid."""
+    capped_goals = _soft_cap_goals(goals, cap_val, slope_val)
+    if xg_weight <= 0.0 or xg is None or not math.isfinite(xg) or xg < 0.0:
+        return float(capped_goals)
+    capped_xg = _soft_cap_goals(xg, cap_val, slope_val)
+    return (1.0 - xg_weight) * float(capped_goals) + xg_weight * float(capped_xg)
+
+
 @dataclass(frozen=True)
 class _PriorMatch:
     match_id: int | str
@@ -1017,6 +1085,8 @@ class _PriorMatch:
     ft_away: int
     ht_home: int | None = None
     ht_away: int | None = None
+    home_xg: float | None = None
+    away_xg: float | None = None
 
 
 def _prior_matches(
@@ -1084,6 +1154,21 @@ def _parse_priors(
         match_id = raw.get("id")
         if match_id is None:
             match_id = f"{home_id}-{away_id}-{utc}"
+        raw_hxg = raw.get("home_xg")
+        raw_axg = raw.get("away_xg")
+        home_xg = (
+            float(raw_hxg)
+            if isinstance(raw_hxg, (int, float)) and not isinstance(raw_hxg, bool) and math.isfinite(raw_hxg) and raw_hxg >= 0.0
+            else None
+        )
+        away_xg = (
+            float(raw_axg)
+            if isinstance(raw_axg, (int, float)) and not isinstance(raw_axg, bool) and math.isfinite(raw_axg) and raw_axg >= 0.0
+            else None
+        )
+        if home_xg is None or away_xg is None:
+            home_xg = None
+            away_xg = None
         by_id[match_id] = _PriorMatch(
             match_id=match_id,
             kickoff=utc,
@@ -1093,6 +1178,8 @@ def _parse_priors(
             ft_away=full_time["away"],
             ht_home=ht_home,
             ht_away=ht_away,
+            home_xg=home_xg,
+            away_xg=away_xg,
         )
     priors = list(by_id.values())
     priors.sort(key=lambda match: match.kickoff)
@@ -1192,6 +1279,7 @@ def _joint_fixture_ratios(
     prior_means: dict[str, float],
     goal_cap: float | None = None,
     goal_cap_slope: float = 0.5,
+    xg_weight: float = 0.0,
 ) -> dict[str, RatioDetail]:
     """Iteratively solve venue attack/defence, then shrink the fixture's four ratios."""
 
@@ -1202,6 +1290,7 @@ def _joint_fixture_ratios(
         league_away=league_away,
         goal_cap=goal_cap,
         goal_cap_slope=goal_cap_slope,
+        xg_weight=xg_weight,
     )
     mapping = {
         "attack_home": (home_team_id, "attack_home"),
@@ -1230,6 +1319,7 @@ def _joint_venue_strengths(
     iterations: int = JOINT_RATIO_ITERATIONS,
     goal_cap: float | None = None,
     goal_cap_slope: float = 0.5,
+    xg_weight: float = 0.0,
 ) -> tuple[dict[int, dict[str, float]], dict[int, dict[str, float]]]:
     """Return per-club venue strengths and effective sample sizes via vectorized np.bincount."""
     import numpy as np
@@ -1244,8 +1334,22 @@ def _joint_venue_strengths(
 
     home_idx = np.fromiter((club_to_idx[m.home_id] for m in priors), dtype=np.int32, count=len(priors))
     away_idx = np.fromiter((club_to_idx[m.away_id] for m in priors), dtype=np.int32, count=len(priors))
-    ft_home = np.fromiter((m.ft_home for m in priors), dtype=np.int16, count=len(priors))
-    ft_away = np.fromiter((m.ft_away for m in priors), dtype=np.int16, count=len(priors))
+    if xg_weight > 0.0:
+        ft_home = np.fromiter(
+            (_effective_goals(m.ft_home, m.home_xg, xg_weight, goal_cap, goal_cap_slope) for m in priors),
+            dtype=np.float64,
+            count=len(priors),
+        )
+        ft_away = np.fromiter(
+            (_effective_goals(m.ft_away, m.away_xg, xg_weight, goal_cap, goal_cap_slope) for m in priors),
+            dtype=np.float64,
+            count=len(priors),
+        )
+        cap_for_vec = None
+    else:
+        ft_home = np.fromiter((m.ft_home for m in priors), dtype=np.int16, count=len(priors))
+        ft_away = np.fromiter((m.ft_away for m in priors), dtype=np.int16, count=len(priors))
+        cap_for_vec = goal_cap
     w_arr = np.asarray(weights, dtype=np.float64)
 
     att_h, def_a, att_a, def_h, n_ah, n_da, n_aa, n_dh = compute_joint_venue_strengths_vec(
@@ -1258,7 +1362,7 @@ def _joint_venue_strengths(
         league_home=league_home,
         league_away=league_away,
         iterations=iterations,
-        goal_cap=goal_cap,
+        goal_cap=cap_for_vec,
         goal_cap_slope=goal_cap_slope,
     )
 

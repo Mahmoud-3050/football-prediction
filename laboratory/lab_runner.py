@@ -180,6 +180,7 @@ class _WorkerInput:
     live_db_path: str  # Path string for read-only access
     lab_db_path: str = "data/lab.db"  # Path string for lab DB access
     persist_predictions: bool = True
+    calibration_mode: str = "none"
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,27 @@ def _build_snapshot_cache(
             competition=competition.upper(),
             seasons=season_keys,
         )
+        from dataclasses import replace
+        from db.xg_store import attach_xg_to_matches
+
+        attached = attach_xg_to_matches(
+            conn,
+            [
+                {
+                    "competition": m.competition,
+                    "home_id": m.home_id,
+                    "away_id": m.away_id,
+                    "kickoff": m.kickoff,
+                }
+                for m in all_matches
+            ],
+        )
+        all_matches = [
+            replace(m, home_xg=att.get("home_xg"), away_xg=att.get("away_xg"))
+            if att.get("home_xg") is not None and att.get("away_xg") is not None
+            else m
+            for m, att in zip(all_matches, attached)
+        ]
 
     matches_by_season: dict[str, list[MatchRecord]] = {}
     for match in all_matches:
@@ -305,6 +327,11 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
     elo_weight = float(input_data.config.get("elo_weight", 0.0))
     elo_k = float(input_data.config.get("elo_k", 20.0))
     elo_home_adv = float(input_data.config.get("elo_home_adv", 55.0))
+    xg_weight = float(input_data.config.get("xg_weight", 0.0))
+    calib_temperature = float(input_data.config.get("calib_temperature", 1.0))
+    calib_draw_bias = float(input_data.config.get("calib_draw_bias", 0.0))
+    _cfg_cal = str(input_data.config.get("calibration_mode") or "").strip()
+    calibration_mode = _cfg_cal if _cfg_cal else str(input_data.calibration_mode or "none").strip()
 
     cache, all_history = _build_snapshot_cache(
         live_db,
@@ -345,15 +372,52 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
         batch_evaluations.clear()
 
     try:
+        from laboratory.calibration import compute_reliability_bins, fit_temperature_platt_1x2
         from laboratory.evaluate import evaluate_prediction
 
-        for cached in cache.values():
+        ordered_targets = sorted(
+            cache.values(),
+            key=lambda c: (int(c.target.season), c.target.kickoff, c.target.match_id),
+        )
+        prior_season_raw: list[tuple[int, tuple[float, float, float], int]] = []
+        fitted_by_season: dict[int, tuple[float, float]] = {}
+
+        ph_list: list[float] = []
+        yh_list: list[int] = []
+        pd_list: list[float] = []
+        yd_list: list[int] = []
+        pa_list: list[float] = []
+        ya_list: list[int] = []
+        pou_list: list[float] = []
+        you_list: list[int] = []
+
+        for cached in ordered_targets:
             target = cached.target
             priors = cached.priors
 
             payload = build_snapshot(target, priors)
             if not payload["leakage_ok"]:
                 continue
+
+            cur_season = int(target.season)
+            eff_draw_boost = draw_boost
+            eff_temp = calib_temperature
+            eff_bias = calib_draw_bias
+            if calibration_mode == "platt_fit_prior_season":
+                eff_draw_boost = 1.0
+                if cur_season not in fitted_by_season:
+                    train_rows = [
+                        (probs, y) for s, probs, y in prior_season_raw if s < cur_season
+                    ]
+                    if len(train_rows) >= 20:
+                        fit = fit_temperature_platt_1x2(
+                            [p for p, _ in train_rows],
+                            [y for _, y in train_rows],
+                        )
+                        fitted_by_season[cur_season] = (fit["temperature"], fit["draw_bias"])
+                    else:
+                        fitted_by_season[cur_season] = (1.0, 0.0)
+                eff_temp, eff_bias = fitted_by_season[cur_season]
 
             means = None
             if prior_mean == "last_season":
@@ -374,7 +438,7 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                 ratio_mode=ratio_mode,
                 dependence=dependence,
                 half_time_share_mode=half_time_share_mode,
-                draw_boost=draw_boost,
+                draw_boost=eff_draw_boost,
                 draw_weights=draw_weights,
                 draw_pick_threshold=draw_pick_threshold,
                 draw_pick_margin=draw_pick_margin,
@@ -398,6 +462,9 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                 elo_weight=elo_weight,
                 elo_k=elo_k,
                 elo_home_adv=elo_home_adv,
+                xg_weight=xg_weight,
+                calib_temperature=eff_temp,
+                calib_draw_bias=eff_bias,
             )
 
             if outcome.excluded or outcome.body is None:
@@ -431,6 +498,44 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                 )
                 evaluated += 1
                 acc.add_evaluation(metrics)
+
+                ft_block = outcome.body.get("full_time") or {}
+                r1x2 = ft_block.get("result_1x2") or {}
+                ou25_blk = ft_block.get("over_under_2_5") or {}
+                p_h = float(r1x2.get("home", 0.0))
+                p_d = float(r1x2.get("draw", 0.0))
+                p_a = float(r1x2.get("away", 0.0))
+                p_ou = ou25_blk.get("over")
+                hg_val = int(target.ft_home)
+                ag_val = int(target.ft_away)
+                out_idx = 0 if hg_val > ag_val else (1 if hg_val == ag_val else 2)
+                ph_list.append(p_h)
+                yh_list.append(1 if out_idx == 0 else 0)
+                pd_list.append(p_d)
+                yd_list.append(1 if out_idx == 1 else 0)
+                pa_list.append(p_a)
+                ya_list.append(1 if out_idx == 2 else 0)
+                if p_ou is not None:
+                    pou_list.append(float(p_ou))
+                    you_list.append(1 if (hg_val + ag_val) > 2 else 0)
+
+                if calibration_mode == "platt_fit_prior_season":
+                    if eff_temp == 1.0 and eff_bias == 0.0:
+                        raw_t = (p_h, p_d, p_a)
+                    else:
+                        import math as _math
+                        _eps = 1e-12
+                        _z = [
+                            eff_temp * _math.log(max(p_h, _eps)),
+                            eff_temp * (_math.log(max(p_d, _eps)) - eff_bias),
+                            eff_temp * _math.log(max(p_a, _eps)),
+                        ]
+                        _mz = max(_z)
+                        _ez = [_math.exp(v - _mz) for v in _z]
+                        _sz = sum(_ez)
+                        raw_t = (_ez[0] / _sz, _ez[1] / _sz, _ez[2] / _sz)
+                    prior_season_raw.append((cur_season, raw_t, out_idx))
+
                 if input_data.persist_predictions:
                     batch_evaluations.append((prediction_id, 1, metrics))
 
@@ -439,10 +544,44 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
 
         _flush_batches()
 
+        rel_diagrams = {}
+        ece_summary = {}
+        if ph_list:
+            rel_home = compute_reliability_bins(ph_list, yh_list)
+            rel_draw = compute_reliability_bins(pd_list, yd_list)
+            rel_away = compute_reliability_bins(pa_list, ya_list)
+            rel_diagrams = {
+                "ft_home": rel_home,
+                "ft_draw": rel_draw,
+                "ft_away": rel_away,
+            }
+            ece_summary = {
+                "ft_home_ece": rel_home["ece"],
+                "ft_draw_ece": rel_draw["ece"],
+                "ft_away_ece": rel_away["ece"],
+                "ou25_ece": None,
+            }
+            if pou_list:
+                rel_ou = compute_reliability_bins(pou_list, you_list)
+                rel_diagrams["over_under_2_5"] = rel_ou
+                ece_summary["ou25_ece"] = rel_ou["ece"]
+
+        if not input_data.persist_predictions:
+            final_metrics = acc.finalize()
+            if rel_diagrams:
+                final_metrics["ece"] = ece_summary
+                final_metrics["reliability_diagrams"] = rel_diagrams
+        else:
+            final_metrics = (
+                {"ece": ece_summary, "reliability_diagrams": rel_diagrams}
+                if rel_diagrams
+                else None
+            )
+
         return _WorkerOutput(
             model_id=input_data.model_id,
             status="completed",
-            metrics=acc.finalize() if not input_data.persist_predictions else None,
+            metrics=final_metrics,
             matches_priced=priced,
             matches_evaluated=evaluated,
             error=None,
@@ -589,6 +728,7 @@ def run_experiment(
             live_db_path=str(live_db_path),
             lab_db_path=str(lab_db_path),
             persist_predictions=persist_predictions,
+            calibration_mode=config.calibration_mode,
         )
         for cfg, mid in pending
     ]
@@ -619,9 +759,15 @@ def run_experiment(
                 )
 
             # Aggregate metrics for completed runs
-            metrics = output.metrics
+            extra_calib = output.metrics if (persist_predictions and isinstance(output.metrics, dict)) else None
+            metrics = output.metrics if not persist_predictions else None
             if metrics is None and output.status == "completed" and output.matches_evaluated > 0:
                 metrics = _aggregate_metrics(lab_db_path, config.experiment_id, model_id)
+                if extra_calib:
+                    if "ece" in extra_calib:
+                        metrics["ece"] = extra_calib["ece"]
+                    if "reliability_diagrams" in extra_calib:
+                        metrics["reliability_diagrams"] = extra_calib["reliability_diagrams"]
 
             # Record run in DB (retry through WAL contention with dashboard readers)
             conn = _connect_lab_with_retry(lab_db_path)

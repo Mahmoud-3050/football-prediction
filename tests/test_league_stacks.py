@@ -21,7 +21,10 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-pl-v3",
+        "elo_weight": 0.08,
+        "elo_k": 24.0,
+        "elo_home_adv": 55.0,
+        "model_id": "bot-score-model-pl-v4",
     },
     "PD": {
         "k": 12.0,
@@ -82,7 +85,10 @@ _PROMOTED_LIVE = {
         "persistent_priors": True,
         "elo_blend": 0.5,
         "domestic_prior_weight": 0.4,
-        "model_id": "bot-score-model-cl-v4",
+        "elo_weight": 0.08,
+        "elo_k": 24.0,
+        "elo_home_adv": 55.0,
+        "model_id": "bot-score-model-cl-v5",
     },
 }
 

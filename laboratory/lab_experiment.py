@@ -71,6 +71,7 @@ class ExperimentConfig:
     primary_metric: str = "log_loss"
     min_matches: int = 100
     random_seed: int = 42
+    calibration_mode: str = "none"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seasons", _as_season_tuple(self.seasons))
@@ -386,6 +387,9 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "elo_weight",
         "elo_k",
         "elo_home_adv",
+        "xg_weight",
+        "calib_temperature",
+        "calib_draw_bias",
     ):
         if key in flat and flat[key] is not None:
             merged[key] = flat[key]
@@ -450,6 +454,9 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "elo_weight",
         "elo_k",
         "elo_home_adv",
+        "xg_weight",
+        "calib_temperature",
+        "calib_draw_bias",
         "promoted_attack_prior",
         "promoted_defence_prior",
         "venue_k",
@@ -463,6 +470,9 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "elo_weight",
         "elo_k",
         "elo_home_adv",
+        "xg_weight",
+        "calib_temperature",
+        "calib_draw_bias",
     ):
         if opt_key in merged:
             val = _as_optional_float(merged.get(opt_key), label=opt_key)
@@ -566,6 +576,9 @@ def _normalize_param_grid(
         "elo_weight",
         "elo_k",
         "elo_home_adv",
+        "xg_weight",
+        "calib_temperature",
+        "calib_draw_bias",
         "promoted_attack_prior",
         "promoted_defence_prior",
     ):

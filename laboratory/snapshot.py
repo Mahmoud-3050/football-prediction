@@ -24,6 +24,8 @@ class MatchRecord:
     ht_home: int | None
     ht_away: int | None
     competition: str = "PL"
+    home_xg: float | None = None
+    away_xg: float | None = None
 
 
 def build_snapshot(target: MatchRecord, history: list[MatchRecord]) -> dict[str, Any]:
@@ -43,20 +45,22 @@ def build_snapshot(target: MatchRecord, history: list[MatchRecord]) -> dict[str,
             continue
         if match.ft_home is None or match.ft_away is None:
             continue
-        priors.append(
-            {
-                "match_id": match.match_id,
-                "kickoff": match.kickoff,
-                "home_id": match.home_id,
-                "home_name": match.home_name,
-                "away_id": match.away_id,
-                "away_name": match.away_name,
-                "ft_home": match.ft_home,
-                "ft_away": match.ft_away,
-                "ht_home": match.ht_home,
-                "ht_away": match.ht_away,
-            }
-        )
+        item = {
+            "match_id": match.match_id,
+            "kickoff": match.kickoff,
+            "home_id": match.home_id,
+            "home_name": match.home_name,
+            "away_id": match.away_id,
+            "away_name": match.away_name,
+            "ft_home": match.ft_home,
+            "ft_away": match.ft_away,
+            "ht_home": match.ht_home,
+            "ht_away": match.ht_away,
+        }
+        if match.home_xg is not None and match.away_xg is not None:
+            item["home_xg"] = match.home_xg
+            item["away_xg"] = match.away_xg
+        priors.append(item)
     priors.sort(key=lambda item: (item["kickoff"], item["match_id"]))
     half_time_count = sum(
         1

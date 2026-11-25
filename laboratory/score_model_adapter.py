@@ -65,6 +65,9 @@ def price_from_snapshot(
     elo_weight: float = 0.0,
     elo_k: float = 20.0,
     elo_home_adv: float = 55.0,
+    xg_weight: float = 0.0,
+    calib_temperature: float = 1.0,
+    calib_draw_bias: float = 0.0,
     neutral_venue: bool = False,
     min_scored_matches: int | None = None,
 ) -> ScoreModelOutcome:
@@ -152,6 +155,9 @@ def price_from_snapshot(
         elo_weight=elo_weight,
         elo_k=elo_k,
         elo_home_adv=elo_home_adv,
+        xg_weight=xg_weight,
+        calib_temperature=calib_temperature,
+        calib_draw_bias=calib_draw_bias,
         neutral_venue=neutral_venue,
     )
     return ScoreModelOutcome(
@@ -251,6 +257,9 @@ def _to_fd_match(
             },
         },
     }
+    if prior.get("home_xg") is not None and prior.get("away_xg") is not None:
+        match["home_xg"] = float(prior["home_xg"])
+        match["away_xg"] = float(prior["away_xg"])
     return match
 
 

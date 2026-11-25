@@ -42,6 +42,9 @@ DEFAULT_LIVE_STACK: dict[str, Any] = {
     "elo_weight": 0.0,
     "elo_k": 20.0,
     "elo_home_adv": 55.0,
+    "xg_weight": 0.0,
+    "calib_temperature": 1.0,
+    "calib_draw_bias": 0.0,
     "persistent_priors": False,
     "elo_blend": 0.0,
     "domestic_prior_weight": 0.0,
@@ -78,6 +81,9 @@ _STACK_KEYS = (
     "elo_weight",
     "elo_k",
     "elo_home_adv",
+    "xg_weight",
+    "calib_temperature",
+    "calib_draw_bias",
     "persistent_priors",
     "elo_blend",
     "domestic_prior_weight",
@@ -204,6 +210,14 @@ def draw_calibration_kwargs(stack: Mapping[str, Any]) -> dict[str, Any]:
         kwargs["elo_home_adv"] = float(
             stack.get("elo_home_adv") if stack.get("elo_home_adv") is not None else 55.0
         )
+    xg_w = float(stack.get("xg_weight") or 0.0)
+    if xg_w > 0.0:
+        kwargs["xg_weight"] = xg_w
+    calib_t = float(stack.get("calib_temperature") if stack.get("calib_temperature") is not None else 1.0)
+    calib_b = float(stack.get("calib_draw_bias") if stack.get("calib_draw_bias") is not None else 0.0)
+    if calib_t != 1.0 or calib_b != 0.0:
+        kwargs["calib_temperature"] = calib_t
+        kwargs["calib_draw_bias"] = calib_b
     return kwargs
 
 
@@ -257,7 +271,7 @@ def _merge_stack(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[st
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number
-        elif key in {"nb_alpha", "elo_blend", "domestic_prior_weight", "standings_blend", "stakes_blend", "elo_weight", "elo_k", "elo_home_adv"}:
+        elif key in {"nb_alpha", "elo_blend", "domestic_prior_weight", "standings_blend", "stakes_blend", "elo_weight", "elo_k", "elo_home_adv", "xg_weight"}:
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number

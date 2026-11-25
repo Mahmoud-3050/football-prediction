@@ -1551,6 +1551,7 @@ def main() -> None:
             "sync-data",
             "map-team",
             "settle-prospective",
+            "import-xg",
         ),
     )
     parser.add_argument(
@@ -1648,6 +1649,8 @@ def main() -> None:
     parser.add_argument("--team-id", type=str, default=None, help="Existing canonical team_id for map-team.")
     parser.add_argument("--audit", action="store_true", help="Audit team mappings coverage.")
     parser.add_argument("--backfill", action="store_true", help="Backfill canonical_teams and team_provider_mappings.")
+    parser.add_argument("--file", type=str, default=None, help="CSV or JSON file path for import-xg.")
+    parser.add_argument("--source", type=str, default=None, help="xG source identifier (e.g. understat, fbref).")
     args = parser.parse_args()
     path = database_path()
     if args.command == "sync-data":
@@ -2097,6 +2100,27 @@ def main() -> None:
                     default=str,
                 )
             )
+        finally:
+            connection.close()
+        return
+    if args.command == "import-xg":
+        from db.xg_store import import_xg_records, load_xg_file
+
+        if not args.file or not args.source or not args.competitions or not args.seasons:
+            raise SystemExit("import-xg requires --file, --source, --competition, and --season")
+        db_path = Path(args.db).resolve() if args.db else path
+        connection = connect(db_path)
+        try:
+            records = load_xg_file(Path(args.file))
+            summary = import_xg_records(
+                connection,
+                records,
+                source=args.source,
+                competition=args.competitions[0],
+                season=int(args.seasons[0]),
+            )
+            checkpoint_wal(connection, mode="TRUNCATE")
+            print(json.dumps(summary, indent=2))
         finally:
             connection.close()
         return

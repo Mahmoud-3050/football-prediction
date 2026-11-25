@@ -319,14 +319,14 @@ Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_seas
 
 | Code | File | Experiment | k | draw_boost | goal_cap | promoted atk/def | model_id |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| PL | `configs/live/pl_stack.json` | `EXP-PL-FINAL-HOLD-21` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-pl-v2` |
+| PL | `configs/live/pl_stack.json` | `EXP-PL-ELO-HOLD-02` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-pl-v4` (`elo_weight=0.08`, `elo_k=24.0`, `elo_home_adv=55.0`; Holdout 2022–2023 `n=349`, `mean_diff=-0.0091`, 95% CI `[-0.0150, -0.0034]`) |
 | PD | `configs/live/pd_stack.json` | `EXP-EURO-DOMESTIC-01-PD` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-pd-v2` |
 | SA | `configs/live/sa_stack.json` | `EXP-EURO-DOMESTIC-01-SA` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-sa-v2` |
 | BL1 | `configs/live/bl1_stack.json` | `EXP-EURO-DOMESTIC-01-BL1` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-bl1-v2` |
 | FL1 | `configs/live/fl1_stack.json` | `EXP-EURO-DOMESTIC-01-FL1` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-fl1-v2` |
 | PPL | `configs/live/ppl_stack.json` | `EXP-EURO-DOMESTIC-01-PPL` | 8 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-ppl-v2` |
 | DED | `configs/live/ded_stack.json` | `EXP-EURO-DOMESTIC-01-DED` | 8 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-ded-v2` |
-| CL | `configs/live/cl_stack.json` | `EXP-CL-OPT-02` | 8 | 0.85 | null | 0.85 / 1.15 | `bot-score-model-cl-v4` (`persistent_priors`, `elo_blend=0.5`, `domestic_prior_weight=0.4`) |
+| CL | `configs/live/cl_stack.json` | `EXP-EURO-ELO-HOLD-02-CL` | 8 | 0.85 | null | 0.85 / 1.15 | `bot-score-model-cl-v5` (`persistent_priors`, `elo_blend=0.5`, `domestic_prior_weight=0.4`, `elo_weight=0.08`, `elo_k=24.0`, `elo_home_adv=55.0`; Holdout 2023 `n=77`, `mean_diff=-0.0060`, 95% CI `[-0.0116, -0.0008]`) |
 | SPL | `data/spl_stack.json` (legacy; no `configs/live/spl_stack.json`) | `BOT-SPL-chal-db1p0-pick` | (file) | 1.0 + pick thr 0.28 / margin 0.05 | null | null | `bot-score-model-live` + `dependence=dixon_coles` |
 
 Unknown competition codes → `DEFAULT_LIVE_STACK`. **Do not** overwrite PL/SPL when promoting other leagues.
@@ -338,6 +338,7 @@ Defaults leave `score_model_v1` behavior unchanged (`goal_cap=None`, `nb_alpha=0
 | Knob | Default | Effect when set |
 | --- | --- | --- |
 | `goal_cap`, `goal_cap_slope` | `None`, `0.5` | Soft-cap prior-match FT goals in rate estimation / league averages / `club_venue_ratios` only—never rewrite snapshot or target scores |
+| `xg_weight` | `0.0` | Secondary xG blend weight in `[0.0, 1.0]` (`eff = (1 - w)*capped_goals + w*capped_xg`; missing xG falls back to 100% actual goals, never `0.0`). Imported into `match_xg` via `python -m laboratory import-xg --file <csv|json> --source <understat|fbref> --competition <COMP> --season <YEAR>` using strict `resolve_team_id` canonical mapping. |
 | `nb_alpha` | `0.0` | `>0` → Negative Binomial marginals (mean λ, Var=λ+αλ²) via stdlib recurrence; same tail/renorm/DC/draw pipeline |
 | `promoted_attack_prior`, `promoted_defence_prior` | `None` | When `prior_mean=last_season` and club missing from previous-season ratios, use these instead of 1.0 |
 
