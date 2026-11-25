@@ -33,7 +33,10 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-pd-v3",
+        "elo_weight": 0.10,
+        "elo_k": 24.0,
+        "elo_home_adv": 55.0,
+        "model_id": "bot-score-model-pd-v4",
     },
     "SA": {
         "k": 12.0,

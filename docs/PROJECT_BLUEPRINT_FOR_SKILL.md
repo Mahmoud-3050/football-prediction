@@ -320,7 +320,7 @@ Shared pattern for PL + Euro domestic + CL (unless noted): `prior_mean=last_seas
 | Code | File | Experiment | k | draw_boost | goal_cap | promoted atk/def | model_id |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | PL | `configs/live/pl_stack.json` | `EXP-PL-XG-HOLDOUT` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-pl-v5` (`elo_weight=0.08`, `elo_k=24.0`, `elo_home_adv=55.0`, `xg_weight=0.25` via `fpl_opta_github` auto-sync; Holdout 2022–2023 `n=349`, `Exact LL Δ=-0.00754`, 95% CI `[-0.01223, -0.00264]`) |
-| PD | `configs/live/pd_stack.json` | `EXP-EURO-DOMESTIC-01-PD` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-pd-v2` |
+| PD | `configs/live/pd_stack.json` | `EXP-PD-ELO-VERIFY` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-pd-v4` (`elo_weight=0.10`, `elo_k=24.0`, `elo_home_adv=55.0`, `stakes_blend=0.3`, `stakes_min_games=15`; 2024–2026 `n=793`, `FT 1X2 LL Δ=-0.00296`, 95% CI `[-0.00527, -0.00059]`, `SP1` Mean CLV `+1.09%`) |
 | SA | `configs/live/sa_stack.json` | `EXP-EURO-DOMESTIC-01-SA` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-sa-v2` |
 | BL1 | `configs/live/bl1_stack.json` | `EXP-EURO-DOMESTIC-01-BL1` | 12 | 1.06 | 4 | 0.80 / 1.25 | `bot-score-model-bl1-v2` |
 | FL1 | `configs/live/fl1_stack.json` | `EXP-EURO-DOMESTIC-01-FL1` | 12 | 1.0 | 4 | 0.80 / 1.25 | `bot-score-model-fl1-v2` |
