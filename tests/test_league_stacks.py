@@ -40,11 +40,14 @@ _PROMOTED_LIVE = {
     },
     "SA": {
         "k": 12.0,
-        "draw_boost": 1.0,
+        "draw_boost": 1.06,
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-sa-v3",
+        "elo_weight": 0.10,
+        "elo_k": 24.0,
+        "elo_home_adv": 55.0,
+        "model_id": "bot-score-model-sa-v4",
     },
     "BL1": {
         "k": 12.0,
@@ -60,7 +63,10 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-fl1-v3",
+        "elo_weight": 0.10,
+        "elo_k": 24.0,
+        "elo_home_adv": 55.0,
+        "model_id": "bot-score-model-fl1-v4",
     },
     "PPL": {
         "k": 8.0,
