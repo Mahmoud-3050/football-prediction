@@ -25,7 +25,8 @@ _PROMOTED_LIVE = {
         "elo_k": 24.0,
         "elo_home_adv": 55.0,
         "xg_weight": 0.25,
-        "model_id": "bot-score-model-pl-v5",
+        "half_time_share_mode": "league_only",
+        "model_id": "bot-score-model-pl-v6",
     },
     "PD": {
         "k": 12.0,
@@ -36,7 +37,8 @@ _PROMOTED_LIVE = {
         "elo_weight": 0.10,
         "elo_k": 24.0,
         "elo_home_adv": 55.0,
-        "model_id": "bot-score-model-pd-v4",
+        "half_time_share_mode": "league_only",
+        "model_id": "bot-score-model-pd-v5",
     },
     "SA": {
         "k": 12.0,
@@ -55,7 +57,8 @@ _PROMOTED_LIVE = {
         "goal_cap": 4.0,
         "promoted_attack_prior": 0.8,
         "promoted_defence_prior": 1.25,
-        "model_id": "bot-score-model-bl1-v3",
+        "half_time_share_mode": "league_only",
+        "model_id": "bot-score-model-bl1-v4",
     },
     "FL1": {
         "k": 12.0,
@@ -66,7 +69,8 @@ _PROMOTED_LIVE = {
         "elo_weight": 0.10,
         "elo_k": 24.0,
         "elo_home_adv": 55.0,
-        "model_id": "bot-score-model-fl1-v4",
+        "half_time_share_mode": "league_only",
+        "model_id": "bot-score-model-fl1-v5",
     },
     "PPL": {
         "k": 8.0,
@@ -119,7 +123,7 @@ def test_promoted_live_stacks_resolve_exact_knobs() -> None:
             assert stack[key] == value, (code, key, stack[key], value)
         assert stack["prior_mean"] == "last_season"
         assert stack["dependence"] == expected.get("dependence", "independent")
-        assert stack["half_time_share_mode"] == "club_shrunk"
+        assert stack["half_time_share_mode"] == expected.get("half_time_share_mode", "club_shrunk")
         assert stack["decay_half_life_days"] == 150.0
         assert stack["nb_alpha"] == expected.get("nb_alpha", 0.0)
         assert stack["code_version"] == "score_model_v1"

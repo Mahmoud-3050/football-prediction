@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 PORT   ?= 8765
 HOST   ?= 127.0.0.1
 
-.PHONY: help install test bot jobs dash dash-restart dash-kill start kill restart backup
+.PHONY: help install test bot jobs daily-sync dash dash-restart dash-kill start kill restart backup
 
 help:
 	@echo "Targets:"
@@ -11,6 +11,7 @@ help:
 	@echo "  make test          Run pytest"
 	@echo "  make bot           Start Telegram bot"
 	@echo "  make jobs          Start server jobs loop"
+	@echo "  make daily-sync    Run one-shot sync, settle, tomorrow lock, and price-finished"
 	@echo "  make dash          Start laboratory dashboard (:$(PORT))"
 	@echo "  make dash-restart  Restart dashboard only"
 	@echo "  make dash-kill     Stop process on :$(PORT)"
@@ -32,6 +33,9 @@ bot:
 
 jobs:
 	$(PYTHON) -m jobs
+
+daily-sync:
+	$(PYTHON) -m jobs.daily_sync
 
 dash:
 	$(PYTHON) -m laboratory serve --host $(HOST) --port $(PORT)
