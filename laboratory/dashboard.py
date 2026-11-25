@@ -95,6 +95,121 @@ def _metric_cell(text: str, *, win: bool = False) -> str:
     return f'<span class="metric-win mono">{text}</span>'
 
 
+def _prospective_scorecard_section(
+    connection: sqlite3.Connection,
+    *,
+    competition: str | None = None,
+) -> str:
+    """Render the Live Prospective Performance scorecard, strictly separate from Backtest."""
+    from db.prospective import compute_prospective_summary
+
+    try:
+        summary = compute_prospective_summary(connection, competition=competition, limit_recent=20)
+    except sqlite3.OperationalError:
+        return ""
+
+    settled_n = int(summary["settled_count"])
+    pending_n = int(summary["pending_count"])
+    locked_n = int(summary["locked_count"])
+    acc = summary["ft_1x2_accuracy"]
+    ll = summary["ft_1x2_log_loss"]
+    brier = summary["ft_1x2_brier"]
+    exact_hit = summary["exact_score_hit_rate"]
+    naive_u = summary["naive_uniform_log_loss"]
+    naive_p = summary["naive_prior_log_loss"]
+
+    acc_str = f"{acc:.1%}" if isinstance(acc, (int, float)) else "—"
+    ll_str = f"{ll:.4f}" if isinstance(ll, (int, float)) else "—"
+    brier_str = f"{brier:.4f}" if isinstance(brier, (int, float)) else "—"
+    exact_str = f"{exact_hit:.1%}" if isinstance(exact_hit, (int, float)) else "—"
+
+    baseline_note = ""
+    if isinstance(naive_u, (int, float)):
+        prior_part = f" · Prior Baseline: {naive_p:.4f}" if isinstance(naive_p, (int, float)) else ""
+        baseline_note = (
+            f'<p class="note" style="margin-top:8px;">'
+            f'Benchmark — Naive Uniform Log-Loss: {naive_u:.4f}{html.escape(prior_part)}'
+            f'</p>'
+        )
+
+    parts = [
+        '<section class="panel" id="prospective-scorecard">',
+        '  <h2>Live Prospective Performance</h2>',
+        '  <p class="note">Live Prospective (Out-of-Sample Real-Time Predictions — Strictly Separate from Backtest)</p>',
+        '  <div class="cards" style="margin-top:12px;">',
+        f'    <article><span>Settled Matches</span><strong>{settled_n}</strong></article>',
+        f'    <article><span>Pending / Locked</span><strong>{pending_n} ({locked_n} locked)</strong></article>',
+        f'    <article><span>Live FT 1X2 Acc %</span><strong>{html.escape(acc_str)}</strong></article>',
+        f'    <article><span>Live Log-Loss</span><strong>{html.escape(ll_str)}</strong></article>',
+        f'    <article><span>Live Brier Score</span><strong>{html.escape(brier_str)}</strong></article>',
+        f'    <article><span>Exact Score Hit %</span><strong>{html.escape(exact_str)}</strong></article>',
+        '  </div>',
+        baseline_note,
+    ]
+
+    if settled_n == 0:
+        parts.append(
+            _state(
+                kind="info",
+                title="No settled live predictions yet",
+                lead="0 settled live predictions yet — waiting for upcoming locked fixtures to finish",
+            )
+        )
+
+    recent = summary.get("recent_predictions") or []
+    if recent:
+        trs = []
+        for row in recent:
+            kickoff = str(row.get("kickoff_utc") or "")[:16].replace("T", " ")
+            comp = str(row.get("competition") or "")
+            home = str(row.get("home_team_name") or "")
+            away = str(row.get("away_team_name") or "")
+            ph = float(row.get("prob_home") or 0.0)
+            pd_ = float(row.get("prob_draw") or 0.0)
+            pa = float(row.get("prob_away") or 0.0)
+            pred_score = str(row.get("most_likely_score") or "—")
+            status = str(row.get("status") or "OPEN")
+            hg = row.get("actual_home_goals")
+            ag = row.get("actual_away_goals")
+            actual_str = f"{hg}-{ag}" if hg is not None and ag is not None else "—"
+            row_ll = row.get("ft_1x2_log_loss")
+            row_ll_str = f"{float(row_ll):.4f}" if isinstance(row_ll, (int, float)) else "—"
+            badge_cls = "good" if status == "SETTLED" else ("wait" if status == "LOCKED" else "muted")
+            trs.append(
+                "<tr>"
+                f'<td class="mono">{html.escape(kickoff)}</td>'
+                f'<td><span class="scope-badge league">{html.escape(comp)}</span></td>'
+                f'<td>{html.escape(home)} vs {html.escape(away)}</td>'
+                f'<td class="mono">{ph:.0%} / {pd_:.0%} / {pa:.0%}</td>'
+                f'<td class="mono">{html.escape(pred_score)}</td>'
+                f'<td class="mono">{html.escape(actual_str)}</td>'
+                f'<td><span class="badge {badge_cls}">{html.escape(status)}</span></td>'
+                f'<td class="mono">{html.escape(row_ll_str)}</td>'
+                "</tr>"
+            )
+        parts.append(
+            '<div class="table-wrap" style="margin-top:12px;">'
+            '  <table>'
+            '    <thead>'
+            '      <tr>'
+            '        <th>Kickoff (UTC)</th>'
+            '        <th>League</th>'
+            '        <th>Match</th>'
+            '        <th>1 / X / 2</th>'
+            '        <th>Pred Score</th>'
+            '        <th>Actual</th>'
+            '        <th>Status</th>'
+            '        <th>Log-Loss</th>'
+            '      </tr>'
+            '    </thead>'
+            f'    <tbody>{"".join(trs)}</tbody>'
+            '  </table>'
+            '</div>'
+        )
+    parts.append("</section>")
+    return "\n".join(parts)
+
+
 def overview(
     connection: sqlite3.Connection,
     query: dict[str, list[str]] | None = None,
@@ -167,6 +282,7 @@ def overview(
                     lead="Fixtures are loaded, but this engine has no scored market metrics for the current filters.",
                 )
             )
+    body.append(_prospective_scorecard_section(connection, competition=filters.get("league") or None))
     try:
         latest_sync = get_latest_sync_job(connection)
     except sqlite3.OperationalError:

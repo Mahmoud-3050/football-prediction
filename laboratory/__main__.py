@@ -260,6 +260,21 @@ def build_dashboard_server(
                         status = 404
                     else:
                         status = 200
+                elif parsed.path == "/api/prospective":
+                    from db.prospective import compute_prospective_summary
+
+                    comp_filter = (query.get("league") or query.get("competition") or [""])[0].strip() or None
+                    payload = json.dumps(
+                        compute_prospective_summary(connection, competition=comp_filter),
+                        default=str,
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 else:
                     page = not_found_page(resource="Page")
                     status = 404
@@ -1535,6 +1550,7 @@ def main() -> None:
             "lab-rollback",
             "sync-data",
             "map-team",
+            "settle-prospective",
         ),
     )
     parser.add_argument(
@@ -2057,6 +2073,28 @@ def main() -> None:
                         "canonical_name": args.canonical_name,
                     },
                     indent=2,
+                )
+            )
+        finally:
+            connection.close()
+        return
+    if args.command == "settle-prospective":
+        from db.prospective import compute_prospective_summary, settle_prospective_predictions
+
+        db_path = Path(args.db).resolve() if args.db else path
+        connection = connect(db_path)
+        try:
+            settled = settle_prospective_predictions(connection)
+            checkpoint_wal(connection, mode="TRUNCATE")
+            summary = compute_prospective_summary(connection)
+            print(
+                json.dumps(
+                    {
+                        "settled": settled,
+                        "summary": {k: v for k, v in summary.items() if k != "recent_predictions"},
+                    },
+                    indent=2,
+                    default=str,
                 )
             )
         finally:

@@ -6,6 +6,7 @@ runs unless a user named the home team, the away team, and the competition.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -526,6 +527,16 @@ class Pipeline:
             )
 
         self.store.save_version(run_id, snapshot_id, produced)
+        self._record_prospective(
+            competition_code=competition.code,
+            fixture=fixture,
+            home=home,
+            away=away,
+            raw_competition=raw_competition,
+            stack=stack,
+            estimate=estimate,
+            produced=produced,
+        )
         status = "partial" if produced.limitations else "completed"
         return self._finish(
             run_id,
@@ -552,6 +563,55 @@ class Pipeline:
             probabilities=produced.probabilities,
             top_scores=produced.top_scores,
         )
+
+    def _record_prospective(
+        self,
+        *,
+        competition_code: str,
+        fixture: Fixture,
+        home: Team,
+        away: Team,
+        raw_competition: str,
+        stack: dict[str, Any],
+        estimate: Any,
+        produced: Any,
+    ) -> None:
+        """Persist pre-kickoff prospective prediction (no-op if post-kickoff)."""
+        if not fixture.utc_date:
+            return
+        try:
+            from db.prospective import record_prospective_prediction
+
+            probs = produced.probabilities or estimate.probabilities or {}
+            top_prob = None
+            if produced.top_scores:
+                top_prob = float(produced.top_scores[0][2])
+            source = "scheduled_job" if raw_competition == "tomorrow-job" else "telegram_predict"
+            record_prospective_prediction(
+                self.store._conn,
+                competition=competition_code,
+                fixture_id=str(fixture.id) if fixture.id else None,
+                home_team_id=str(home.id),
+                away_team_id=str(away.id),
+                home_team_name=home.name,
+                away_team_name=away.name,
+                kickoff_utc=fixture.utc_date,
+                source=source,
+                model_id=produced.model_id,
+                stack_json=json.dumps(stack, sort_keys=True),
+                prob_home=float(probs.get("home_win", 0.0)),
+                prob_draw=float(probs.get("draw", 0.0)),
+                prob_away=float(probs.get("away_win", 0.0)),
+                prob_over_25=probs.get("over_2_5"),
+                prob_under_25=probs.get("under_2_5"),
+                most_likely_score=produced.prediction.full_time_score,
+                most_likely_score_prob=top_prob,
+                display_pick=produced.markets.result_1x2,
+                lambda_home=getattr(estimate, "lambda_home", None),
+                lambda_away=getattr(estimate, "lambda_away", None),
+            )
+        except Exception:
+            logger.warning("failed to record prospective prediction", exc_info=True)
 
     def _resolve_club(
         self,

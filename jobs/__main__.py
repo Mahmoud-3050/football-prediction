@@ -16,9 +16,10 @@ from typing import Any
 from dotenv import load_dotenv
 
 from core.config import ConfigError, load_config
+from db.prospective import settle_prospective_predictions
 from jobs.standings_job import run_standings_once
 from jobs.tomorrow import run_tomorrow_once
-from laboratory.store import connect, record_job_run
+from laboratory.store import checkpoint_wal, connect, record_job_run
 from main import build_pipeline
 
 DEFAULT_INTERVAL_SECONDS = 3600
@@ -47,6 +48,7 @@ async def jobs_loop(
             ninjas_api_key=ninjas_api_key,
             state=standings_state,
         )
+        _run_prospective_settle_tracked(connection)
         try:
             await asyncio.wait_for(stop.wait(), timeout=max(1.0, interval_seconds))
         except asyncio.TimeoutError:
@@ -110,6 +112,32 @@ async def _run_standings_tracked(
         record_job_run(
             connection,
             name="standings",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            ok=False,
+            summary={"error": str(exc)},
+        )
+
+
+def _run_prospective_settle_tracked(connection: Any) -> None:
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        summary = settle_prospective_predictions(connection)
+        checkpoint_wal(connection, mode="PASSIVE")
+        logging.getLogger(__name__).info("prospective settle finished: %s", summary)
+        record_job_run(
+            connection,
+            name="prospective_settle",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            ok=True,
+            summary=dict(summary),
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("prospective settle crashed")
+        record_job_run(
+            connection,
+            name="prospective_settle",
             started_at=started,
             finished_at=datetime.now(timezone.utc).isoformat(),
             ok=False,
