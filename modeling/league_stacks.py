@@ -39,6 +39,9 @@ DEFAULT_LIVE_STACK: dict[str, Any] = {
     "standings_min_games": 6,
     "stakes_blend": 0.0,
     "stakes_min_games": 15,
+    "elo_weight": 0.0,
+    "elo_k": 20.0,
+    "elo_home_adv": 55.0,
     "persistent_priors": False,
     "elo_blend": 0.0,
     "domestic_prior_weight": 0.0,
@@ -72,6 +75,9 @@ _STACK_KEYS = (
     "standings_min_games",
     "stakes_blend",
     "stakes_min_games",
+    "elo_weight",
+    "elo_k",
+    "elo_home_adv",
     "persistent_priors",
     "elo_blend",
     "domestic_prior_weight",
@@ -162,7 +168,7 @@ def draw_calibration_kwargs(stack: Mapping[str, Any]) -> dict[str, Any]:
     promoted priors). Defaults are no-ops matching ``score_model_v1``.
     """
     weights = stack.get("draw_weights")
-    return {
+    kwargs: dict[str, Any] = {
         "draw_boost": float(stack.get("draw_boost") or 1.0),
         "draw_weights": None if weights is None else list(weights),
         "draw_pick_threshold": _optional_float(stack.get("draw_pick_threshold")),
@@ -191,6 +197,14 @@ def draw_calibration_kwargs(stack: Mapping[str, Any]) -> dict[str, Any]:
         "stakes_blend": float(stack.get("stakes_blend") or 0.0),
         "stakes_min_games": int(stack.get("stakes_min_games") or 15),
     }
+    elo_w = float(stack.get("elo_weight") or 0.0)
+    if elo_w > 0.0:
+        kwargs["elo_weight"] = elo_w
+        kwargs["elo_k"] = float(stack.get("elo_k") if stack.get("elo_k") is not None else 20.0)
+        kwargs["elo_home_adv"] = float(
+            stack.get("elo_home_adv") if stack.get("elo_home_adv") is not None else 55.0
+        )
+    return kwargs
 
 
 def _merge_stack(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -243,7 +257,7 @@ def _merge_stack(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[st
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number
-        elif key in {"nb_alpha", "elo_blend", "domestic_prior_weight", "standings_blend", "stakes_blend"}:
+        elif key in {"nb_alpha", "elo_blend", "domestic_prior_weight", "standings_blend", "stakes_blend", "elo_weight", "elo_k", "elo_home_adv"}:
             number = _optional_nonneg_float(value)
             if number is not None:
                 merged[key] = number

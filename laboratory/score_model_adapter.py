@@ -62,6 +62,9 @@ def price_from_snapshot(
     standings_full_games: float = 19.0,
     stakes_blend: float = 0.0,
     stakes_min_games: int = 15,
+    elo_weight: float = 0.0,
+    elo_k: float = 20.0,
+    elo_home_adv: float = 55.0,
     neutral_venue: bool = False,
     min_scored_matches: int | None = None,
 ) -> ScoreModelOutcome:
@@ -146,6 +149,9 @@ def price_from_snapshot(
         standings_full_games=standings_full_games,
         stakes_blend=stakes_blend,
         stakes_min_games=stakes_min_games,
+        elo_weight=elo_weight,
+        elo_k=elo_k,
+        elo_home_adv=elo_home_adv,
         neutral_venue=neutral_venue,
     )
     return ScoreModelOutcome(

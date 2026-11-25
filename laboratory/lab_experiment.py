@@ -368,6 +368,9 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "draw_tightness_ref",
         "decay_half_life_days",
         "goal_cap",
+        "elo_weight",
+        "elo_k",
+        "elo_home_adv",
         "goal_cap_slope",
         "nb_alpha",
         "promoted_attack_prior",
@@ -380,6 +383,9 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "standings_min_games",
         "stakes_blend",
         "stakes_min_games",
+        "elo_weight",
+        "elo_k",
+        "elo_home_adv",
     ):
         if key in flat and flat[key] is not None:
             merged[key] = flat[key]
@@ -441,6 +447,9 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "draw_tightness_scale",
         "decay_half_life_days",
         "goal_cap",
+        "elo_weight",
+        "elo_k",
+        "elo_home_adv",
         "promoted_attack_prior",
         "promoted_defence_prior",
         "venue_k",
@@ -451,6 +460,9 @@ def _normalize_base_config(raw: dict[str, Any], flat: dict[str, Any]) -> dict[st
         "standings_min_games",
         "stakes_blend",
         "stakes_min_games",
+        "elo_weight",
+        "elo_k",
+        "elo_home_adv",
     ):
         if opt_key in merged:
             val = _as_optional_float(merged.get(opt_key), label=opt_key)
@@ -551,6 +563,9 @@ def _normalize_param_grid(
         "draw_tightness_scale",
         "decay_half_life_days",
         "goal_cap",
+        "elo_weight",
+        "elo_k",
+        "elo_home_adv",
         "promoted_attack_prior",
         "promoted_defence_prior",
     ):

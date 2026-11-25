@@ -533,3 +533,66 @@ def test_parse_experiment_launch_json_calibration_knobs_and_null_grid() -> None:
     assert spec.param_grid["decay_half_life_days"] == [None, 150.0]
     assert spec.param_grid["goal_cap"] == [None, 3.0, 4.0]
     assert spec.param_grid["nb_alpha"] == [0.0, 0.06]
+
+
+def test_run_experiment_elo_weight_grid(tmp_path: Path) -> None:
+    from laboratory.lab_experiment import ExperimentConfig
+    from laboratory.lab_runner import run_experiment
+    from laboratory.store import connect, upsert_match, append_result
+
+    db_path = tmp_path / "elo_lab.db"
+    conn = connect(db_path)
+    try:
+        teams = [(str(i), f"Club {i}") for i in range(1, 5)]
+        mid = 1
+        for day in range(1, 20):
+            h = teams[day % 4]
+            a = teams[(day + 1) % 4]
+            match_id = f"elo-{mid}"
+            upsert_match(
+                conn,
+                {
+                    "match_id": match_id,
+                    "dataset_version": "test",
+                    "competition": "PL",
+                    "season": "2025",
+                    "kickoff": f"2025-09-{day:02d}T15:00:00Z",
+                    "home_id": h[0],
+                    "home_name": h[1],
+                    "away_id": a[0],
+                    "away_name": a[1],
+                },
+            )
+            append_result(
+                conn,
+                match_id,
+                {"ft_home": 2 if h[0] == "1" else 1, "ft_away": 0 if a[0] == "4" else 1, "ht_home": 1, "ht_away": 0},
+                source="test",
+            )
+            mid += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    cfg = ExperimentConfig(
+        experiment_id="EXP-ELO-TEST",
+        competition="PL",
+        seasons=(2025,),
+        tuning_seasons=(2025,),
+        holdout_seasons=(),
+        base_config={"k": 6.0, "prior_mean": "one", "elo_k": 20.0, "elo_home_adv": 55.0},
+        param_grid={"elo_weight": [0.0, 0.15]},
+        min_matches=1,
+    )
+    res = run_experiment(
+        lab_db_path=db_path,
+        live_db_path=db_path,
+        config=cfg,
+        max_workers=1,
+        persist_predictions=False,
+    )
+    assert res.completed_runs == 2
+    assert res.failed_runs == 0
+    assert len(res.all_runs) == 2
+    lls = [r["metrics"]["full_time_1x2_log_loss"] for r in res.all_runs]
+    assert lls[0] != lls[1]

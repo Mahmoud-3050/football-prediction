@@ -302,6 +302,9 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
     standings_min_games = int(input_data.config.get("standings_min_games", 6))
     stakes_blend = float(input_data.config.get("stakes_blend", 0.0))
     stakes_min_games = int(input_data.config.get("stakes_min_games", 15))
+    elo_weight = float(input_data.config.get("elo_weight", 0.0))
+    elo_k = float(input_data.config.get("elo_k", 20.0))
+    elo_home_adv = float(input_data.config.get("elo_home_adv", 55.0))
 
     cache, all_history = _build_snapshot_cache(
         live_db,
@@ -392,6 +395,9 @@ def _price_worker(input_data: _WorkerInput) -> _WorkerOutput:
                 standings_min_games=standings_min_games,
                 stakes_blend=stakes_blend,
                 stakes_min_games=stakes_min_games,
+                elo_weight=elo_weight,
+                elo_k=elo_k,
+                elo_home_adv=elo_home_adv,
             )
 
             if outcome.excluded or outcome.body is None:

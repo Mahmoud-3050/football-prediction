@@ -877,3 +877,95 @@ def test_promoted_team_prior_fallback() -> None:
     assert custom["defence_home"] == 1.15
     assert custom["attack_away"] == 1.1
     assert custom["defence_away"] == 0.95
+
+
+def test_dynamic_elo_weight_zero_is_identical_and_positive_rewards_winning_streak() -> None:
+    league = []
+    # Arsenal wins 5 straight against Man City/Chelsea; Spurs loses 5 straight
+    for idx in range(5):
+        league.append(
+            make_match(
+                9000 + idx,
+                ARSENAL,
+                MAN_CITY,
+                home_goals=3,
+                away_goals=1,
+                half_home=1,
+                half_away=0,
+                when=f"2026-01-{10 + idx:02d}T15:00:00Z",
+            )
+        )
+        league.append(
+            make_match(
+                9100 + idx,
+                CHELSEA,
+                SPURS,
+                home_goals=3,
+                away_goals=1,
+                half_home=1,
+                half_away=0,
+                when=f"2026-01-{10 + idx:02d}T17:30:00Z",
+            )
+        )
+    # Future match that must never leak into pre-kickoff Elo
+    future = make_match(
+        9999,
+        SPURS,
+        ARSENAL,
+        home_goals=5,
+        away_goals=0,
+        half_home=2,
+        half_away=0,
+        when="2026-02-10T15:00:00Z",
+    )
+    target_ko = "2026-02-01T15:00:00Z"
+
+    base = estimate_score(
+        competition_finished_payload={"matches": league},
+        home_finished_payload={"matches": []},
+        away_finished_payload={"matches": []},
+        home_team_id=ARSENAL["id"],
+        away_team_id=SPURS["id"],
+        include_half_time=False,
+        kickoff=target_ko,
+    )
+    zero_elo = estimate_score(
+        competition_finished_payload={"matches": league},
+        home_finished_payload={"matches": []},
+        away_finished_payload={"matches": []},
+        home_team_id=ARSENAL["id"],
+        away_team_id=SPURS["id"],
+        include_half_time=False,
+        kickoff=target_ko,
+        elo_weight=0.0,
+    )
+    assert base.lambda_home == zero_elo.lambda_home
+    assert base.lambda_away == zero_elo.lambda_away
+    assert base.matrix == zero_elo.matrix
+
+    with_elo = estimate_score(
+        competition_finished_payload={"matches": league},
+        home_finished_payload={"matches": []},
+        away_finished_payload={"matches": []},
+        home_team_id=ARSENAL["id"],
+        away_team_id=SPURS["id"],
+        include_half_time=False,
+        kickoff=target_ko,
+        decay_half_life_days=90.0,
+        elo_weight=0.2,
+    )
+    with_elo_future = estimate_score(
+        competition_finished_payload={"matches": league + [future]},
+        home_finished_payload={"matches": []},
+        away_finished_payload={"matches": []},
+        home_team_id=ARSENAL["id"],
+        away_team_id=SPURS["id"],
+        include_half_time=False,
+        kickoff=target_ko,
+        decay_half_life_days=90.0,
+        elo_weight=0.2,
+    )
+    assert with_elo.lambda_home > zero_elo.lambda_home
+    assert with_elo.lambda_away < zero_elo.lambda_away
+    assert with_elo.lambda_home == with_elo_future.lambda_home
+    assert with_elo.matrix == with_elo_future.matrix

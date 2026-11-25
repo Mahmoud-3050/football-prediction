@@ -86,6 +86,9 @@ class ScoreEstimate:
     standings_min_games: int = 6
     stakes_blend: float = 0.0
     stakes_min_games: int = 15
+    elo_weight: float = 0.0
+    elo_k: float = 20.0
+    elo_home_adv: float = 55.0
 
     def probability(self, home_goals: int, away_goals: int) -> float:
         if home_goals >= len(self.matrix) or away_goals >= len(self.matrix[0]):
@@ -301,6 +304,9 @@ def estimate_from_lambdas(
     standings_full_games: float = 19.0,
     stakes_blend: float = 0.0,
     stakes_min_games: int = 15,
+    elo_weight: float = 0.0,
+    elo_k: float = 20.0,
+    elo_home_adv: float = 55.0,
     neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Price a full-time grid, and a half-time grid when that market is eligible."""
@@ -319,6 +325,12 @@ def estimate_from_lambdas(
         )
     if draw_boost <= 0 or not math.isfinite(draw_boost):
         raise ValueError("draw_boost must be a finite positive number.")
+    if not math.isfinite(elo_weight) or elo_weight < 0.0 or elo_weight > 0.5:
+        raise ValueError("elo_weight must be a finite number in [0.0, 0.5].")
+    if not math.isfinite(elo_k) or elo_k < 0.0:
+        raise ValueError("elo_k must be a finite non-negative number.")
+    if not math.isfinite(elo_home_adv):
+        raise ValueError("elo_home_adv must be finite.")
     nb_alpha_val = _validate_nb_alpha(nb_alpha)
     normalized_weights = _normalize_draw_weights(draw_weights)
     _validate_draw_pick_params(draw_pick_threshold, draw_pick_margin)
@@ -423,7 +435,56 @@ def estimate_from_lambdas(
         standings_min_games=standings_min_games,
         stakes_blend=stakes_blend,
         stakes_min_games=stakes_min_games,
+        elo_weight=elo_weight,
+        elo_k=elo_k,
+        elo_home_adv=elo_home_adv,
     )
+
+
+def _compute_dynamic_elo_ratings(
+    priors: list[_PriorMatch],
+    *,
+    home_team_id: int,
+    away_team_id: int,
+    target_kickoff: str | None,
+    decay_half_life_days: float | None,
+    elo_k: float,
+    elo_home_adv: float,
+    promoted_default: float = 1500.0,
+) -> tuple[float, float]:
+    """Sequential, strictly pre-kickoff Elo ratings with optional time-decay toward 1500."""
+    cutoff = target_kickoff or ""
+    ordered = sorted(
+        (m for m in priors if not cutoff or not m.kickoff or m.kickoff < cutoff),
+        key=lambda m: (m.kickoff, str(m.match_id)),
+    )
+    ratings: dict[int, float] = {}
+    last_dt: dict[int, datetime] = {}
+
+    def _decay_to(tid: int, dt: datetime | None) -> float:
+        r = ratings.get(tid, promoted_default if tid not in ratings and len(ordered) >= 20 else 1500.0)
+        if dt is not None and decay_half_life_days is not None and tid in last_dt:
+            dt_days = max(0.0, (dt - last_dt[tid]).total_seconds() / 86400.0)
+            if dt_days > 0.0:
+                r = 1500.0 + (r - 1500.0) * (0.5 ** (dt_days / decay_half_life_days))
+        return r
+
+    for m in ordered:
+        m_dt = _parse_kickoff(m.kickoff)
+        rh = _decay_to(m.home_id, m_dt)
+        ra = _decay_to(m.away_id, m_dt)
+        expected_h = 1.0 / (1.0 + 10.0 ** ((ra - (rh + elo_home_adv)) / 400.0))
+        actual_h = 1.0 if m.ft_home > m.ft_away else (0.5 if m.ft_home == m.ft_away else 0.0)
+        mov = math.log(abs(m.ft_home - m.ft_away) + 1.0) + 1.0
+        delta = elo_k * mov * (actual_h - expected_h)
+        ratings[m.home_id] = rh + delta
+        ratings[m.away_id] = ra - delta
+        if m_dt is not None:
+            last_dt[m.home_id] = m_dt
+            last_dt[m.away_id] = m_dt
+
+    target_dt = _parse_kickoff(target_kickoff)
+    return _decay_to(home_team_id, target_dt), _decay_to(away_team_id, target_dt)
 
 
 def estimate_score(
@@ -465,6 +526,9 @@ def estimate_score(
     standings_full_games: float = 19.0,
     stakes_blend: float = 0.0,
     stakes_min_games: int = 15,
+    elo_weight: float = 0.0,
+    elo_k: float = 20.0,
+    elo_home_adv: float = 55.0,
     neutral_venue: bool = False,
 ) -> ScoreEstimate:
     """Expected goals from shrunk multiplicative rates, then modal scores and markets."""
@@ -493,6 +557,12 @@ def estimate_score(
         )
     if draw_boost <= 0 or not math.isfinite(draw_boost):
         raise ValueError("draw_boost must be a finite positive number.")
+    if not math.isfinite(elo_weight) or elo_weight < 0.0 or elo_weight > 0.5:
+        raise ValueError("elo_weight must be a finite number in [0.0, 0.5].")
+    if not math.isfinite(elo_k) or elo_k < 0.0:
+        raise ValueError("elo_k must be a finite non-negative number.")
+    if not math.isfinite(elo_home_adv):
+        raise ValueError("elo_home_adv must be finite.")
     cap_val, slope_val = _validate_goal_cap(goal_cap, goal_cap_slope)
     nb_alpha_val = _validate_nb_alpha(nb_alpha)
     promo_atk, promo_def = _validate_promoted_priors(
@@ -774,6 +844,22 @@ def estimate_score(
                 f"Match stakes context ({stakes.context_label}, progress={stakes.season_progress:.0%}) adjusted expected goals."
             )
 
+    if elo_weight > 0.0 and priors:
+        r_home, r_away = _compute_dynamic_elo_ratings(
+            priors,
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            target_kickoff=target_kickoff or kickoff,
+            decay_half_life_days=decay_half_life_days,
+            elo_k=elo_k,
+            elo_home_adv=elo_home_adv,
+            promoted_default=(1440.0 if (promo_atk is not None or promo_def is not None) else 1500.0),
+        )
+        elo_diff = (r_home + elo_home_adv) - r_away
+        elo_mult = max(0.75, min(1.35, math.exp(elo_weight * (elo_diff / 400.0))))
+        lambda_home = lambda_home * elo_mult
+        lambda_away = lambda_away / elo_mult
+
     # Fixture congestion / rest-days adjustment (optional).
     if short_rest_days is not None and target_kickoff is not None:
         target_dt = _parse_kickoff(target_kickoff)
@@ -869,7 +955,56 @@ def estimate_score(
         venue_k=venue_k,
         stakes_blend=stakes_blend,
         stakes_min_games=stakes_min_games,
+        elo_weight=elo_weight,
+        elo_k=elo_k,
+        elo_home_adv=elo_home_adv,
     )
+
+
+def _compute_dynamic_elo_ratings(
+    priors: list[_PriorMatch],
+    *,
+    home_team_id: int,
+    away_team_id: int,
+    target_kickoff: str | None,
+    decay_half_life_days: float | None,
+    elo_k: float,
+    elo_home_adv: float,
+    promoted_default: float = 1500.0,
+) -> tuple[float, float]:
+    """Sequential, strictly pre-kickoff Elo ratings with optional time-decay toward 1500."""
+    cutoff = target_kickoff or ""
+    ordered = sorted(
+        (m for m in priors if not cutoff or not m.kickoff or m.kickoff < cutoff),
+        key=lambda m: (m.kickoff, str(m.match_id)),
+    )
+    ratings: dict[int, float] = {}
+    last_dt: dict[int, datetime] = {}
+
+    def _decay_to(tid: int, dt: datetime | None) -> float:
+        r = ratings.get(tid, promoted_default if tid not in ratings and len(ordered) >= 20 else 1500.0)
+        if dt is not None and decay_half_life_days is not None and tid in last_dt:
+            dt_days = max(0.0, (dt - last_dt[tid]).total_seconds() / 86400.0)
+            if dt_days > 0.0:
+                r = 1500.0 + (r - 1500.0) * (0.5 ** (dt_days / decay_half_life_days))
+        return r
+
+    for m in ordered:
+        m_dt = _parse_kickoff(m.kickoff)
+        rh = _decay_to(m.home_id, m_dt)
+        ra = _decay_to(m.away_id, m_dt)
+        expected_h = 1.0 / (1.0 + 10.0 ** ((ra - (rh + elo_home_adv)) / 400.0))
+        actual_h = 1.0 if m.ft_home > m.ft_away else (0.5 if m.ft_home == m.ft_away else 0.0)
+        mov = math.log(abs(m.ft_home - m.ft_away) + 1.0) + 1.0
+        delta = elo_k * mov * (actual_h - expected_h)
+        ratings[m.home_id] = rh + delta
+        ratings[m.away_id] = ra - delta
+        if m_dt is not None:
+            last_dt[m.home_id] = m_dt
+            last_dt[m.away_id] = m_dt
+
+    target_dt = _parse_kickoff(target_kickoff)
+    return _decay_to(home_team_id, target_dt), _decay_to(away_team_id, target_dt)
 
 
 @dataclass(frozen=True)
